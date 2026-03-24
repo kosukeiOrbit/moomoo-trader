@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class BreakerAction(Enum):
     """サーキットブレーカーのアクション."""
+
     OK = "OK"
     HALT_NEW_ORDERS = "HALT_NEW_ORDERS"
     FORCE_CLOSE_ALL = "FORCE_CLOSE_ALL"
@@ -22,6 +23,7 @@ class BreakerAction(Enum):
 @dataclass
 class AccountState:
     """口座状態."""
+
     balance: float
     daily_pnl: float
     peak_balance: float
@@ -31,24 +33,31 @@ class AccountState:
 @dataclass
 class BreakerStatus:
     """サーキットブレーカーの判定結果."""
+
     action: BreakerAction
     reason: str
     can_trade: bool
 
 
 class CircuitBreaker:
-    """サーキットブレーカー: 異常時にトレードを自動停止する."""
+    """サーキットブレーカー: 異常時にトレードを自動停止する.
+
+    判定優先順位:
+      1. 最大ドローダウン > MAX_DRAWDOWN_PCT (10%) → 全ポジ強制決済・停止
+      2. 日次損失 > MAX_DAILY_LOSS_PCT (3%)        → 新規発注停止
+      3. 連続敗北 >= CONSECUTIVE_LOSS_LIMIT (3)     → サイズ50%縮小
+    """
 
     def __init__(self) -> None:
         self._halted: bool = False
 
+    @property
+    def is_halted(self) -> bool:
+        """発動中かどうか."""
+        return self._halted
+
     def check(self, account_state: AccountState) -> BreakerStatus:
         """口座状態を評価してサーキットブレーカーの判定を行う.
-
-        発動条件:
-        - 日次損失が資金の3%超過 → 当日の全新規発注停止
-        - 最大ドローダウンが10%超過 → 全ポジション強制決済・停止
-        - 連続3敗 → ポジションサイズを50%に縮小
 
         Args:
             account_state: 口座状態
@@ -56,6 +65,7 @@ class CircuitBreaker:
         Returns:
             サーキットブレーカー判定結果
         """
+        # 既に発動済みの場合はリセットされるまで取引不可
         if self._halted:
             return BreakerStatus(
                 action=BreakerAction.HALT_NEW_ORDERS,
@@ -67,12 +77,15 @@ class CircuitBreaker:
         daily_pnl = account_state.daily_pnl
         peak = account_state.peak_balance
 
-        # 最大ドローダウン判定（最優先）
+        # --- 1. 最大ドローダウン判定（最優先） ---
         if peak > 0:
             drawdown = (peak - balance) / peak
             if drawdown > settings.MAX_DRAWDOWN_PCT:
                 self._halted = True
-                reason = f"最大DD {drawdown:.1%} > {settings.MAX_DRAWDOWN_PCT:.0%}: 全ポジション強制決済"
+                reason = (
+                    f"最大DD {drawdown:.1%} > {settings.MAX_DRAWDOWN_PCT:.0%}: "
+                    f"全ポジション強制決済"
+                )
                 logger.critical(reason)
                 return BreakerStatus(
                     action=BreakerAction.FORCE_CLOSE_ALL,
@@ -80,12 +93,15 @@ class CircuitBreaker:
                     can_trade=False,
                 )
 
-        # 日次損失判定
-        if balance > 0:
-            daily_loss_pct = abs(daily_pnl) / balance if daily_pnl < 0 else 0
+        # --- 2. 日次損失判定 ---
+        if balance > 0 and daily_pnl < 0:
+            daily_loss_pct = abs(daily_pnl) / balance
             if daily_loss_pct > settings.MAX_DAILY_LOSS_PCT:
                 self._halted = True
-                reason = f"日次損失 {daily_loss_pct:.1%} > {settings.MAX_DAILY_LOSS_PCT:.0%}: 新規発注停止"
+                reason = (
+                    f"日次損失 {daily_loss_pct:.1%} > {settings.MAX_DAILY_LOSS_PCT:.0%}: "
+                    f"新規発注停止"
+                )
                 logger.warning(reason)
                 return BreakerStatus(
                     action=BreakerAction.HALT_NEW_ORDERS,
@@ -93,9 +109,11 @@ class CircuitBreaker:
                     can_trade=False,
                 )
 
-        # 連続敗北判定
+        # --- 3. 連続敗北判定 ---
         if account_state.consecutive_losses >= settings.CONSECUTIVE_LOSS_LIMIT:
-            reason = f"連続{account_state.consecutive_losses}敗: サイズ50%縮小"
+            reason = (
+                f"連続{account_state.consecutive_losses}敗: サイズ50%縮小"
+            )
             logger.warning(reason)
             return BreakerStatus(
                 action=BreakerAction.REDUCE_SIZE,
@@ -110,6 +128,6 @@ class CircuitBreaker:
         )
 
     def reset_daily(self) -> None:
-        """毎朝9:30（ET）に自動リセットする."""
+        """毎朝リセットする（9:30 ET に呼び出す想定）."""
         self._halted = False
         logger.info("サーキットブレーカーをリセットしました")
