@@ -1,6 +1,6 @@
 # AI Daytrade Bot — システム設計書
 > moomoo OpenAPI × LLM Sentiment × Institutional Flow
-> Version: 1.0 | 作成日: 2026-03-24
+> Version: 2.0 | 更新日: 2026-03-25
 
 ---
 
@@ -16,15 +16,28 @@ moomoo OpenAPIを使い、LLMセンチメント解析と大口フロー検出を
 1. **LLMによるテキストセンチメント解析** — 自然言語理解はLLM登場後に個人でも扱えるようになった領域
 2. **moomoo独自の大口フロー・空売りデータ** — 一般的な証券APIでは取得できないデータ
 
-### 基本戦略：AND条件二重ロック
+### 基本戦略：AND条件四重ロック
 ```
-センチメントスコア ↑ (> +0.3)
-        AND
-大口フロー 買い超過 (> 閾値)
-        ↓
-エントリー候補 → リスク計算 → 発注
+① sentiment.score        > +0.3
+② flow.direction         == "BUY"
+③ sentiment.confidence   > 0.6
+④ flow.strength          > 0.65
+          ↓ 全条件クリア
+  エントリー候補 → リスク計算 → 発注
 ```
-どちらか一方のシグナルのみの場合はスキップ。誤シグナルを構造的に排除する。
+1条件でも未達の場合はスキップ。不合格理由をログに記録する。
+
+### 対象市場
+- **米国株（メイン）** — moomoo OpenAPI対応済み
+- 日本株は現時点でOpenAPIの発注非対応のため対象外
+
+### 稼働時間（Windows・ローカルPC運用）
+```
+23:20  タスクスケジューラがBot自動起動
+23:30  米国市場オープン・監視スタート
+05:50  未決済ポジションを全決済
+06:10  Bot自動停止
+```
 
 ---
 
@@ -41,7 +54,7 @@ moomoo OpenAPIを使い、LLMセンチメント解析と大口フロー検出を
 ┌───────────────────▼─────────────────────────┐
 │  Layer 2: SIGNAL ENGINE                     │
 │  LLMセンチメント解析 + 大口フロー検出        │
-│  → AND条件フィルター                        │
+│  → AND条件フィルター（4条件）               │
 └───────────────────┬─────────────────────────┘
                     │
 ┌───────────────────▼─────────────────────────┐
@@ -56,7 +69,7 @@ moomoo OpenAPIを使い、LLMセンチメント解析と大口フロー検出を
                     │
 ┌───────────────────▼─────────────────────────┐
 │  Layer 5: DASHBOARD                         │
-│  P&L監視 / シグナル可視化 / アラート         │
+│  P&L監視 / シグナル可視化 / Discordアラート  │
 └─────────────────────────────────────────────┘
 ```
 
@@ -65,54 +78,153 @@ moomoo OpenAPIを使い、LLMセンチメント解析と大口フロー検出を
 ## 3. ディレクトリ構成
 
 ```
-daytrade-bot/
+moomoo-trader/
 ├── README.md
+├── DESIGN.md
 ├── .env.example
+├── .gitignore
 ├── requirements.txt
 ├── config/
-│   └── settings.py          # 全設定値の一元管理
+│   └── settings.py              # 全設定値の一元管理
 ├── src/
 │   ├── data/
-│   │   ├── moomoo_client.py     # moomoo OpenAPI接続・データ取得
-│   │   ├── board_scraper.py     # moomoo掲示板テキスト収集
-│   │   └── news_feed.py         # 外部ニュースフィード取得
+│   │   ├── moomoo_client.py     # moomoo OpenAPI接続・データ取得 ⬜
+│   │   ├── board_scraper.py     # moomoo掲示板テキスト収集 ⬜
+│   │   └── news_feed.py         # 外部ニュースフィード取得 ⬜
 │   ├── signal/
-│   │   ├── sentiment_analyzer.py  # Claude APIによるLLMセンチメント解析
-│   │   ├── flow_detector.py       # 大口フロー・空売りデータ検出
-│   │   └── and_filter.py          # AND条件フィルター（エントリー判定）
+│   │   ├── sentiment_analyzer.py  # Claude APIセンチメント解析 ✅
+│   │   ├── flow_detector.py       # 大口フロー・空売り検出 ⬜
+│   │   └── and_filter.py          # AND条件フィルター（4条件） ✅
 │   ├── risk/
-│   │   ├── position_sizer.py    # Kelly基準によるロットサイズ計算
-│   │   ├── stop_loss.py         # ATRベース動的SL/TP設定
-│   │   └── circuit_breaker.py   # 日次損失上限・ドローダウン監視
+│   │   ├── position_sizer.py    # ハーフKellyロットサイズ計算 ✅
+│   │   ├── stop_loss.py         # ATRベース動的SL/TP設定 ✅
+│   │   └── circuit_breaker.py   # サーキットブレーカー ✅
 │   ├── execution/
-│   │   ├── order_router.py      # moomoo OpenAPI発注
-│   │   └── paper_trade.py       # ペーパートレードモード
+│   │   ├── order_router.py      # moomoo OpenAPI発注 ⬜
+│   │   └── paper_trade.py       # ペーパートレードモード ⬜
 │   ├── monitor/
-│   │   ├── pnl_tracker.py       # リアルタイムP&L記録
-│   │   └── notifier.py          # Telegram通知
-│   └── main.py                  # エントリーポイント・メインループ
+│   │   ├── pnl_tracker.py       # リアルタイムP&L記録 ✅
+│   │   └── notifier.py          # Discord Webhook通知 ✅
+│   └── main.py                  # エントリーポイント・メインループ ⬜
 ├── tests/
-│   ├── test_sentiment.py
-│   ├── test_flow_detector.py
-│   └── test_risk.py
+│   ├── test_sentiment.py        # 23テスト ✅
+│   ├── test_and_filter.py       # 18テスト ✅
+│   ├── test_position_sizer.py   # 19テスト ✅
+│   ├── test_stop_loss.py        # 16テスト ✅
+│   ├── test_circuit_breaker.py  # 19テスト ✅
+│   ├── test_notifier.py         # 15テスト ✅
+│   └── test_pnl_tracker.py      # 35テスト ✅
 └── scripts/
-    └── backtest.py              # バックテスト実行スクリプト
+    ├── check_connection.py      # 接続前チェック（5ステップ） ✅
+    └── backtest.py              # バックテスト実行 ⬜
 ```
+
+**実装進捗: 145テスト合格済み**
 
 ---
 
-## 4. 各モジュール仕様
+## 4. 実装済みモジュール詳細
 
-### 4.1 moomoo_client.py
+### 4.1 sentiment_analyzer.py ✅
+**テスト: 23件（ユニット19 + 統合4）**
 
-**役割:** moomoo OpenAPIとの接続管理、リアルタイムデータ取得
+- モデル: `claude-sonnet-4-20250514`
+- 入力: テキストリスト + 銘柄コード
+- 出力: `SentimentResult(score: float, confidence: float, reasoning: str)`
+- scoreは`[-1.0, +1.0]`、confidenceは`[0.0, 1.0]`にクランプ
+- `RateLimitError` / `APIConnectionError` で指数バックオフリトライ（最大3回: 1s→2s→4s）
+- JSONパース: 前後に余計なテキストがあっても`{}`を抽出
+- 履歴の自動プルーニング: 60分以上前のデータを自動削除
+- `get_rolling_score(window_minutes=30)` で移動平均スコアを取得
 
-**取得データ:**
-- 株価・板情報・約定データ（WebSocket）
-- 空売り比率データ
-- 大口投資家フローデータ（moomoo独自）
+### 4.2 and_filter.py ✅
+**テスト: 18件（全条件OK・各条件単独NG・境界値・複数条件未達）**
 
-**主要クラス:**
+4条件のANDロジック:
+```python
+① sentiment.score        > SENTIMENT_THRESHOLD  # 0.3
+② flow.direction         == "BUY"
+③ sentiment.confidence   > CONFIDENCE_MIN       # 0.6
+④ flow.strength          > FLOW_BUY_THRESHOLD   # 0.65
+```
+不合格時は未達条件を全てreason文字列に列挙（デバッグ・ログ用）
+
+### 4.3 position_sizer.py ✅
+**テスト: 19件**
+
+- ハーフKelly基準: `Kelly% = (勝率×利益 - 敗率×損失) / 損失 × 0.5`
+- 上限: 総資金の`POSITION_MAX_PCT`（2%）
+- 初期勝率50%（データなし時）→ Kelly=0で賭けない
+- 連続3敗でサイズを50%に縮小
+- `update_stats()`で勝率を動的更新
+
+### 4.4 stop_loss.py ✅
+**テスト: 16件**
+
+- SL: `entry - ATR × 1.5`
+- TP: `entry + ATR × 2.5`（R:R = 1:1.67）
+- フォールバック: 価格履歴<14本 → ATR = entry × 2%
+- `calculate_vwap()` でVWAP乖離>2%を検知して撤退フラグ
+
+### 4.5 circuit_breaker.py ✅
+**テスト: 19件**
+
+優先度順の発動条件:
+1. DD > 10% → `FORCE_CLOSE_ALL`（全ポジ強制決済・システム停止）
+2. 日次損失 > 3% → `HALT_NEW_ORDERS`（新規発注停止）
+3. 連続3敗 → `REDUCE_SIZE`（サイズ50%縮小、取引継続）
+
+`is_halted`プロパティ、`reset_daily()`で毎朝リセット
+
+### 4.6 notifier.py ✅
+**テスト: 15件**
+
+Discord Webhook経由で3チャンネルに通知:
+
+| メソッド | チャンネル | Embed色 |
+|---------|-----------|---------|
+| `notify_signal()` | mt-signal | 青 #3498DB |
+| `notify_entry()` | mt-signal | 緑 #2ECC71 |
+| `notify_exit()` 利益 | mt-alert | 緑 #2ECC71 |
+| `notify_exit()` 損失 | mt-alert | 赤 #E74C3C |
+| `notify_circuit_breaker()` | mt-alert | 赤 + @everyone |
+| `notify_daily_summary()` | mt-summary | PnLに応じて緑/赤 |
+
+送信失敗時は`False`を返しログ記録、システムは止めない
+
+### 4.7 pnl_tracker.py ✅
+**テスト: 35件**
+
+| 機能 | メソッド |
+|-----|---------|
+| トレード記録 | `register()` / `close_trade()` |
+| 勝率 | `get_win_rate(last_n)` |
+| 最大DD | `get_max_drawdown()` |
+| シャープレシオ | `get_sharpe_ratio()` |
+| 日次サマリー | `get_daily_summary()` |
+| CSV保存 | `save_to_csv()` / `load_from_csv()` |
+
+PostgreSQL不要でCSVのみで動作（後からDB追加可能）
+
+### 4.8 check_connection.py ✅
+
+5ステップの接続前チェック:
+```
+Step 1/5  OpenD ポート接続確認 (127.0.0.1:11111)
+Step 2/5  moomoo API認証
+Step 3/5  株価取得 (AAPL / NVDA)
+Step 4/5  口座残高確認（ペーパートレード）
+Step 5/5  Claude API接続確認（独立実行）
+```
+OpenD未起動時はStep2-4をスキップしStep5のみ実行。
+全PASS → exit 0 / 一部FAIL → 対処手順を表示してexit 1
+
+---
+
+## 5. 未実装モジュール（口座開設後に着手）
+
+### 5.1 moomoo_client.py ⬜
+
 ```python
 class MoomooClient:
     def connect(self) -> None
@@ -123,167 +235,19 @@ class MoomooClient:
     def close(self) -> None
 ```
 
-**設定値（config/settings.py）:**
-```python
-MOOMOO_HOST = "127.0.0.1"
-MOOMOO_PORT = 11111
-TRADE_ENV = "SIMULATE"  # 本番: "REAL"
-WATCHLIST = ["AAPL", "NVDA", "TSLA", "META", "MSFT"]
-```
+### 5.2 flow_detector.py ⬜
 
----
-
-### 4.2 board_scraper.py
-
-**役割:** moomooコミュニティ掲示板からテキストをリアルタイム収集
-
-**取得対象:**
-- 監視銘柄ごとのコメント・投稿
-- 投稿時刻・著者情報（匿名）
-
-**主要クラス:**
-```python
-class BoardScraper:
-    def fetch_posts(self, symbol: str, limit: int = 50) -> list[Post]
-    def stream_new_posts(self, symbol: str, callback: Callable) -> None
-```
-
----
-
-### 4.3 sentiment_analyzer.py
-
-**役割:** Claude APIを使い、テキストをBull/Bearスコアに変換する
-
-**仕様:**
-- 入力: 掲示板投稿・ニュース記事のテキストリスト
-- 出力: -1.0（強気Bearish）〜 +1.0（強気Bullish）のスコア
-- 皮肉・ジャーゴン・絵文字も考慮したコンテキスト理解
-- 銘柄ごとに直近30分のスコアを移動平均で保持
-
-**主要クラス:**
-```python
-class SentimentAnalyzer:
-    def __init__(self, api_key: str)
-    def analyze(self, texts: list[str], symbol: str) -> SentimentResult
-    # SentimentResult: score: float, confidence: float, reasoning: str
-
-    def get_rolling_score(self, symbol: str, window_minutes: int = 30) -> float
-```
-
-**Claude APIプロンプト方針:**
-- モデル: `claude-sonnet-4-20250514`
-- システムプロンプトで「株式市場のセンチメント分析専門家」として設定
-- JSON形式で `{"score": 0.0, "confidence": 0.0, "reasoning": ""}` を返させる
-- バッチ処理で複数テキストを一括分析しAPIコール数を最小化
-
----
-
-### 4.4 flow_detector.py
-
-**役割:** moomoo独自の大口フローデータを監視し、買い超過・売り超過を検出する
-
-**検出ロジック:**
 - 過去15分間の大口フロー累積値を計算
 - 買い超過比率 = 大口買い / (大口買い + 大口売り)
-- 閾値: `FLOW_BUY_THRESHOLD = 0.65`（65%以上が買いなら買い超過シグナル）
-- 空売り比率が急増した場合はショートスクイーズ候補としてフラグ
+- 空売り比率急増でショートスクイーズ候補フラグ
 
-**主要クラス:**
 ```python
 class FlowDetector:
     def get_flow_signal(self, symbol: str) -> FlowSignal
     # FlowSignal: direction: "BUY"|"SELL"|"NEUTRAL", strength: float, short_squeeze: bool
 ```
 
----
-
-### 4.5 and_filter.py
-
-**役割:** センチメントと大口フローの両シグナルを統合し、エントリー判定を行う
-
-**判定ロジック:**
-```python
-def should_enter(sentiment: SentimentResult, flow: FlowSignal) -> EntryDecision:
-    if sentiment.score > SENTIMENT_THRESHOLD:      # default: +0.3
-        if flow.direction == "BUY":
-            if sentiment.confidence > CONFIDENCE_MIN:  # default: 0.6
-                return EntryDecision(go=True, direction="LONG")
-    return EntryDecision(go=False)
-```
-
-**設定値:**
-```python
-SENTIMENT_THRESHOLD = 0.3    # センチメントスコアの最低閾値
-CONFIDENCE_MIN = 0.6          # LLMの確信度最低値
-FLOW_BUY_THRESHOLD = 0.65    # 大口買い比率の最低閾値
-```
-
----
-
-### 4.6 position_sizer.py
-
-**役割:** Kelly基準に基づき最適ポジションサイズを算出する
-
-**計算式:**
-```
-Kelly% = (勝率 × 平均利益) - (敗率 × 平均損失) / 平均損失
-実際のサイズ = Kelly% × 0.5  # ハーフケリーで保守的に
-上限 = 総資金の2%
-```
-
-**主要クラス:**
-```python
-class PositionSizer:
-    def calculate(self, symbol: str, price: float, account_balance: float) -> int
-    def update_stats(self, trade_result: TradeResult) -> None  # 勝率を動的更新
-```
-
----
-
-### 4.7 stop_loss.py
-
-**役割:** ATR（Average True Range）ベースで動的にSL/TPを設定する
-
-**ロジック:**
-- SL = エントリー価格 - (ATR × 1.5)
-- TP = エントリー価格 + (ATR × 2.5)  → リスクリワード比 1:1.67
-- VWAPからの乖離が2%を超えた場合は即時撤退
-
-**主要クラス:**
-```python
-class StopLossManager:
-    def calculate_levels(self, symbol: str, entry_price: float) -> Levels
-    # Levels: stop_loss: float, take_profit: float, trailing_stop: float
-```
-
----
-
-### 4.8 circuit_breaker.py
-
-**役割:** 異常時の自動停止とリスク管理
-
-**発動条件:**
-- 日次損失が資金の3%を超えた → 当日の全新規発注を停止
-- 最大ドローダウンが10%を超えた → 全ポジション強制決済・システム停止
-- 連続3敗 → ポジションサイズを50%に縮小
-
-```python
-class CircuitBreaker:
-    def check(self, account_state: AccountState) -> BreakerStatus
-    def reset_daily(self) -> None  # 毎朝9:30（ET）に自動リセット
-```
-
----
-
-### 4.9 order_router.py
-
-**役割:** moomoo OpenAPI経由での発注・決済管理
-
-**発注フロー:**
-1. `circuit_breaker.check()` で安全確認
-2. `paper_trade` フラグ確認
-3. 成行 or 指値で発注
-4. 注文IDを記録し、SL/TPを監視ループに登録
+### 5.3 order_router.py ⬜
 
 ```python
 class OrderRouter:
@@ -292,39 +256,30 @@ class OrderRouter:
     def monitor_positions(self) -> None  # 非同期ループ
 ```
 
----
+### 5.4 main.py ⬜
 
-### 4.10 main.py
-
-**役割:** 全モジュールのオーケストレーション
-
-**メインループ（疑似コード）:**
 ```python
 async def main_loop():
     while market_is_open():
         for symbol in WATCHLIST:
-            # データ収集
-            posts = board_scraper.fetch_posts(symbol)
-            news  = news_feed.get_latest(symbol)
-            flow  = flow_detector.get_flow_signal(symbol)
-
-            # シグナル生成
+            posts     = board_scraper.fetch_posts(symbol)
+            news      = news_feed.get_latest(symbol)
+            flow      = flow_detector.get_flow_signal(symbol)
             sentiment = sentiment_analyzer.analyze(posts + news, symbol)
             decision  = and_filter.should_enter(sentiment, flow)
 
-            # リスク計算 → 発注
             if decision.go:
-                size   = position_sizer.calculate(symbol, current_price, balance)
-                levels = stop_loss_manager.calculate_levels(symbol, current_price)
+                size   = position_sizer.calculate(symbol, price, balance)
+                levels = stop_loss_manager.calculate_levels(symbol, price)
                 order  = order_router.enter(decision, size)
                 pnl_tracker.register(order, levels)
 
-        await asyncio.sleep(LOOP_INTERVAL_SECONDS)  # default: 30
+        await asyncio.sleep(LOOP_INTERVAL_SECONDS)
 ```
 
 ---
 
-## 5. 技術スタック
+## 6. 技術スタック
 
 | カテゴリ | ライブラリ | 用途 |
 |---------|-----------|------|
@@ -333,31 +288,16 @@ async def main_loop():
 | LLM | `anthropic` (Claude API) | センチメント解析 |
 | データ処理 | `pandas`, `numpy` | 価格・フロー集計 |
 | テクニカル | `pandas-ta` | ATR・VWAP計算 |
-| DB | `PostgreSQL` + `TimescaleDB` | 時系列データ保存 |
-| 監視 | `Grafana` | P&L・シグナルダッシュボード |
-| 通知 | `python-telegram-bot` | Telegramアラート |
+| HTTP | `requests` | Discord Webhook送信 |
+| DB | `PostgreSQL` + `TimescaleDB` | 時系列データ保存（将来） |
+| 通知 | Discord Webhook | 3チャンネル通知 |
 | テスト | `pytest`, `pytest-asyncio` | 単体・統合テスト |
 
 **Pythonバージョン:** 3.11+
 
-**requirements.txt（主要パッケージ）:**
-```
-moomoo-openapi>=4.0.0
-anthropic>=0.20.0
-pandas>=2.0.0
-pandas-ta>=0.3.14b
-numpy>=1.24.0
-aiohttp>=3.9.0
-asyncpg>=0.29.0
-python-telegram-bot>=21.0
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-python-dotenv>=1.0.0
-```
-
 ---
 
-## 6. 環境変数（.env.example）
+## 7. 環境変数（.env.example）
 
 ```env
 # moomoo OpenAPI
@@ -373,97 +313,112 @@ TRADE_ENV=SIMULATE          # SIMULATE or REAL
 MAX_DAILY_LOSS_PCT=0.03     # 日次最大損失 3%
 MAX_DRAWDOWN_PCT=0.10       # 最大ドローダウン 10%
 POSITION_MAX_PCT=0.02       # 1ポジション最大 2%
+LOOP_INTERVAL_SECONDS=30    # メインループ間隔
 
-# Telegram通知
-TELEGRAM_BOT_TOKEN=your_token
-TELEGRAM_CHAT_ID=your_chat_id
-
-# DB
-DATABASE_URL=postgresql://user:pass@localhost/daytrade
+# Discord Webhook（3チャンネル）
+DISCORD_WEBHOOK_SIGNAL=https://discord.com/api/webhooks/...   # mt-signal
+DISCORD_WEBHOOK_ALERT=https://discord.com/api/webhooks/...    # mt-alert
+DISCORD_WEBHOOK_SUMMARY=https://discord.com/api/webhooks/...  # mt-summary
 ```
 
 ---
 
-## 7. 実装ロードマップ
+## 8. シグナル閾値設定（config/settings.py）
 
-### Phase 1: 基盤構築（Week 1-2）
-- [ ] moomoo OpenAPI接続・ペーパートレード動作確認
-- [ ] `MoomooClient` の実装とユニットテスト
-- [ ] `config/settings.py` の整備
-
-### Phase 2: シグナルエンジン（Week 3-4）
-- [ ] `SentimentAnalyzer` 実装（Claude API連携）
-- [ ] `FlowDetector` 実装・閾値チューニング
-- [ ] `AndFilter` 実装・ロジック検証
-- [ ] 過去データで精度測定
-
-### Phase 3: リスク管理（Week 5）
-- [ ] `PositionSizer` 実装（ハーフKelly）
-- [ ] `StopLossManager` 実装（ATRベース）
-- [ ] `CircuitBreaker` 実装・テスト
-
-### Phase 4: 統合・バックテスト（Week 6-7）
-- [ ] `main.py` で全モジュール統合
-- [ ] `backtest.py` で過去3ヶ月データ検証
-- [ ] パフォーマンス指標確認（シャープレシオ > 1.5 を目標）
-
-### Phase 5: 本番デプロイ（Week 8〜）
-- [ ] `TRADE_ENV=SIMULATE` で2週間ライブペーパートレード
-- [ ] 問題なければ小額実弾（$500程度）でスタート
-- [ ] Grafanaダッシュボード整備
-- [ ] Telegram通知セットアップ
+```python
+SENTIMENT_THRESHOLD   = 0.3    # センチメントスコア最低値
+CONFIDENCE_MIN        = 0.6    # LLM確信度最低値
+FLOW_BUY_THRESHOLD    = 0.65   # 大口買い比率最低値
+FLOW_WINDOW_MINUTES   = 15     # 大口フロー集計ウィンドウ
+SENTIMENT_WINDOW_MIN  = 30     # センチメント移動平均ウィンドウ
+VWAP_DEVIATION_MAX    = 0.02   # VWAP乖離撤退閾値（2%）
+ATR_SL_MULTIPLIER     = 1.5    # SL = entry - ATR × 1.5
+ATR_TP_MULTIPLIER     = 2.5    # TP = entry + ATR × 2.5
+CONSECUTIVE_LOSS_MAX  = 3      # 連続敗北でサイズ縮小
+```
 
 ---
 
-## 8. 将来拡張：強化学習（RL）統合
+## 9. 実装ロードマップ
+
+### Phase 1: 完了済み ✅
+- [x] sentiment_analyzer.py（23テスト・実API確認済み）
+- [x] and_filter.py（18テスト）
+- [x] position_sizer.py（19テスト）
+- [x] stop_loss.py（16テスト）
+- [x] circuit_breaker.py（19テスト）
+- [x] notifier.py（15テスト・Discord Webhook対応）
+- [x] pnl_tracker.py（35テスト）
+- [x] check_connection.py（5ステップ確認）
+
+### Phase 2: 口座開設後 ⬜
+- [ ] moomoo OpenAPI申請・承認
+- [ ] OpenD Windows版インストール・起動
+- [ ] `python scripts/check_connection.py` で全ステップ確認
+- [ ] moomoo_client.py 実装・テスト
+- [ ] flow_detector.py 実装・テスト
+- [ ] board_scraper.py 実装
+- [ ] order_router.py 実装
+- [ ] main.py 統合
+
+### Phase 3: 統合・検証 ⬜
+- [ ] ペーパートレードで2週間ライブ動作確認
+- [ ] backtest.py で過去データ検証
+- [ ] シャープレシオ > 1.5 を確認
+- [ ] 小額実弾（$500程度）でスタート
+
+### Phase 4: 将来拡張 ⬜
+- [ ] 強化学習（RL）エージェント導入
+- [ ] 監視銘柄の拡大
+- [ ] PostgreSQL + TimescaleDB 導入
+- [ ] Grafanaダッシュボード整備
+
+---
+
+## 10. 将来拡張：強化学習（RL）統合
 
 本設計はRL追加を想定した構造になっている。
-
-**現在のAND条件フィルターをRLエージェントに段階的に置き換える:**
+`and_filter.py`のAND条件をRLエージェントに段階的に置き換えるだけで移行可能。
 
 ```
 Phase 1（現在）: ルールベース AND条件
-Phase 2: RLエージェントがAND条件の閾値を動的最適化
-Phase 3: RLエージェントが特徴量の重みを自律決定
+Phase 2:        RLエージェントが閾値を動的最適化
+Phase 3:        RLエージェントが特徴量の重みを自律決定
 ```
 
-**状態空間（State）として渡せる特徴量:**
-- センチメントスコア（-1.0〜+1.0）
-- センチメント移動平均（5分・15分・30分）
-- 大口フロー強度（0.0〜1.0）
-- 空売り比率
-- VWAPからの価格乖離率
-- ATR（ボラティリティ指標）
+**状態空間（State）として使える特徴量:**
+- センチメントスコア・移動平均（5分・15分・30分）
+- 大口フロー強度・空売り比率
+- VWAPからの価格乖離率・ATR
 - 時間帯（寄り付き・昼・引け）
 
-**報酬関数:**
-```
-報酬 = リスクリワード比を考慮した利益 - ドローダウンペナルティ
-```
-
 **注意:** RLはデータ量が必要なため、最低3〜6ヶ月のライブデータ蓄積後に着手を推奨。
-moomooのペーパートレード機能をGym環境として活用できる。
 
 ---
 
-## 9. Claude Codeへの実装依頼メモ
+## 11. Claude Codeへの次の実装依頼（口座開設後）
 
-本設計書に基づき、以下の順序で実装を依頼する:
+```
+moomoo OpenAPIの承認が完了しました。
+scripts/check_connection.py が全ステップPASSしました。
 
-1. **まず `config/settings.py` と `.env.example` を作成**
-2. **`src/data/moomoo_client.py` を実装** — moomoo OpenAPI SDK公式ドキュメントを参照
-3. **`src/signal/sentiment_analyzer.py` を実装** — Anthropic Python SDKを使用
-4. **`src/signal/flow_detector.py` を実装**
-5. **`src/signal/and_filter.py` を実装**
-6. **`src/risk/` 配下を実装**
-7. **`src/execution/order_router.py` を実装**
-8. **`src/main.py` で統合**
-9. **`tests/` 配下にユニットテストを作成**
+DESIGN.mdのセクション5に従い以下を実装してください:
 
-**各モジュールに求める品質:**
-- 型ヒント（Type Hints）を全関数に付与
-- docstringで仕様を明記
-- ユニットテストをセットで作成
-- 非同期処理（async/await）を活用し低レイテンシを維持
-- エラーハンドリング（API接続断・レート制限）を適切に実装
+1. src/data/moomoo_client.py
+   - moomoo OpenAPI公式SDKを使用
+   - WebSocket経由のリアルタイム株価取得
+   - 大口フロー・空売りデータの取得
+   - ペーパートレード / 本番の切り替え対応
+
+2. src/signal/flow_detector.py
+   - MoomooClientから大口フローデータを取得
+   - 15分ウィンドウで買い超過比率を計算
+   - FlowSignal(direction, strength, short_squeeze)を返す
+
+3. src/execution/order_router.py
+   - CircuitBreakerの確認後に発注
+   - SL/TPをStopLossManagerから取得して設定
+   - 非同期でポジション監視ループを実行
+
+各モジュールに型ヒント・docstring・ユニットテストをセットで作成。
 ```
