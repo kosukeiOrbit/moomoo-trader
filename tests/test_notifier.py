@@ -2,22 +2,49 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
-from src.monitor.notifier import Notifier
+from src.monitor.notifier import (
+    Notifier,
+    COLOR_BLUE,
+    COLOR_GREEN,
+    COLOR_RED,
+)
 
 
 # ---------------------------------------------------------------------------
 # ヘルパー
 # ---------------------------------------------------------------------------
 
+FAKE_SIGNAL = "https://discord.com/api/webhooks/signal/xxx"
+FAKE_ALERT = "https://discord.com/api/webhooks/alert/xxx"
+FAKE_SUMMARY = "https://discord.com/api/webhooks/summary/xxx"
+
+
 def _make_notifier(configured: bool = True) -> Notifier:
     """テスト用 Notifier を生成する."""
     if configured:
-        return Notifier(bot_token="test-token", chat_id="12345")
-    return Notifier(bot_token="", chat_id="")
+        return Notifier(
+            webhook_signal=FAKE_SIGNAL,
+            webhook_alert=FAKE_ALERT,
+            webhook_summary=FAKE_SUMMARY,
+        )
+    return Notifier(webhook_signal="", webhook_alert="", webhook_summary="")
+
+
+def _mock_post_ok() -> MagicMock:
+    """requests.post の成功モックを返す."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 204
+    return MagicMock(return_value=mock_resp)
+
+
+def _extract_payload(mock_post: MagicMock) -> dict:
+    """mock_post から送信された JSON payload を取り出す."""
+    return mock_post.call_args[1]["json"]
 
 
 # ---------------------------------------------------------------------------
@@ -31,65 +58,65 @@ class TestNotifierBasic:
         n = _make_notifier(configured=True)
         assert n.is_configured is True
 
-    def test_is_configured_false_no_token(self) -> None:
-        n = Notifier(bot_token="", chat_id="123")
-        assert n.is_configured is False
-
-    def test_is_configured_false_no_chat_id(self) -> None:
-        n = Notifier(bot_token="tok", chat_id="")
-        assert n.is_configured is False
-
-    @pytest.mark.asyncio
-    async def test_send_skips_when_not_configured(self) -> None:
-        """未設定時は送信せず False を返す."""
+    def test_is_configured_false_all_empty(self) -> None:
         n = _make_notifier(configured=False)
-        result = await n.send("test")
+        assert n.is_configured is False
+
+    def test_is_configured_partial(self) -> None:
+        """1つでも設定されていれば True."""
+        n = Notifier(webhook_signal=FAKE_SIGNAL, webhook_alert="", webhook_summary="")
+        assert n.is_configured is True
+
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_skips_empty_url(self, mock_post: MagicMock) -> None:
+        """URL 空文字の場合は POST せず False."""
+        n = _make_notifier(configured=False)
+        result = n.notify_signal("AAPL", 0.5, 0.8, 150.0)
         assert result is False
+        mock_post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# send()
+# _post() エラーハンドリング
 # ---------------------------------------------------------------------------
 
-class TestNotifierSend:
-    """send() のテスト."""
+class TestNotifierPost:
+    """_post() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_send_success(self) -> None:
-        """正常送信で True を返す."""
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_success_204(self, mock_post: MagicMock) -> None:
+        """204 で True を返す."""
+        mock_post.return_value = MagicMock(status_code=204)
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
+        assert n._post(FAKE_SIGNAL, {"test": True}) is True
 
-        result = await n.send("hello")
-        assert result is True
-        mock_bot.send_message.assert_awaited_once_with(
-            chat_id="12345", text="hello",
-        )
-
-    @pytest.mark.asyncio
-    async def test_send_telegram_error_returns_false(self) -> None:
-        """TelegramError で False を返し、システムは止まらない."""
-        from telegram.error import TelegramError
-
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_success_200(self, mock_post: MagicMock) -> None:
+        """200 でも True を返す."""
+        mock_post.return_value = MagicMock(status_code=200)
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        mock_bot.send_message.side_effect = TelegramError("network error")
-        n._bot = mock_bot
+        assert n._post(FAKE_SIGNAL, {"test": True}) is True
 
-        result = await n.send("hello")
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_send_unexpected_error_returns_false(self) -> None:
-        """予期しない例外でも False を返す."""
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_http_error_returns_false(self, mock_post: MagicMock) -> None:
+        """4xx/5xx で False."""
+        mock_post.return_value = MagicMock(status_code=400, text="Bad Request")
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        mock_bot.send_message.side_effect = RuntimeError("boom")
-        n._bot = mock_bot
+        assert n._post(FAKE_SIGNAL, {}) is False
 
-        result = await n.send("hello")
-        assert result is False
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_network_error_returns_false(self, mock_post: MagicMock) -> None:
+        """接続エラーで False（システムは止まらない）."""
+        mock_post.side_effect = requests.ConnectionError("network down")
+        n = _make_notifier()
+        assert n._post(FAKE_SIGNAL, {}) is False
+
+    @patch("src.monitor.notifier.requests.post")
+    def test_post_unexpected_error_returns_false(self, mock_post: MagicMock) -> None:
+        """予期しない例外でも False."""
+        mock_post.side_effect = RuntimeError("boom")
+        n = _make_notifier()
+        assert n._post(FAKE_SIGNAL, {}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -99,25 +126,28 @@ class TestNotifierSend:
 class TestNotifierSignal:
     """notify_signal() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_signal_message_format(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_signal_embed_format(self, mock_post: MagicMock) -> None:
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
-
-        await n.notify_signal(
+        result = n.notify_signal(
             symbol="NVDA",
             sentiment_score=0.75,
             flow_strength=0.82,
             entry_price=125.50,
             direction="LONG",
         )
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "SIGNAL" in msg
-        assert "NVDA" in msg
-        assert "+0.75" in msg
-        assert "0.82" in msg
-        assert "125.50" in msg
+        assert result is True
+        # Webhook URL は mt-signal
+        assert mock_post.call_args[0][0] == FAKE_SIGNAL
+        payload = _extract_payload(mock_post)
+        embed = payload["embeds"][0]
+        assert "SIGNAL" in embed["title"]
+        assert "NVDA" in embed["title"]
+        assert embed["color"] == COLOR_BLUE
+        field_values = [f["value"] for f in embed["fields"]]
+        assert "+0.75" in field_values
+        assert "0.82" in field_values
+        assert "$125.50" in field_values
 
 
 # ---------------------------------------------------------------------------
@@ -127,18 +157,18 @@ class TestNotifierSignal:
 class TestNotifierEntry:
     """notify_entry() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_entry_message_format(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_entry_embed_format(self, mock_post: MagicMock) -> None:
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
-
-        await n.notify_entry("AAPL", "LONG", 10, 150.00)
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "ENTRY" in msg
-        assert "AAPL" in msg
-        assert "10" in msg
-        assert "150.00" in msg
+        n.notify_entry("AAPL", "LONG", 10, 150.00)
+        payload = _extract_payload(mock_post)
+        embed = payload["embeds"][0]
+        assert "ENTRY" in embed["title"]
+        assert "AAPL" in embed["title"]
+        assert embed["color"] == COLOR_GREEN
+        field_values = [f["value"] for f in embed["fields"]]
+        assert "10 shares" in field_values
+        assert "$150.00" in field_values
 
 
 # ---------------------------------------------------------------------------
@@ -148,28 +178,31 @@ class TestNotifierEntry:
 class TestNotifierExit:
     """notify_exit() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_exit_profit_message(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_exit_profit_green(self, mock_post: MagicMock) -> None:
+        """利益のときは緑."""
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
+        n.notify_exit("AAPL", 250.00, "TP")
+        payload = _extract_payload(mock_post)
+        embed = payload["embeds"][0]
+        assert embed["color"] == COLOR_GREEN
+        field_values = [f["value"] for f in embed["fields"]]
+        assert "$+250.00" in field_values
+        assert "TP" in field_values
+        # mt-alert に送信される
+        assert mock_post.call_args[0][0] == FAKE_ALERT
 
-        await n.notify_exit("AAPL", 250.00, "TP")
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "EXIT" in msg
-        assert "+250.00" in msg
-        assert "TP" in msg
-
-    @pytest.mark.asyncio
-    async def test_exit_loss_message(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_exit_loss_red(self, mock_post: MagicMock) -> None:
+        """損失のときは赤."""
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
-
-        await n.notify_exit("TSLA", -120.00, "SL")
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "-120.00" in msg
-        assert "SL" in msg
+        n.notify_exit("TSLA", -120.00, "SL")
+        payload = _extract_payload(mock_post)
+        embed = payload["embeds"][0]
+        assert embed["color"] == COLOR_RED
+        field_values = [f["value"] for f in embed["fields"]]
+        assert "$-120.00" in field_values
+        assert "SL" in field_values
 
 
 # ---------------------------------------------------------------------------
@@ -179,16 +212,19 @@ class TestNotifierExit:
 class TestNotifierCircuitBreaker:
     """notify_circuit_breaker() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_circuit_breaker_message(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_circuit_breaker_red_with_everyone(self, mock_post: MagicMock) -> None:
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
-
-        await n.notify_circuit_breaker("日次損失3%超過")
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "CIRCUIT BREAKER" in msg
-        assert "日次損失" in msg
+        n.notify_circuit_breaker("日次損失3%超過")
+        payload = _extract_payload(mock_post)
+        # @everyone が content に含まれる
+        assert payload["content"] == "@everyone"
+        embed = payload["embeds"][0]
+        assert "CIRCUIT BREAKER" in embed["title"]
+        assert embed["color"] == COLOR_RED
+        assert "日次損失" in embed["description"]
+        # mt-alert に送信される
+        assert mock_post.call_args[0][0] == FAKE_ALERT
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +234,9 @@ class TestNotifierCircuitBreaker:
 class TestNotifierDailySummary:
     """notify_daily_summary() のテスト."""
 
-    @pytest.mark.asyncio
-    async def test_daily_summary_message(self) -> None:
+    @patch("src.monitor.notifier.requests.post", new_callable=_mock_post_ok)
+    def test_daily_summary_embed(self, mock_post: MagicMock) -> None:
         n = _make_notifier()
-        mock_bot = AsyncMock()
-        n._bot = mock_bot
-
         summary = {
             "daily_pnl": 350.50,
             "total_trades": 8,
@@ -211,9 +244,14 @@ class TestNotifierDailySummary:
             "max_drawdown": 0.015,
             "open_positions": 2,
         }
-        await n.notify_daily_summary(summary)
-        msg = mock_bot.send_message.call_args[1]["text"]
-        assert "DAILY SUMMARY" in msg
-        assert "+350.50" in msg
-        assert "8" in msg
-        assert "62%" in msg  # 0.625 → 62%
+        n.notify_daily_summary(summary)
+        # mt-summary に送信される
+        assert mock_post.call_args[0][0] == FAKE_SUMMARY
+        payload = _extract_payload(mock_post)
+        embed = payload["embeds"][0]
+        assert "DAILY SUMMARY" in embed["title"]
+        assert embed["color"] == COLOR_GREEN  # PnL > 0 → 緑
+        field_values = [f["value"] for f in embed["fields"]]
+        assert "$+350.50" in field_values
+        assert "8" in field_values
+        assert "62%" in field_values
