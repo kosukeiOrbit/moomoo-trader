@@ -1,36 +1,59 @@
-"""リアルタイムP&L記録モジュール."""
+"""リアルタイムP&L記録モジュール.
+
+トレードごとの記録・日次サマリー計算・CSV保存を担当する。
+PostgreSQL未接続でもCSVファイルのみで動作する。
+"""
 
 from __future__ import annotations
 
+import csv
 import logging
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# CSV保存先のデフォルトディレクトリ
+DEFAULT_CSV_DIR = Path("data/trades")
 
 
 @dataclass
 class TradeRecord:
     """トレード記録."""
+
     order_id: str
     symbol: str
-    direction: str
+    direction: str  # "LONG" or "SHORT"
     size: int
     entry_price: float
     exit_price: float | None = None
     pnl: float = 0.0
+    reason: str = ""  # 決済理由 (SL / TP / センチメント反転 等)
     opened_at: datetime = field(default_factory=datetime.now)
     closed_at: datetime | None = None
 
 
 class PnLTracker:
-    """P&Lトラッカー: リアルタイムに損益を記録・集計する."""
+    """P&Lトラッカー: トレードの記録・集計・CSV保存を行う."""
 
-    def __init__(self) -> None:
+    CSV_HEADER = [
+        "order_id", "symbol", "direction", "size",
+        "entry_price", "exit_price", "pnl", "reason",
+        "opened_at", "closed_at",
+    ]
+
+    def __init__(self, csv_dir: Path | str | None = None) -> None:
         self._open_trades: dict[str, TradeRecord] = {}
         self._closed_trades: list[TradeRecord] = []
         self._daily_pnl: float = 0.0
         self._peak_balance: float = 0.0
+        self._csv_dir = Path(csv_dir) if csv_dir else DEFAULT_CSV_DIR
+
+    # ------------------------------------------------------------------
+    # トレード登録・決済
+    # ------------------------------------------------------------------
 
     def register(
         self,
@@ -40,15 +63,7 @@ class PnLTracker:
         size: int,
         entry_price: float,
     ) -> None:
-        """新規トレードを記録する.
-
-        Args:
-            order_id: 注文ID
-            symbol: 銘柄シンボル
-            direction: "LONG" or "SHORT"
-            size: 株数
-            entry_price: エントリー価格
-        """
+        """新規トレードを記録する."""
         self._open_trades[order_id] = TradeRecord(
             order_id=order_id,
             symbol=symbol,
@@ -56,14 +71,23 @@ class PnLTracker:
             size=size,
             entry_price=entry_price,
         )
-        logger.info("トレード記録: %s %s %s %d株 @ %.2f", order_id, direction, symbol, size, entry_price)
+        logger.info(
+            "トレード記録: %s %s %s %d株 @ %.2f",
+            order_id, direction, symbol, size, entry_price,
+        )
 
-    def close_trade(self, order_id: str, exit_price: float) -> float:
+    def close_trade(
+        self,
+        order_id: str,
+        exit_price: float,
+        reason: str = "",
+    ) -> float:
         """トレードを決済記録する.
 
         Args:
             order_id: 注文ID
             exit_price: 決済価格
+            reason: 決済理由 (SL / TP / センチメント反転 等)
 
         Returns:
             損益
@@ -80,12 +104,20 @@ class PnLTracker:
 
         trade.exit_price = exit_price
         trade.pnl = pnl
+        trade.reason = reason
         trade.closed_at = datetime.now()
         self._closed_trades.append(trade)
         self._daily_pnl += pnl
 
-        logger.info("トレード決済: %s PnL=%.2f 日次合計=%.2f", order_id, pnl, self._daily_pnl)
+        logger.info(
+            "トレード決済: %s PnL=%.2f reason=%s 日次合計=%.2f",
+            order_id, pnl, reason, self._daily_pnl,
+        )
         return pnl
+
+    # ------------------------------------------------------------------
+    # プロパティ
+    # ------------------------------------------------------------------
 
     @property
     def daily_pnl(self) -> float:
@@ -102,31 +134,206 @@ class PnLTracker:
         """オープンポジション数."""
         return len(self._open_trades)
 
+    @property
+    def peak_balance(self) -> float:
+        """ピーク残高."""
+        return self._peak_balance
+
+    @property
+    def closed_trade_count(self) -> int:
+        """決済済みトレード数."""
+        return len(self._closed_trades)
+
+    # ------------------------------------------------------------------
+    # ピーク残高
+    # ------------------------------------------------------------------
+
     def update_peak_balance(self, current_balance: float) -> None:
         """ピーク残高を更新する."""
         if current_balance > self._peak_balance:
             self._peak_balance = current_balance
 
-    @property
-    def peak_balance(self) -> float:
-        """ピーク残高."""
-        return self._peak_balance
+    # ------------------------------------------------------------------
+    # 勝率
+    # ------------------------------------------------------------------
+
+    def get_win_rate(self, last_n: int | None = None) -> float:
+        """勝率を返す.
+
+        Args:
+            last_n: 直近Nトレードで計算（Noneなら全期間）
+
+        Returns:
+            勝率 (0.0〜1.0)
+        """
+        trades = self._closed_trades
+        if last_n is not None and last_n > 0:
+            trades = trades[-last_n:]
+        if not trades:
+            return 0.0
+        wins = sum(1 for t in trades if t.pnl > 0)
+        return wins / len(trades)
+
+    # ------------------------------------------------------------------
+    # 最大ドローダウン
+    # ------------------------------------------------------------------
+
+    def get_max_drawdown(self) -> float:
+        """決済済みトレードの累積損益から最大ドローダウン率を計算する.
+
+        Returns:
+            最大ドローダウン率 (0.0〜1.0)
+        """
+        if not self._closed_trades:
+            return 0.0
+
+        cumulative = 0.0
+        peak = 0.0
+        max_dd = 0.0
+
+        for trade in self._closed_trades:
+            cumulative += trade.pnl
+            if cumulative > peak:
+                peak = cumulative
+            if peak > 0:
+                dd = (peak - cumulative) / peak
+                if dd > max_dd:
+                    max_dd = dd
+
+        return max_dd
+
+    # ------------------------------------------------------------------
+    # シャープレシオ
+    # ------------------------------------------------------------------
+
+    def get_sharpe_ratio(self) -> float:
+        """決済済みトレードのシャープレシオを計算する.
+
+        Sharpe = mean(pnl) / std(pnl)  (リスクフリーレート=0と仮定)
+
+        Returns:
+            シャープレシオ（トレード2件未満は0.0）
+        """
+        if len(self._closed_trades) < 2:
+            return 0.0
+
+        pnls = [t.pnl for t in self._closed_trades]
+        mean_pnl = sum(pnls) / len(pnls)
+        variance = sum((p - mean_pnl) ** 2 for p in pnls) / (len(pnls) - 1)
+        std_pnl = math.sqrt(variance)
+
+        if std_pnl == 0:
+            return 0.0
+        return mean_pnl / std_pnl
+
+    # ------------------------------------------------------------------
+    # 日次サマリー
+    # ------------------------------------------------------------------
+
+    def get_daily_summary(self) -> dict:
+        """当日のサマリーを返す."""
+        today = date.today()
+        today_trades = [
+            t for t in self._closed_trades
+            if t.closed_at is not None and t.closed_at.date() == today
+        ]
+        wins = sum(1 for t in today_trades if t.pnl > 0)
+        total = len(today_trades)
+
+        return {
+            "date": today.isoformat(),
+            "daily_pnl": self._daily_pnl,
+            "total_trades": total,
+            "wins": wins,
+            "losses": total - wins,
+            "win_rate": wins / max(total, 1),
+            "max_drawdown": self.get_max_drawdown(),
+            "sharpe_ratio": self.get_sharpe_ratio(),
+            "open_positions": self.open_trade_count,
+        }
+
+    # ------------------------------------------------------------------
+    # リセット
+    # ------------------------------------------------------------------
 
     def reset_daily(self) -> None:
         """日次リセット."""
         self._daily_pnl = 0.0
         logger.info("日次P&Lをリセットしました")
 
-    def get_summary(self) -> dict:
-        """サマリーを返す."""
-        wins = [t for t in self._closed_trades if t.pnl > 0]
-        losses = [t for t in self._closed_trades if t.pnl <= 0]
-        return {
-            "total_pnl": self.total_pnl,
-            "daily_pnl": self.daily_pnl,
-            "total_trades": len(self._closed_trades),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": len(wins) / max(len(self._closed_trades), 1),
-            "open_positions": self.open_trade_count,
-        }
+    # ------------------------------------------------------------------
+    # CSV保存・読み込み
+    # ------------------------------------------------------------------
+
+    def save_to_csv(self, filename: str | None = None) -> Path:
+        """決済済みトレードをCSVファイルに保存する.
+
+        Args:
+            filename: ファイル名（Noneなら trades_YYYY-MM-DD.csv）
+
+        Returns:
+            保存先のパス
+        """
+        self._csv_dir.mkdir(parents=True, exist_ok=True)
+        if filename is None:
+            filename = f"trades_{date.today().isoformat()}.csv"
+        filepath = self._csv_dir / filename
+
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.CSV_HEADER)
+            for t in self._closed_trades:
+                writer.writerow([
+                    t.order_id,
+                    t.symbol,
+                    t.direction,
+                    t.size,
+                    f"{t.entry_price:.4f}",
+                    f"{t.exit_price:.4f}" if t.exit_price is not None else "",
+                    f"{t.pnl:.4f}",
+                    t.reason,
+                    t.opened_at.isoformat(),
+                    t.closed_at.isoformat() if t.closed_at else "",
+                ])
+
+        logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
+        return filepath
+
+    def load_from_csv(self, filepath: Path | str) -> int:
+        """CSVファイルからトレード履歴を読み込む.
+
+        Args:
+            filepath: CSVファイルパス
+
+        Returns:
+            読み込んだレコード数
+        """
+        filepath = Path(filepath)
+        if not filepath.exists():
+            logger.warning("CSVファイルが見つかりません: %s", filepath)
+            return 0
+
+        count = 0
+        with open(filepath, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trade = TradeRecord(
+                    order_id=row["order_id"],
+                    symbol=row["symbol"],
+                    direction=row["direction"],
+                    size=int(row["size"]),
+                    entry_price=float(row["entry_price"]),
+                    exit_price=float(row["exit_price"]) if row["exit_price"] else None,
+                    pnl=float(row["pnl"]),
+                    reason=row.get("reason", ""),
+                    opened_at=datetime.fromisoformat(row["opened_at"]),
+                    closed_at=(
+                        datetime.fromisoformat(row["closed_at"])
+                        if row.get("closed_at") else None
+                    ),
+                )
+                self._closed_trades.append(trade)
+                count += 1
+
+        logger.info("CSVから読み込み: %s (%d件)", filepath, count)
+        return count
