@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from moomoo import (
+from futu import (
     OpenQuoteContext,
     OpenSecTradeContext,
     RET_OK,
@@ -119,9 +119,9 @@ class MoomooClient:
             port=settings.MOOMOO_PORT,
         )
         self._trade_ctx = OpenSecTradeContext(
+            filter_trdmarket=TrdMarket.US,
             host=settings.MOOMOO_HOST,
             port=settings.MOOMOO_PORT,
-            trd_env=self._trd_env,
         )
 
         if settings.MOOMOO_TRADE_PWD:
@@ -280,7 +280,6 @@ class MoomooClient:
         assert self._trade_ctx is not None
         ret, data = self._trade_ctx.accinfo_query(
             trd_env=self._trd_env,
-            trd_market=TrdMarket.US,
         )
         if ret != RET_OK or data.empty:
             logger.warning("口座残高取得失敗")
@@ -313,7 +312,6 @@ class MoomooClient:
             trd_side=side,
             order_type=order_type,
             trd_env=self._trd_env,
-            trd_market=TrdMarket.US,
         )
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)

@@ -18,7 +18,7 @@ _mock_moomoo.TrdEnv.REAL = "REAL"
 _mock_moomoo.TrdMarket = MagicMock()
 _mock_moomoo.TrdSide = MagicMock()
 _mock_moomoo.OrderType = MagicMock()
-sys.modules["moomoo"] = _mock_moomoo
+sys.modules["futu"] = _mock_moomoo
 
 from src.data.moomoo_client import (
     MoomooClient,

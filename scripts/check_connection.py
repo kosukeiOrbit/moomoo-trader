@@ -90,7 +90,7 @@ def check_api_connection() -> tuple[bool, object | None]:
     """Step 2: moomoo OpenAPI に接続して認証を確認."""
     header("[2/5] moomoo OpenAPI 認証")
     try:
-        from moomoo import OpenQuoteContext, RET_OK
+        from futu import OpenQuoteContext, RET_OK
 
         quote_ctx = OpenQuoteContext(
             host=settings.MOOMOO_HOST,
@@ -111,7 +111,7 @@ def check_api_connection() -> tuple[bool, object | None]:
     except ImportError:
         fail(
             "API認証: FAILED — moomoo パッケージが見つかりません\n"
-            "         pip install moomoo-openapi を実行してください"
+            "         pip install futu-api を実行してください"
         )
         return False, None
     except Exception as e:
@@ -123,7 +123,7 @@ def check_quote_data(quote_ctx: object) -> bool:
     """Step 3: 米国市場の株価を取得."""
     header("[3/5] 株価取得テスト")
     try:
-        from moomoo import RET_OK
+        from futu import RET_OK
 
         symbols = ["US.AAPL", "US.NVDA"]
         ret, data = quote_ctx.get_market_snapshot(symbols)  # type: ignore[union-attr]
@@ -155,15 +155,15 @@ def check_account_balance() -> bool:
     """Step 4: ペーパートレードアカウントの残高を取得."""
     header("[4/5] 口座残高取得")
     try:
-        from moomoo import OpenSecTradeContext, TrdEnv, TrdMarket, RET_OK
+        from futu import OpenSecTradeContext, TrdEnv, TrdMarket, RET_OK
 
         trd_env = TrdEnv.SIMULATE if settings.TRADE_ENV == "SIMULATE" else TrdEnv.REAL
         env_label = "ペーパートレード" if trd_env == TrdEnv.SIMULATE else "本番"
 
         trade_ctx = OpenSecTradeContext(
+            filter_trdmarket=TrdMarket.US,
             host=settings.MOOMOO_HOST,
             port=settings.MOOMOO_PORT,
-            trd_env=trd_env,
         )
 
         # トレードパスワードでアンロック
@@ -174,7 +174,7 @@ def check_account_balance() -> bool:
                 trade_ctx.close()
                 return False
 
-        ret, data = trade_ctx.accinfo_query(trd_env=trd_env, trd_market=TrdMarket.US)
+        ret, data = trade_ctx.accinfo_query(trd_env=trd_env)
         trade_ctx.close()
 
         if ret != RET_OK:

@@ -8,8 +8,8 @@ import sys
 import pytest
 
 # moomoo SDK がインストールされていない環境でもテスト可能にする
-if "moomoo" not in sys.modules:
-    sys.modules["moomoo"] = MagicMock()
+if "futu" not in sys.modules:
+    sys.modules["futu"] = MagicMock()
 
 from src.signal.and_filter import AndFilter, EntryDecision
 from src.signal.sentiment_analyzer import SentimentResult

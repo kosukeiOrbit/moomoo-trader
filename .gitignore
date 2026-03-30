@@ -42,3 +42,12 @@ logs/
 # Database
 *.db
 *.sqlite3
+
+# moomoo OpenD binaries
+moomoo_OpenD_*/
+
+# Claude Code
+.claude/
+
+# Trade data
+data/trades/

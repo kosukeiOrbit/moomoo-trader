@@ -1,4 +1,4 @@
-moomoo-openapi>=4.0.0
+futu-api>=10.2.0
 anthropic>=0.20.0
 pandas>=2.0.0
 pandas-ta>=0.3.14b

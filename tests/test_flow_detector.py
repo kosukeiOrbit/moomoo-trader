@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 # moomoo SDK が未インストールでもテスト可能にする
-if "moomoo" not in sys.modules:
-    sys.modules["moomoo"] = MagicMock()
+if "futu" not in sys.modules:
+    sys.modules["futu"] = MagicMock()
 
 from src.data.moomoo_client import FlowData, ShortData
 from src.signal.flow_detector import FlowDetector, FlowSignal

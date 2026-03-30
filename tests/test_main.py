@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 # moomoo SDK モック
-if "moomoo" not in sys.modules:
-    sys.modules["moomoo"] = MagicMock()
+if "futu" not in sys.modules:
+    sys.modules["futu"] = MagicMock()
 
 from src.main import market_is_open, should_force_exit, ET, JST
 

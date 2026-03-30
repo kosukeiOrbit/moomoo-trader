@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 import pytest
 
 # moomoo SDK が未インストールでもテスト可能にする
-if "moomoo" not in sys.modules:
-    sys.modules["moomoo"] = MagicMock()
+if "futu" not in sys.modules:
+    sys.modules["futu"] = MagicMock()
 
 from src.data.moomoo_client import Order, OrderResult, QuoteSnapshot
 from src.execution.order_router import OrderRouter, Position
