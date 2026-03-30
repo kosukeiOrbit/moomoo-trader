@@ -5,9 +5,12 @@
 
 .DESCRIPTION
     以下の3タスクを登録する:
-      1. MoomooTrader-OpenD     毎日 23:20 に OpenD.exe を起動
-      2. MoomooTrader-Bot       毎日 23:25 に python src/main.py を起動
-      3. MoomooTrader-Stop      毎日 06:10 に Bot と OpenD を停止
+      1. MoomooTrader-OpenD     月〜金 23:20 に OpenD.exe を起動
+      2. MoomooTrader-Bot       月〜金 23:25 に python src/main.py を起動
+      3. MoomooTrader-Stop      火〜土 06:10 に Bot と OpenD を停止
+                                （月曜夜の取引 → 火曜朝に停止）
+
+    米国祝日は自動判定しないため、手動で無効化すること（下記コマンド参照）。
 
     管理者権限で実行すること:
       PowerShell -ExecutionPolicy Bypass -File scripts\setup_scheduler.ps1
@@ -102,6 +105,7 @@ function Register-MoomooTask {
         [string]$TaskName,
         [string]$Description,
         [string]$Time,
+        [string[]]$DaysOfWeek,
         [string]$Execute,
         [string]$Arguments = "",
         [string]$WorkingDirectory = ""
@@ -114,8 +118,8 @@ function Register-MoomooTask {
         Write-Host "  既存タスク削除: $TaskName" -ForegroundColor Yellow
     }
 
-    # トリガー: 毎日指定時刻
-    $trigger = New-ScheduledTaskTrigger -Daily -At $Time
+    # トリガー: 毎週指定曜日の指定時刻
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $DaysOfWeek -At $Time
 
     # アクション
     $actionParams = @{
@@ -162,8 +166,9 @@ Write-Host "--- タスク登録 ---" -ForegroundColor Cyan
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-OpenD" `
-    -Description "moomoo OpenD を起動する (23:20)" `
+    -Description "moomoo OpenD を起動する (月〜金 23:20)" `
     -Time "23:20" `
+    -DaysOfWeek @("Monday","Tuesday","Wednesday","Thursday","Friday") `
     -Execute $OpenDExe `
     -WorkingDirectory $OpenDDir
 
@@ -173,8 +178,9 @@ Register-MoomooTask `
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-Bot" `
-    -Description "moomoo-trader Bot を起動する (23:25)" `
+    -Description "moomoo-trader Bot を起動する (月〜金 23:25)" `
     -Time "23:25" `
+    -DaysOfWeek @("Monday","Tuesday","Wednesday","Thursday","Friday") `
     -Execute $PythonExe `
     -Arguments $MainPy `
     -WorkingDirectory $ProjectRoot
@@ -185,8 +191,9 @@ Register-MoomooTask `
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-Stop" `
-    -Description "moomoo-trader Bot と OpenD を停止する (06:10)" `
+    -Description "moomoo-trader Bot と OpenD を停止する (火〜土 06:10)" `
     -Time "06:10" `
+    -DaysOfWeek @("Tuesday","Wednesday","Thursday","Friday","Saturday") `
     -Execute "powershell.exe" `
     -Arguments "-ExecutionPolicy Bypass -File `"$StopScript`"" `
     -WorkingDirectory $ProjectRoot
@@ -200,11 +207,11 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " 登録完了" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  23:20  MoomooTrader-OpenD   OpenD.exe 起動"
-Write-Host "  23:25  MoomooTrader-Bot     python src/main.py 起動"
-Write-Host "  06:10  MoomooTrader-Stop    Bot + OpenD 停止"
+Write-Host "  23:20  MoomooTrader-OpenD   OpenD.exe 起動    (月〜金)"
+Write-Host "  23:25  MoomooTrader-Bot     python src/main.py  (月〜金)"
+Write-Host "  06:10  MoomooTrader-Stop    Bot + OpenD 停止   (火〜土)"
 Write-Host ""
-Write-Host "確認コマンド:" -ForegroundColor Yellow
+Write-Host "確認:" -ForegroundColor Yellow
 Write-Host "  Get-ScheduledTask -TaskName 'MoomooTrader-*' | Format-Table TaskName, State"
 Write-Host ""
 Write-Host "手動実行:" -ForegroundColor Yellow
@@ -212,6 +219,17 @@ Write-Host "  Start-ScheduledTask -TaskName 'MoomooTrader-OpenD'"
 Write-Host "  Start-ScheduledTask -TaskName 'MoomooTrader-Bot'"
 Write-Host "  Start-ScheduledTask -TaskName 'MoomooTrader-Stop'"
 Write-Host ""
-Write-Host "削除:" -ForegroundColor Yellow
+Write-Host "米国祝日の一時無効化:" -ForegroundColor Yellow
+Write-Host "  # 祝日前日の夜に無効化"
+Write-Host "  Disable-ScheduledTask -TaskName 'MoomooTrader-OpenD'"
+Write-Host "  Disable-ScheduledTask -TaskName 'MoomooTrader-Bot'"
+Write-Host "  Disable-ScheduledTask -TaskName 'MoomooTrader-Stop'"
+Write-Host ""
+Write-Host "  # 翌営業日の前に再有効化"
+Write-Host "  Enable-ScheduledTask -TaskName 'MoomooTrader-OpenD'"
+Write-Host "  Enable-ScheduledTask -TaskName 'MoomooTrader-Bot'"
+Write-Host "  Enable-ScheduledTask -TaskName 'MoomooTrader-Stop'"
+Write-Host ""
+Write-Host "全タスク削除:" -ForegroundColor Yellow
 Write-Host "  Get-ScheduledTask -TaskName 'MoomooTrader-*' | Unregister-ScheduledTask -Confirm:`$false"
 Write-Host ""
