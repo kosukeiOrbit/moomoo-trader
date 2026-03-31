@@ -125,7 +125,7 @@ class TestSentimentAnalyzerUnit:
         )
         result = analyzer.analyze(["some text"], "AAPL")
         assert result.score == 0.0
-        assert "パースエラー" in result.reasoning
+        assert "Parse error" in result.reasoning
 
     def test_api_error_returns_zero(self) -> None:
         """APIError 時にスコア0を返す."""
@@ -139,55 +139,31 @@ class TestSentimentAnalyzerUnit:
         )
         result = analyzer.analyze(["some text"], "AAPL")
         assert result.score == 0.0
-        assert "APIエラー" in result.reasoning
+        assert "error" in result.reasoning.lower()
 
-    @patch("src.signals.sentiment_analyzer.time.sleep")
-    def test_rate_limit_retries(self, mock_sleep: MagicMock) -> None:
-        """RateLimitError 時にリトライしてから成功する."""
+    def test_status_error_529_returns_zero(self) -> None:
+        """529 Overloaded (SDK がリトライ後に到達) でスコア0を返す."""
         analyzer = _make_mock_analyzer()
         analyzer._client.messages.create = MagicMock(
-            side_effect=[
-                anthropic.RateLimitError(
-                    message="rate limited",
-                    response=MagicMock(status_code=429, headers={}),
-                    body=None,
-                ),
-                _mock_response('{"score": 0.6, "confidence": 0.8, "reasoning": "retry ok"}'),
-            ]
-        )
-        result = analyzer.analyze(["test"], "AAPL")
-        assert result.score == 0.6
-        assert mock_sleep.call_count == 1
-
-    @patch("src.signals.sentiment_analyzer.time.sleep")
-    def test_connection_error_retries(self, mock_sleep: MagicMock) -> None:
-        """APIConnectionError 時にリトライする."""
-        analyzer = _make_mock_analyzer()
-        analyzer._client.messages.create = MagicMock(
-            side_effect=[
-                anthropic.APIConnectionError(request=MagicMock()),
-                _mock_response('{"score": 0.4, "confidence": 0.7, "reasoning": "recovered"}'),
-            ]
-        )
-        result = analyzer.analyze(["test"], "AAPL")
-        assert result.score == 0.4
-        assert mock_sleep.call_count == 1
-
-    @patch("src.signals.sentiment_analyzer.time.sleep")
-    def test_all_retries_exhausted(self, mock_sleep: MagicMock) -> None:
-        """全リトライが失敗した場合にスコア0を返す."""
-        analyzer = _make_mock_analyzer()
-        analyzer._client.messages.create = MagicMock(
-            side_effect=anthropic.RateLimitError(
-                message="rate limited",
-                response=MagicMock(status_code=429, headers={}),
+            side_effect=anthropic.APIStatusError(
+                message="Overloaded",
+                response=MagicMock(status_code=529, headers={}),
                 body=None,
             )
         )
         result = analyzer.analyze(["test"], "AAPL")
         assert result.score == 0.0
-        assert "リトライ上限" in result.reasoning
-        assert mock_sleep.call_count == 3  # MAX_RETRIES
+        assert "529" in result.reasoning
+
+    def test_connection_error_returns_zero(self) -> None:
+        """APIConnectionError でスコア0を返す."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create = MagicMock(
+            side_effect=anthropic.APIConnectionError(request=MagicMock()),
+        )
+        result = analyzer.analyze(["test"], "AAPL")
+        assert result.score == 0.0
+        assert "error" in result.reasoning.lower()
 
     def test_batch_limit_trims_texts(self) -> None:
         """BATCH_LIMIT を超えるテキストは切り詰められる."""

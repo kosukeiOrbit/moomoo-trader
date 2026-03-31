@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,10 +13,6 @@ import anthropic
 from config import settings
 
 logger = logging.getLogger(__name__)
-
-# リトライ設定
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 1.0  # 秒
 
 
 @dataclass
@@ -37,9 +32,9 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 class SentimentAnalyzer:
     """Claude APIによるテキストセンチメント解析エンジン.
 
-    複数テキストをバッチ処理して1回のAPIコールで分析し、
-    レート制限・接続断に対して指数バックオフでリトライする。
-    直近N分のスコアを移動平均として保持する。
+    Anthropic SDK の内蔵リトライ (max_retries=3, 指数バックオフ) に任せ、
+    アプリ側では追加リトライをしない。
+    529 Overloaded が連続する場合は score=0.0 を返してループを続行する。
     """
 
     SYSTEM_PROMPT = (
@@ -58,15 +53,14 @@ class SentimentAnalyzer:
     def __init__(self, api_key: str | None = None) -> None:
         self._client = anthropic.Anthropic(
             api_key=api_key or settings.ANTHROPIC_API_KEY,
+            max_retries=3,       # SDK内蔵リトライ (429/529 で指数バックオフ)
+            timeout=30.0,        # 30秒タイムアウト
         )
         # symbol -> [(timestamp, score)] のローリングウィンドウ
         self._score_history: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
 
     def analyze(self, texts: list[str], symbol: str) -> SentimentResult:
         """テキストリストを一括分析してセンチメントスコアを返す.
-
-        複数テキストを1つのプロンプトにバッチ結合し、APIコール数を最小化する。
-        レート制限・接続断は指数バックオフでリトライする。
 
         Args:
             texts: 掲示板投稿・ニュース記事のテキストリスト
@@ -90,8 +84,7 @@ class SentimentAnalyzer:
             f"{combined}"
         )
 
-        # APIコール（リトライ付き）
-        result = self._call_api_with_retry(user_message)
+        result = self._call_api(user_message)
 
         # ローリングウィンドウに記録
         if result.score != 0.0 or result.confidence != 0.0:
@@ -100,49 +93,38 @@ class SentimentAnalyzer:
 
         return result
 
-    def _call_api_with_retry(self, user_message: str) -> SentimentResult:
-        """指数バックオフ付きでClaude APIを呼び出す."""
-        last_error: Exception | None = None
+    def _call_api(self, user_message: str) -> SentimentResult:
+        """Claude API を呼び出す（リトライは SDK 内蔵に任せる）."""
+        try:
+            response = self._client.messages.create(
+                model=settings.CLAUDE_MODEL,
+                max_tokens=256,
+                system=self.SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            return self._parse_response(response)
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self._client.messages.create(
-                    model=settings.CLAUDE_MODEL,
-                    max_tokens=256,
-                    system=self.SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": user_message}],
-                )
-                return self._parse_response(response)
+        except anthropic.APIStatusError as e:
+            # 529 Overloaded, 500 Internal Error etc. (SDK が max_retries 回リトライ後にここに来る)
+            logger.error("Claude API %d: %s", e.status_code, e.message)
+            return SentimentResult(
+                score=0.0, confidence=0.0,
+                reasoning=f"API error {e.status_code}",
+            )
 
-            except anthropic.RateLimitError as e:
-                last_error = e
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                logger.warning(
-                    "レート制限 (attempt %d/%d): %.1f秒後にリトライ",
-                    attempt + 1, MAX_RETRIES, delay,
-                )
-                time.sleep(delay)
+        except anthropic.APIConnectionError as e:
+            logger.error("Claude API connection error: %s", e)
+            return SentimentResult(
+                score=0.0, confidence=0.0,
+                reasoning=f"Connection error: {e}",
+            )
 
-            except anthropic.APIConnectionError as e:
-                last_error = e
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                logger.warning(
-                    "接続エラー (attempt %d/%d): %.1f秒後にリトライ — %s",
-                    attempt + 1, MAX_RETRIES, delay, e,
-                )
-                time.sleep(delay)
-
-            except anthropic.APIError as e:
-                logger.error("Claude API エラー: %s", e)
-                return SentimentResult(
-                    score=0.0, confidence=0.0, reasoning=f"APIエラー: {e}",
-                )
-
-        # 全リトライ失敗
-        logger.error("APIリトライ上限到達: %s", last_error)
-        return SentimentResult(
-            score=0.0, confidence=0.0, reasoning=f"リトライ上限到達: {last_error}",
-        )
+        except anthropic.APIError as e:
+            logger.error("Claude API error: %s", e)
+            return SentimentResult(
+                score=0.0, confidence=0.0,
+                reasoning=f"API error: {e}",
+            )
 
     def _parse_response(self, response: anthropic.types.Message) -> SentimentResult:
         """APIレスポンスをパースしてSentimentResultに変換する."""
@@ -166,21 +148,13 @@ class SentimentAnalyzer:
                 reasoning=reasoning,
             )
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-            logger.error("レスポンスのパースに失敗: %s (raw=%s)", e, raw[:200] if 'raw' in dir() else "N/A")
+            logger.error("Response parse error: %s", e)
             return SentimentResult(
-                score=0.0, confidence=0.0, reasoning=f"パースエラー: {e}",
+                score=0.0, confidence=0.0, reasoning=f"Parse error: {e}",
             )
 
     def get_rolling_score(self, symbol: str, window_minutes: int = 30) -> float:
-        """直近N分間のセンチメントスコアの移動平均を返す.
-
-        Args:
-            symbol: 銘柄シンボル
-            window_minutes: ウィンドウ幅（分）
-
-        Returns:
-            移動平均スコア（データなしの場合は0.0）
-        """
+        """直近N分間のセンチメントスコアの移動平均を返す."""
         cutoff = datetime.now() - timedelta(minutes=window_minutes)
         history = self._score_history.get(symbol, [])
         recent = [score for ts, score in history if ts >= cutoff]
