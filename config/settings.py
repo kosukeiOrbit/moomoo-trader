@@ -10,6 +10,7 @@ MOOMOO_HOST: str = os.getenv("MOOMOO_HOST", "127.0.0.1")
 MOOMOO_PORT: int = int(os.getenv("MOOMOO_PORT", "11111"))
 MOOMOO_TRADE_PWD: str = os.getenv("MOOMOO_TRADE_PWD", "")
 TRADE_ENV: str = os.getenv("TRADE_ENV", "SIMULATE")  # "SIMULATE" or "REAL"
+SECURITY_FIRM: str = os.getenv("SECURITY_FIRM", "FUTUJP")  # moomoo証券（日本）
 
 # --- Anthropic Claude API ---
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")

@@ -164,6 +164,7 @@ def check_account_balance() -> bool:
             filter_trdmarket=TrdMarket.US,
             host=settings.MOOMOO_HOST,
             port=settings.MOOMOO_PORT,
+            security_firm=settings.SECURITY_FIRM,
         )
 
         # トレードパスワードでアンロック（本番のみ。ペーパートレードは不要）
