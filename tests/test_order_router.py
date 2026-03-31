@@ -7,19 +7,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# moomoo SDK が未インストールでもテスト可能にする
+# futu SDK mock
 if "futu" not in sys.modules:
     sys.modules["futu"] = MagicMock()
 
 from src.data.moomoo_client import Order, OrderResult, QuoteSnapshot
-from src.execution.order_router import OrderRouter, Position
+from src.execution.order_router import OrderRouter, Position, ExitResult
 from src.risk.circuit_breaker import CircuitBreaker
 from src.risk.stop_loss import Levels
 from src.signals.and_filter import EntryDecision
 
 
 # ---------------------------------------------------------------------------
-# ヘルパー
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _go_long() -> EntryDecision:
@@ -30,59 +30,61 @@ def _no_go() -> EntryDecision:
     return EntryDecision(go=False, reason="test")
 
 
-def _make_router(paper: bool = True) -> tuple[OrderRouter, MagicMock]:
-    mock_client = MagicMock()
-    cb = CircuitBreaker()
-    router = OrderRouter(mock_client, cb, paper_trade=paper)
-    return router, mock_client
-
-
 def _levels() -> Levels:
     return Levels(stop_loss=145.0, take_profit=160.0, trailing_stop=147.0)
 
 
+def _make_router(
+    paper: bool = True,
+    on_exit: object = None,
+    snapshot_price: float = 155.0,
+) -> tuple[OrderRouter, MagicMock]:
+    mock_client = MagicMock()
+    mock_client.get_snapshot.return_value = QuoteSnapshot(
+        symbol="AAPL", last_price=snapshot_price, volume=0, turnover=0,
+    )
+    cb = CircuitBreaker()
+    router = OrderRouter(mock_client, cb, paper_trade=paper, on_exit=on_exit)
+    return router, mock_client
+
+
 # ---------------------------------------------------------------------------
-# ペーパートレード
+# Paper trade
 # ---------------------------------------------------------------------------
 
 class TestOrderRouterPaper:
-    """ペーパートレードモードのテスト."""
 
     def test_enter_paper(self) -> None:
-        """ペーパーモードでエントリーできる."""
         router, _ = _make_router(paper=True)
         result = router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
         assert result is not None
         assert result.status == "PAPER_FILLED"
         assert router.position_count == 1
 
-    def test_exit_paper(self) -> None:
-        """ペーパーモードで決済できる."""
+    def test_exit_paper_returns_exit_result(self) -> None:
         router, _ = _make_router(paper=True)
-        result = router.enter(_go_long(), "AAPL", 10, 150.0)
-        assert result is not None
-        exit_result = router.exit(result.order_id, "TP")
-        assert exit_result is not None
-        assert exit_result.status == "PAPER_CLOSED"
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        result = router.exit(oid, "TP")
+        assert isinstance(result, ExitResult)
+        assert result.exit_price == 155.0  # from mock snapshot
+        assert result.pnl == 50.0  # (155-150)*10
+        assert result.reason == "TP"
         assert router.position_count == 0
 
     def test_no_go_returns_none(self) -> None:
-        """go=False のとき None を返す."""
         router, _ = _make_router()
         assert router.enter(_no_go(), "AAPL", 10, 150.0) is None
 
     def test_zero_size_returns_none(self) -> None:
-        """size=0 のとき None を返す."""
         router, _ = _make_router()
         assert router.enter(_go_long(), "AAPL", 0, 150.0) is None
 
     def test_exit_unknown_returns_none(self) -> None:
-        """存在しないポジションの決済は None."""
         router, _ = _make_router()
         assert router.exit("UNKNOWN", "test") is None
 
     def test_paper_order_id_increments(self) -> None:
-        """ペーパー注文IDが連番になる."""
         router, _ = _make_router()
         r1 = router.enter(_go_long(), "AAPL", 5, 150.0)
         r2 = router.enter(_go_long(), "NVDA", 5, 500.0)
@@ -91,14 +93,12 @@ class TestOrderRouterPaper:
 
 
 # ---------------------------------------------------------------------------
-# 実弾モード
+# Real mode
 # ---------------------------------------------------------------------------
 
 class TestOrderRouterReal:
-    """実弾モードのテスト."""
 
     def test_enter_real_success(self) -> None:
-        """実弾エントリー成功."""
         router, mock_client = _make_router(paper=False)
         mock_client.place_order.return_value = OrderResult(
             order_id="REAL-001", status="SUBMITTED",
@@ -106,20 +106,15 @@ class TestOrderRouterReal:
         result = router.enter(_go_long(), "AAPL", 10, 150.0)
         assert result.order_id == "REAL-001"
         assert router.position_count == 1
-        mock_client.place_order.assert_called_once()
 
     def test_enter_real_failure(self) -> None:
-        """実弾エントリー失敗 → ポジション記録なし."""
         router, mock_client = _make_router(paper=False)
-        mock_client.place_order.return_value = OrderResult(
-            order_id="", status="FAILED",
-        )
+        mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
         result = router.enter(_go_long(), "AAPL", 10, 150.0)
         assert result.status == "FAILED"
         assert router.position_count == 0
 
     def test_exit_real_success(self) -> None:
-        """実弾決済成功."""
         router, mock_client = _make_router(paper=False)
         mock_client.place_order.side_effect = [
             OrderResult(order_id="REAL-001", status="SUBMITTED"),
@@ -127,7 +122,8 @@ class TestOrderRouterReal:
         ]
         router.enter(_go_long(), "AAPL", 10, 150.0)
         result = router.exit("REAL-001", "SL")
-        assert result.status == "SUBMITTED"
+        assert result is not None
+        assert result.order_result.status == "SUBMITTED"
         assert router.position_count == 0
 
 
@@ -136,43 +132,118 @@ class TestOrderRouterReal:
 # ---------------------------------------------------------------------------
 
 class TestOrderRouterExitAll:
-    """exit_all() のテスト."""
 
     def test_exit_all_closes_all(self) -> None:
-        """全ポジションが決済される."""
         router, _ = _make_router(paper=True)
         router.enter(_go_long(), "AAPL", 10, 150.0)
         router.enter(_go_long(), "NVDA", 5, 500.0)
-        assert router.position_count == 2
 
-        results = router.exit_all("05:50 JST 強制決済")
+        results = router.exit_all("force close")
         assert len(results) == 2
         assert router.position_count == 0
+        assert all(isinstance(r, ExitResult) for r in results)
 
     def test_exit_all_empty(self) -> None:
-        """ポジションなしなら空リスト."""
         router, _ = _make_router()
         assert router.exit_all("test") == []
 
 
 # ---------------------------------------------------------------------------
-# ポジション監視
+# on_exit callback
+# ---------------------------------------------------------------------------
+
+class TestOrderRouterOnExit:
+
+    def test_on_exit_called_on_exit(self) -> None:
+        """exit() で on_exit コールバックが呼ばれる."""
+        callback = MagicMock()
+        router, _ = _make_router(paper=True, on_exit=callback)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        router.exit(oid, "TP")
+
+        callback.assert_called_once()
+        result: ExitResult = callback.call_args[0][0]
+        assert result.exit_price == 155.0
+        assert result.pnl == 50.0
+        assert result.reason == "TP"
+
+    def test_on_exit_called_on_exit_all(self) -> None:
+        """exit_all() で各ポジションに on_exit が呼ばれる."""
+        callback = MagicMock()
+        router, _ = _make_router(paper=True, on_exit=callback)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        router.enter(_go_long(), "NVDA", 5, 500.0)
+
+        router.exit_all("force close")
+        assert callback.call_count == 2
+
+    def test_on_exit_loss(self) -> None:
+        """損失の場合 pnl が負になる."""
+        callback = MagicMock()
+        # exit price 140 < entry 150 → loss
+        router, _ = _make_router(paper=True, on_exit=callback, snapshot_price=140.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        router.exit(oid, "SL")
+
+        result: ExitResult = callback.call_args[0][0]
+        assert result.pnl == -100.0  # (140-150)*10
+        assert result.reason == "SL"
+
+    def test_on_exit_exception_does_not_crash(self) -> None:
+        """on_exit がエラーを投げてもクラッシュしない."""
+        callback = MagicMock(side_effect=RuntimeError("boom"))
+        router, _ = _make_router(paper=True, on_exit=callback)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        # Should not raise
+        result = router.exit(oid, "TP")
+        assert result is not None
+
+    def test_no_callback_is_ok(self) -> None:
+        """on_exit 未設定でも正常動作."""
+        router, _ = _make_router(paper=True, on_exit=None)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        result = router.exit(oid, "TP")
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# PnL calculation
+# ---------------------------------------------------------------------------
+
+class TestOrderRouterPnL:
+
+    def test_long_profit(self) -> None:
+        """LONG: exit > entry → profit."""
+        router, _ = _make_router(paper=True, snapshot_price=160.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        result = router.exit(oid, "TP")
+        assert result.pnl == 100.0  # (160-150)*10
+
+    def test_long_loss(self) -> None:
+        """LONG: exit < entry → loss."""
+        router, _ = _make_router(paper=True, snapshot_price=145.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        result = router.exit(oid, "SL")
+        assert result.pnl == -50.0  # (145-150)*10
+
+
+# ---------------------------------------------------------------------------
+# Monitor positions
 # ---------------------------------------------------------------------------
 
 class TestOrderRouterMonitor:
-    """monitor_positions() のテスト."""
 
     @pytest.mark.asyncio
     async def test_monitor_triggers_sl(self) -> None:
-        """株価がSLを下回ると自動決済する."""
-        router, mock_client = _make_router(paper=True)
-        levels = Levels(stop_loss=145.0, take_profit=160.0, trailing_stop=147.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0, levels)
-
-        # SL以下の株価を返す
-        mock_client.get_snapshot.return_value = QuoteSnapshot(
-            symbol="AAPL", last_price=144.0, volume=0, turnover=0,
-        )
+        callback = MagicMock()
+        router, mock_client = _make_router(paper=True, on_exit=callback, snapshot_price=144.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
 
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
@@ -183,19 +254,15 @@ class TestOrderRouterMonitor:
         except asyncio.CancelledError:
             pass
 
-        # SLで決済されている
         assert router.position_count == 0
+        callback.assert_called_once()
+        assert callback.call_args[0][0].reason == "SL"
 
     @pytest.mark.asyncio
     async def test_monitor_triggers_tp(self) -> None:
-        """株価がTPを上回ると自動決済する."""
-        router, mock_client = _make_router(paper=True)
-        levels = Levels(stop_loss=145.0, take_profit=160.0, trailing_stop=147.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0, levels)
-
-        mock_client.get_snapshot.return_value = QuoteSnapshot(
-            symbol="AAPL", last_price=161.0, volume=0, turnover=0,
-        )
+        callback = MagicMock()
+        router, mock_client = _make_router(paper=True, on_exit=callback, snapshot_price=161.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
 
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
@@ -207,17 +274,14 @@ class TestOrderRouterMonitor:
             pass
 
         assert router.position_count == 0
+        callback.assert_called_once()
+        assert callback.call_args[0][0].reason == "TP"
 
     @pytest.mark.asyncio
     async def test_monitor_no_exit_in_range(self) -> None:
-        """株価がSL/TP範囲内なら決済しない."""
-        router, mock_client = _make_router(paper=True)
-        levels = Levels(stop_loss=145.0, take_profit=160.0, trailing_stop=147.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0, levels)
-
-        mock_client.get_snapshot.return_value = QuoteSnapshot(
-            symbol="AAPL", last_price=152.0, volume=0, turnover=0,
-        )
+        callback = MagicMock()
+        router, _ = _make_router(paper=True, on_exit=callback, snapshot_price=152.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
 
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
@@ -229,3 +293,4 @@ class TestOrderRouterMonitor:
             pass
 
         assert router.position_count == 1
+        callback.assert_not_called()

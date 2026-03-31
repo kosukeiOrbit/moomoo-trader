@@ -2,6 +2,7 @@
 
 CircuitBreaker で安全確認 → StopLossManager から SL/TP 取得 →
 MoomooClient で発注。SIMULATE/REAL モード切り替え対応。
+決済時は on_exit コールバックで pnl_tracker / notifier / position_sizer を更新する。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Callable
 
 from config import settings
 from src.data.moomoo_client import MoomooClient, Order, OrderResult
@@ -33,11 +35,26 @@ class Position:
     opened_at: datetime = field(default_factory=datetime.now)
 
 
+@dataclass
+class ExitResult:
+    """決済結果（価格・PnL 込み）."""
+
+    order_result: OrderResult
+    position: Position
+    exit_price: float
+    pnl: float
+    reason: str
+
+
+# コールバック型: (ExitResult) -> None
+OnExitCallback = Callable[[ExitResult], None]
+
+
 class OrderRouter:
     """発注ルーター: 安全チェック → 発注 → ポジション管理.
 
-    paper_trade=True の場合は実際の発注を行わず、
-    ローカルでポジションを記録するだけのシミュレーションモードで動作する。
+    決済時に on_exit コールバックを呼び出し、
+    pnl_tracker / notifier / position_sizer を一元的に更新する。
     """
 
     def __init__(
@@ -45,12 +62,14 @@ class OrderRouter:
         client: MoomooClient,
         circuit_breaker: CircuitBreaker,
         paper_trade: bool = True,
+        on_exit: OnExitCallback | None = None,
     ) -> None:
         self._client = client
         self._circuit_breaker = circuit_breaker
         self._paper_trade = paper_trade
         self._positions: dict[str, Position] = {}
         self._order_seq: int = 0
+        self._on_exit = on_exit
 
     # ------------------------------------------------------------------
     # プロパティ
@@ -78,22 +97,7 @@ class OrderRouter:
         price: float,
         levels: Levels | None = None,
     ) -> OrderResult | None:
-        """エントリー注文を発注する.
-
-        1. signal.go == False or size <= 0 → None
-        2. ペーパートレード → ローカル記録
-        3. 実弾 → MoomooClient.place_order()
-
-        Args:
-            signal: エントリー判定結果
-            symbol: 銘柄シンボル
-            size: 発注株数
-            price: 現在の株価
-            levels: SL/TP水準
-
-        Returns:
-            発注結果（発注不可の場合は None）
-        """
+        """エントリー注文を発注する."""
         if not signal.go or size <= 0:
             return None
 
@@ -110,7 +114,7 @@ class OrderRouter:
                 levels=levels,
             )
             logger.info(
-                "[PAPER] ENTRY: %s %s %d株 @ %.2f",
+                "[PAPER] ENTRY: %s %s %d shares @ $%.2f",
                 signal.direction, symbol, size, price,
             )
             return OrderResult(
@@ -135,7 +139,7 @@ class OrderRouter:
                 levels=levels,
             )
             logger.info(
-                "ENTRY: %s %s %d株 order_id=%s",
+                "ENTRY: %s %s %d shares order_id=%s",
                 signal.direction, symbol, size, result.order_id,
             )
         return result
@@ -144,51 +148,94 @@ class OrderRouter:
     # 決済
     # ------------------------------------------------------------------
 
-    def exit(self, order_id: str, reason: str) -> OrderResult | None:
+    def exit(self, order_id: str, reason: str) -> ExitResult | None:
         """ポジションを決済する.
+
+        1. 現在価格を取得
+        2. PnL を計算
+        3. ポジションを閉じる
+        4. on_exit コールバックを呼ぶ
 
         Args:
             order_id: 決済対象の注文ID
             reason: 決済理由
 
         Returns:
-            決済結果
+            決済結果（ポジション不存在なら None）
         """
         position = self._positions.get(order_id)
         if position is None:
-            logger.warning("決済対象なし: %s", order_id)
+            logger.warning("EXIT target not found: %s", order_id)
             return None
 
+        # 現在価格を取得
+        exit_price = self._get_exit_price(position.symbol)
+
+        # PnL 計算
+        if position.direction == "LONG":
+            pnl = (exit_price - position.entry_price) * position.size
+        else:
+            pnl = (position.entry_price - exit_price) * position.size
+
         logger.info(
-            "EXIT: %s (%s) 理由=%s", order_id, position.symbol, reason,
+            "EXIT: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+            order_id, position.symbol, position.entry_price,
+            exit_price, pnl, reason,
         )
 
+        # 発注 (実弾モードのみ)
+        order_result: OrderResult
         if self._paper_trade:
             del self._positions[order_id]
-            return OrderResult(order_id=order_id, status="PAPER_CLOSED")
+            order_result = OrderResult(order_id=order_id, status="PAPER_CLOSED")
+        else:
+            side = "SELL" if position.direction == "LONG" else "BUY"
+            order = Order(symbol=position.symbol, side=side, quantity=position.size)
+            order_result = self._client.place_order(order)
+            if order_result.status != "FAILED":
+                del self._positions[order_id]
+            else:
+                logger.error("EXIT order failed: %s", order_id)
+                return None
 
-        side = "SELL" if position.direction == "LONG" else "BUY"
-        order = Order(symbol=position.symbol, side=side, quantity=position.size)
-        result = self._client.place_order(order)
-        if result.status != "FAILED":
-            del self._positions[order_id]
-        return result
+        # コールバック
+        exit_result = ExitResult(
+            order_result=order_result,
+            position=position,
+            exit_price=exit_price,
+            pnl=pnl,
+            reason=reason,
+        )
+        if self._on_exit:
+            try:
+                self._on_exit(exit_result)
+            except Exception:
+                logger.exception("on_exit callback error")
 
-    def exit_all(self, reason: str) -> list[OrderResult]:
-        """全ポジションを決済する.
+        return exit_result
 
-        Args:
-            reason: 決済理由
-
-        Returns:
-            各ポジションの決済結果
-        """
-        results: list[OrderResult] = []
+    def exit_all(self, reason: str) -> list[ExitResult]:
+        """全ポジションを決済する."""
+        results: list[ExitResult] = []
         for order_id in list(self._positions.keys()):
             result = self.exit(order_id, reason)
             if result:
                 results.append(result)
         return results
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+
+    def _get_exit_price(self, symbol: str) -> float:
+        """現在の株価を取得する（取得失敗時は0.0）."""
+        try:
+            snapshot = self._client.get_snapshot(symbol)
+            if snapshot.last_price > 0:
+                return snapshot.last_price
+        except Exception:
+            logger.exception("Failed to get exit price for %s", symbol)
+        return 0.0
 
     # ------------------------------------------------------------------
     # ポジション監視
@@ -209,7 +256,7 @@ class OrderRouter:
                     # ストップロス
                     if price <= pos.levels.stop_loss:
                         logger.warning(
-                            "SL発動: %s %.2f <= %.2f",
+                            "SL triggered: %s $%.2f <= $%.2f",
                             pos.symbol, price, pos.levels.stop_loss,
                         )
                         self.exit(order_id, "SL")
@@ -217,12 +264,12 @@ class OrderRouter:
                     # テイクプロフィット
                     elif price >= pos.levels.take_profit:
                         logger.info(
-                            "TP発動: %s %.2f >= %.2f",
+                            "TP triggered: %s $%.2f >= $%.2f",
                             pos.symbol, price, pos.levels.take_profit,
                         )
                         self.exit(order_id, "TP")
 
                 except Exception:
-                    logger.exception("ポジション監視エラー: %s", order_id)
+                    logger.exception("Position monitor error: %s", order_id)
 
             await asyncio.sleep(1)

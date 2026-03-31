@@ -27,7 +27,7 @@ from src.signals.and_filter import AndFilter
 from src.risk.position_sizer import PositionSizer, TradeResult
 from src.risk.stop_loss import StopLossManager
 from src.risk.circuit_breaker import CircuitBreaker, AccountState, BreakerAction
-from src.execution.order_router import OrderRouter
+from src.execution.order_router import OrderRouter, ExitResult
 from src.monitor.pnl_tracker import PnLTracker
 from src.monitor.notifier import Notifier
 
@@ -138,10 +138,29 @@ async def main_loop() -> None:
     position_sizer = PositionSizer()
     stop_loss_manager = StopLossManager()
     circuit_breaker = CircuitBreaker()
-    paper_trade = settings.TRADE_ENV == "SIMULATE"
-    order_router = OrderRouter(client, circuit_breaker, paper_trade=paper_trade)
     pnl_tracker = PnLTracker()
     notifier = Notifier()
+
+    # 決済コールバック: pnl_tracker / notifier / position_sizer を一元更新
+    def _on_exit(result: ExitResult) -> None:
+        pnl = pnl_tracker.close_trade(
+            result.position.order_id, result.exit_price, result.reason,
+        )
+        is_win = pnl > 0
+        position_sizer.update_stats(TradeResult(
+            symbol=result.position.symbol, pnl=pnl, is_win=is_win,
+        ))
+        notifier.notify_exit(result.position.symbol, pnl, result.reason)
+        logger.info(
+            "[%s] EXIT %s pnl=$%.2f (%s)",
+            result.position.symbol, result.reason, pnl,
+            "WIN" if is_win else "LOSS",
+        )
+
+    paper_trade = settings.TRADE_ENV == "SIMULATE"
+    order_router = OrderRouter(
+        client, circuit_breaker, paper_trade=paper_trade, on_exit=_on_exit,
+    )
 
     # ポジション監視タスク
     monitor_task = asyncio.create_task(order_router.monitor_positions())
@@ -153,13 +172,11 @@ async def main_loop() -> None:
 
     try:
         while not _shutdown_requested:
-            # --- 05:50 JST 強制決済 ---
+            # --- ET 15:50 強制決済 ---
             if should_force_exit() and order_router.position_count > 0:
-                logger.warning("05:50 JST — 全ポジション強制決済")
-                results = order_router.exit_all("05:50 JST 強制決済")
-                for r in results:
-                    pnl_tracker.close_trade(r.order_id, 0.0, "05:50 JST 強制決済")
-                notifier.notify_circuit_breaker("05:50 JST 全ポジション強制決済")
+                logger.warning("ET 15:50 — Force closing all positions")
+                order_router.exit_all("ET 15:50 force close")
+                notifier.notify_circuit_breaker("ET 15:50 all positions force-closed")
                 break
 
             # --- 市場クローズ中は待機 ---
@@ -176,7 +193,7 @@ async def main_loop() -> None:
                 balance=balance,
                 daily_pnl=pnl_tracker.daily_pnl,
                 peak_balance=pnl_tracker.peak_balance,
-                consecutive_losses=0,
+                consecutive_losses=position_sizer.consecutive_losses,
             )
 
             breaker_status = circuit_breaker.check(account_state)
@@ -184,7 +201,7 @@ async def main_loop() -> None:
                 logger.warning("サーキットブレーカー: %s", breaker_status.reason)
                 notifier.notify_circuit_breaker(breaker_status.reason)
                 if breaker_status.action == BreakerAction.FORCE_CLOSE_ALL:
-                    order_router.exit_all("サーキットブレーカー")
+                    order_router.exit_all("Circuit breaker: force close")
                     break
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 continue
