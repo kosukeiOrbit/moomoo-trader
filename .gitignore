@@ -36,8 +36,7 @@ htmlcov/
 coverage.xml
 
 # Logs
-*.log
-logs/
+logs/*.log
 
 # Database
 *.db

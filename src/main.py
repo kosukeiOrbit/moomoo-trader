@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
+import os
 import signal
 import sys
 from datetime import datetime, time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from config import settings
@@ -28,10 +31,35 @@ from src.execution.order_router import OrderRouter
 from src.monitor.pnl_tracker import PnLTracker
 from src.monitor.notifier import Notifier
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+def _setup_logging() -> None:
+    """Console + daily rotating file logging."""
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+
+    # File handler (daily rotation: logs/bot_YYYYMMDD.log)
+    today = datetime.now().strftime("%Y%m%d")
+    file_handler = logging.FileHandler(
+        log_dir / f"bot_{today}.log",
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
@@ -136,7 +164,7 @@ async def main_loop() -> None:
 
             # --- 市場クローズ中は待機 ---
             if not market_is_open():
-                logger.debug("市場クローズ中。60秒後に再チェック...")
+                logger.info("Market closed. Waiting 60s...")
                 await asyncio.sleep(60)
                 continue
 
@@ -178,6 +206,13 @@ async def main_loop() -> None:
                     flow = flow_detector.get_flow_signal(symbol)
                     decision = and_filter.should_enter(sentiment, flow)
 
+                    logger.info(
+                        "[%s] texts=%d sentiment=%.2f conf=%.2f flow=%s(%.2f) -> %s",
+                        symbol, len(texts), sentiment.score, sentiment.confidence,
+                        flow.direction, flow.strength,
+                        "ENTRY" if decision.go else f"SKIP({decision.reason[:50]})",
+                    )
+
                     if decision.go:
                         snapshot = client.get_snapshot(symbol)
                         current_price = snapshot.last_price
@@ -194,6 +229,10 @@ async def main_loop() -> None:
                             decision, symbol, size, current_price, levels,
                         )
                         if result and result.status != "FAILED":
+                            logger.info(
+                                "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
+                                symbol, decision.direction, size, current_price, result.order_id,
+                            )
                             pnl_tracker.register(
                                 result.order_id, symbol, decision.direction,
                                 size, current_price,
