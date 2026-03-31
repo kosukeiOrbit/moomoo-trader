@@ -96,13 +96,16 @@ class PositionSizer:
     def calculate(self, symbol: str, price: float, account_balance: float) -> int:
         """最適ポジションサイズ（株数）を計算する.
 
+        Kelly=0（初期状態 or 期待値マイナス）でも MIN_POSITION_SHARES を
+        保証してデータ蓄積を可能にする。ただし資金の MAX_PCT は超えない。
+
         Args:
             symbol: 銘柄シンボル
             price: 現在の株価
             account_balance: 口座残高
 
         Returns:
-            発注株数（最小0）
+            発注株数（最小 MIN_POSITION_SHARES、ただし資金上限内）
         """
         if price <= 0 or account_balance <= 0:
             return 0
@@ -116,17 +119,26 @@ class PositionSizer:
         if self._consecutive_losses >= settings.CONSECUTIVE_LOSS_LIMIT:
             size_pct *= 0.5
             logger.warning(
-                "連続%d敗: ポジションサイズを50%%に縮小",
+                "Consecutive %d losses: position size halved",
                 self._consecutive_losses,
             )
 
         position_value = account_balance * size_pct
-        shares = int(position_value / price)
+        kelly_shares = int(position_value / price)
+
+        # 資金上限の株数
+        max_shares = int(account_balance * max_pct / price)
+
+        # Kelly=0 でも最低 MIN_POSITION_SHARES を保証（ただし資金上限内）
+        shares = max(kelly_shares, settings.MIN_POSITION_SHARES)
+        shares = min(shares, max(max_shares, 0))
+
         logger.info(
-            "ポジションサイズ計算: %s kelly=%.4f size=%.4f shares=%d",
-            symbol, kelly_pct, size_pct, shares,
+            "Position size: %s kelly=%.4f shares=%d (kelly=%d, min=%d, max=%d)",
+            symbol, kelly_pct, shares, kelly_shares,
+            settings.MIN_POSITION_SHARES, max_shares,
         )
-        return max(shares, 0)
+        return shares
 
     # ------------------------------------------------------------------
     # 統計更新
