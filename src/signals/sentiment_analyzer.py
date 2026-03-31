@@ -70,12 +70,15 @@ class SentimentAnalyzer:
             センチメント解析結果
         """
         if not texts:
-            return SentimentResult(score=0.0, confidence=0.0, reasoning="テキストなし")
+            return SentimentResult(score=0.0, confidence=0.0, reasoning="No texts")
 
         # バッチ上限でトリム & 空文字を除去
         filtered = [t.strip() for t in texts if t.strip()][:self.BATCH_LIMIT]
-        if not filtered:
-            return SentimentResult(score=0.0, confidence=0.0, reasoning="有効なテキストなし")
+        if len(filtered) < settings.MIN_TEXTS_FOR_ANALYSIS:
+            return SentimentResult(
+                score=0.0, confidence=0.0,
+                reasoning=f"Skipped: {len(filtered)} texts < {settings.MIN_TEXTS_FOR_ANALYSIS}",
+            )
 
         combined = "\n---\n".join(filtered)
         user_message = (

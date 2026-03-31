@@ -54,19 +54,40 @@ class TestSentimentAnalyzerUnit:
     """SentimentAnalyzer のモックテスト."""
 
     def test_empty_texts_returns_zero(self) -> None:
-        """テキストが空リストの場合はスコア0を返す."""
+        """テキストが空リストの場合はAPIを呼ばずスコア0を返す."""
         analyzer = _make_mock_analyzer()
         result = analyzer.analyze([], "AAPL")
         assert result.score == 0.0
         assert result.confidence == 0.0
-        assert "テキストなし" in result.reasoning
+        analyzer._client.messages.create.assert_not_called()
 
-    def test_whitespace_only_texts_returns_zero(self) -> None:
-        """空白のみのテキストは無効として扱う."""
+    def test_single_text_skipped(self) -> None:
+        """1件のみではAPIを呼ばずスキップ (MIN_TEXTS_FOR_ANALYSIS=2)."""
+        analyzer = _make_mock_analyzer()
+        result = analyzer.analyze(["only one text"], "AAPL")
+        assert result.score == 0.0
+        assert "Skipped" in result.reasoning
+        analyzer._client.messages.create.assert_not_called()
+
+    def test_whitespace_only_texts_skipped(self) -> None:
+        """空白のみのテキストは有効テキスト0件でスキップ."""
         analyzer = _make_mock_analyzer()
         result = analyzer.analyze(["", "   ", "\n"], "AAPL")
         assert result.score == 0.0
-        assert "有効なテキストなし" in result.reasoning
+        assert "Skipped" in result.reasoning
+        analyzer._client.messages.create.assert_not_called()
+
+    def test_two_texts_calls_api(self) -> None:
+        """2件以上ならAPIを呼び出す."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create = MagicMock(
+            return_value=_mock_response(
+                '{"score": 0.5, "confidence": 0.7, "reasoning": "mixed"}'
+            )
+        )
+        result = analyzer.analyze(["text one", "text two"], "AAPL")
+        assert result.score == 0.5
+        analyzer._client.messages.create.assert_called_once()
 
     def test_bullish_response_parsed(self) -> None:
         """Bullishなレスポンスを正しくパースする."""
@@ -76,7 +97,7 @@ class TestSentimentAnalyzerUnit:
                 '{"score": 0.8, "confidence": 0.9, "reasoning": "非常に強気"}'
             )
         )
-        result = analyzer.analyze(["AAPL is going to the moon!"], "AAPL")
+        result = analyzer.analyze(["AAPL is going to the moon!", "Buy buy buy"], "AAPL")
         assert result.score == 0.8
         assert result.confidence == 0.9
         assert "強気" in result.reasoning
@@ -89,7 +110,7 @@ class TestSentimentAnalyzerUnit:
                 '{"score": -0.7, "confidence": 0.85, "reasoning": "弱気センチメント"}'
             )
         )
-        result = analyzer.analyze(["AAPL is crashing hard"], "AAPL")
+        result = analyzer.analyze(["AAPL is crashing hard", "Sell now"], "AAPL")
         assert result.score == -0.7
         assert result.confidence == 0.85
 
@@ -101,7 +122,7 @@ class TestSentimentAnalyzerUnit:
                 '{"score": 2.5, "confidence": 1.8, "reasoning": "out of range"}'
             )
         )
-        result = analyzer.analyze(["test"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 1.0
         assert result.confidence == 1.0
 
@@ -113,7 +134,7 @@ class TestSentimentAnalyzerUnit:
                 'Here is the analysis:\n{"score": 0.5, "confidence": 0.7, "reasoning": "moderate"}\nEnd.'
             )
         )
-        result = analyzer.analyze(["test"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 0.5
         assert result.confidence == 0.7
 
@@ -123,7 +144,7 @@ class TestSentimentAnalyzerUnit:
         analyzer._client.messages.create = MagicMock(
             return_value=_mock_response("This is not JSON at all")
         )
-        result = analyzer.analyze(["some text"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 0.0
         assert "Parse error" in result.reasoning
 
@@ -137,7 +158,7 @@ class TestSentimentAnalyzerUnit:
                 body=None,
             )
         )
-        result = analyzer.analyze(["some text"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 0.0
         assert "error" in result.reasoning.lower()
 
@@ -151,7 +172,7 @@ class TestSentimentAnalyzerUnit:
                 body=None,
             )
         )
-        result = analyzer.analyze(["test"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 0.0
         assert "529" in result.reasoning
 
@@ -161,7 +182,7 @@ class TestSentimentAnalyzerUnit:
         analyzer._client.messages.create = MagicMock(
             side_effect=anthropic.APIConnectionError(request=MagicMock()),
         )
-        result = analyzer.analyze(["test"], "AAPL")
+        result = analyzer.analyze(["text a", "text b"], "AAPL")
         assert result.score == 0.0
         assert "error" in result.reasoning.lower()
 
@@ -219,7 +240,7 @@ class TestSentimentAnalyzerUnit:
                 '{"score": 0.3, "confidence": 0.6, "reasoning": "ok"}'
             )
         )
-        analyzer.analyze(["test"], "AAPL")
+        analyzer.analyze(["text a", "text b"], "AAPL")
 
         # 古いエントリーは削除され、新しいものだけ残る
         assert len(analyzer._score_history["AAPL"]) == 1
@@ -278,6 +299,6 @@ class TestSentimentAnalyzerIntegration:
 
     def test_rolling_score_after_real_calls(self, analyzer: SentimentAnalyzer) -> None:
         """実API呼び出し後にローリングスコアが記録される."""
-        analyzer.analyze(["MSFT cloud revenue is booming, AI integration is great"], "MSFT")
+        analyzer.analyze(["MSFT cloud revenue is booming", "AI integration is great"], "MSFT")
         rolling = analyzer.get_rolling_score("MSFT", window_minutes=5)
         assert rolling != 0.0, "Rolling score should be non-zero after a real API call"
