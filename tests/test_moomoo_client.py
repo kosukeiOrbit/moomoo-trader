@@ -115,28 +115,47 @@ class TestMoomooClientSnapshot:
 # ---------------------------------------------------------------------------
 
 class TestMoomooClientFlow:
-    """get_institutional_flow() のテスト."""
+    """get_institutional_flow() のテスト (uses get_capital_flow)."""
 
-    def test_flow_success(self) -> None:
+    def test_flow_buy_dominant(self) -> None:
+        """super + big が正 → big_buy に値が入る."""
         client = _make_client()
-        df = pd.DataFrame([{"capital_in_big": 500.0, "capital_out_big": 200.0}])
-        client._quote_ctx.get_capital_distribution.return_value = (RET_OK, df)
+        df = pd.DataFrame([{
+            "in_flow": 1000.0, "super_in_flow": 300.0,
+            "big_in_flow": 500.0, "mid_in_flow": 100.0,
+            "sml_in_flow": 100.0, "capital_flow_item_time": "2026-03-31 10:00:00",
+        }])
+        client._quote_ctx.get_capital_flow.return_value = (RET_OK, df)
 
         flow = client.get_institutional_flow("AAPL")
-        assert flow.big_buy == 500.0
-        assert flow.big_sell == 200.0
-        assert flow.net_flow == 300.0
+        assert flow.big_buy == 800.0  # 300 + 500
+        assert flow.big_sell == 0.0
+        assert flow.net_flow == 800.0
+
+    def test_flow_sell_dominant(self) -> None:
+        """super + big が負 → big_sell に値が入る."""
+        client = _make_client()
+        df = pd.DataFrame([{
+            "in_flow": -500.0, "super_in_flow": -200.0,
+            "big_in_flow": -400.0, "mid_in_flow": 50.0,
+            "sml_in_flow": 50.0, "capital_flow_item_time": "2026-03-31 10:00:00",
+        }])
+        client._quote_ctx.get_capital_flow.return_value = (RET_OK, df)
+
+        flow = client.get_institutional_flow("AAPL")
+        assert flow.big_buy == 0.0
+        assert flow.big_sell == 600.0  # abs(-200 + -400)
 
     def test_flow_failure_returns_zero(self) -> None:
         client = _make_client()
-        client._quote_ctx.get_capital_distribution.return_value = (1, "error")
+        client._quote_ctx.get_capital_flow.return_value = (1, "error")
 
         flow = client.get_institutional_flow("AAPL")
         assert flow.big_buy == 0.0
 
 
 # ---------------------------------------------------------------------------
-# 空売りデータ
+# 空売りデータ (uses get_capital_distribution)
 # ---------------------------------------------------------------------------
 
 class TestMoomooClientShort:
@@ -144,15 +163,19 @@ class TestMoomooClientShort:
 
     def test_short_data_success(self) -> None:
         client = _make_client()
-        df = pd.DataFrame([{"short_volume": 50000, "short_ratio": 0.25}])
-        client._quote_ctx.get_capital_flow.return_value = (RET_OK, df)
+        df = pd.DataFrame([{
+            "capital_in_super": 100.0, "capital_in_big": 200.0,
+            "capital_out_super": 150.0, "capital_out_big": 250.0,
+        }])
+        client._quote_ctx.get_capital_distribution.return_value = (RET_OK, df)
 
         data = client.get_short_data("AAPL")
-        assert data.short_ratio == 0.25
+        # out = 150+250=400, in = 100+200=300, total=700, ratio=400/700≈0.571
+        assert abs(data.short_ratio - 400 / 700) < 0.01
 
     def test_short_data_failure(self) -> None:
         client = _make_client()
-        client._quote_ctx.get_capital_flow.return_value = (1, "error")
+        client._quote_ctx.get_capital_distribution.return_value = (1, "error")
 
         data = client.get_short_data("AAPL")
         assert data.short_ratio == 0.0

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from futu import (
@@ -46,12 +46,13 @@ class ShortData:
 
 @dataclass
 class FlowData:
-    """大口投資家フローデータ."""
+    """大口投資家フローデータ（分足ベース）."""
 
     symbol: str
-    big_buy: float
-    big_sell: float
-    net_flow: float
+    big_buy: float       # super + big の買いフロー
+    big_sell: float      # super + big の売りフロー
+    net_flow: float      # big_buy - big_sell
+    timestamp: str = ""  # データの時刻
 
 
 @dataclass
@@ -172,11 +173,7 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def subscribe_realtime(self, symbols: list[str]) -> None:
-        """リアルタイムデータ（株価・板情報・約定）を購読する.
-
-        Args:
-            symbols: 銘柄シンボルのリスト (例: ["AAPL", "NVDA"])
-        """
+        """リアルタイムデータ（株価・板情報・約定）を購読する."""
         assert self._quote_ctx is not None, "connect() を先に呼んでください"
         codes = [f"US.{s}" for s in symbols]
         sub_types = [SubType.QUOTE, SubType.ORDER_BOOK, SubType.TICKER]
@@ -191,14 +188,7 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def get_snapshot(self, symbol: str) -> QuoteSnapshot:
-        """指定銘柄の株価スナップショットを取得する.
-
-        Args:
-            symbol: 銘柄シンボル (例: "AAPL")
-
-        Returns:
-            株価スナップショット
-        """
+        """指定銘柄の株価スナップショットを取得する."""
         assert self._quote_ctx is not None
         code = f"US.{symbol}"
         ret, data = self._quote_ctx.get_market_snapshot([code])
@@ -215,11 +205,15 @@ class MoomooClient:
         )
 
     # ------------------------------------------------------------------
-    # 大口フロー
+    # 大口フロー (get_capital_flow — 分足時系列)
     # ------------------------------------------------------------------
 
     def get_institutional_flow(self, symbol: str) -> FlowData:
         """大口投資家フローデータを取得する.
+
+        get_capital_flow() は分足の時系列データを返す。
+        直近データの super_in_flow + big_in_flow を大口買いフローとして使う。
+        net flow が正なら買い超過、負なら売り超過。
 
         Args:
             symbol: 銘柄シンボル
@@ -229,26 +223,52 @@ class MoomooClient:
         """
         assert self._quote_ctx is not None
         code = f"US.{symbol}"
-        ret, data = self._quote_ctx.get_capital_distribution(code)
-        if ret != RET_OK:
-            logger.warning("大口フローデータ取得失敗: %s", symbol)
+        ret, data = self._quote_ctx.get_capital_flow(code)
+        if ret != RET_OK or data.empty:
+            logger.warning("大口フローデータ取得失敗: %s (ret=%s)", symbol, ret)
             return FlowData(symbol=symbol, big_buy=0.0, big_sell=0.0, net_flow=0.0)
 
-        big_buy = float(data.iloc[0].get("capital_in_big", 0))
-        big_sell = float(data.iloc[0].get("capital_out_big", 0))
+        # 直近の行を取得 (最新の分足データ)
+        latest = data.iloc[-1]
+        in_flow = float(latest.get("in_flow", 0))
+        super_in = float(latest.get("super_in_flow", 0))
+        big_in = float(latest.get("big_in_flow", 0))
+        ts = str(latest.get("capital_flow_item_time", ""))
+
+        # in_flow = net flow (買い - 売り の累積)
+        # super + big のフローを大口として扱う
+        big_net = super_in + big_in
+
+        # big_net > 0 → 大口が買い超過、big_net < 0 → 大口が売り超過
+        if big_net >= 0:
+            big_buy = big_net
+            big_sell = 0.0
+        else:
+            big_buy = 0.0
+            big_sell = abs(big_net)
+
+        logger.debug(
+            "[%s] capital_flow: in_flow=%.0f super=%.0f big=%.0f big_net=%.0f ts=%s rows=%d",
+            symbol, in_flow, super_in, big_in, big_net, ts, len(data),
+        )
+
         return FlowData(
             symbol=symbol,
             big_buy=big_buy,
             big_sell=big_sell,
-            net_flow=big_buy - big_sell,
+            net_flow=big_net,
+            timestamp=ts,
         )
 
     # ------------------------------------------------------------------
-    # 空売りデータ
+    # 空売りデータ (get_capital_distribution — 日次スナップショット)
     # ------------------------------------------------------------------
 
     def get_short_data(self, symbol: str) -> ShortData:
-        """空売り比率データを取得する.
+        """大口の売り超過比率を空売り指標として取得する.
+
+        get_capital_distribution() の super + big の out/in 比率を使う。
+        (futu-api に直接の short interest API がないため代用)
 
         Args:
             symbol: 銘柄シンボル
@@ -258,15 +278,33 @@ class MoomooClient:
         """
         assert self._quote_ctx is not None
         code = f"US.{symbol}"
-        ret, data = self._quote_ctx.get_capital_flow(code)
-        if ret != RET_OK:
+        ret, data = self._quote_ctx.get_capital_distribution(code)
+        if ret != RET_OK or data.empty:
             logger.warning("空売りデータ取得失敗: %s", symbol)
             return ShortData(symbol=symbol, short_volume=0.0, short_ratio=0.0)
 
+        row = data.iloc[0]
+        cap_in_super = float(row.get("capital_in_super", 0))
+        cap_in_big = float(row.get("capital_in_big", 0))
+        cap_out_super = float(row.get("capital_out_super", 0))
+        cap_out_big = float(row.get("capital_out_big", 0))
+
+        total_big_in = cap_in_super + cap_in_big
+        total_big_out = cap_out_super + cap_out_big
+        total = total_big_in + total_big_out
+
+        # 売り超過比率: 大口の売り / (大口の買い + 売り)
+        short_ratio = total_big_out / total if total > 0 else 0.0
+
+        logger.debug(
+            "[%s] capital_dist: big_in=%.0f big_out=%.0f ratio=%.3f",
+            symbol, total_big_in, total_big_out, short_ratio,
+        )
+
         return ShortData(
             symbol=symbol,
-            short_volume=float(data.iloc[0].get("short_volume", 0)),
-            short_ratio=float(data.iloc[0].get("short_ratio", 0)),
+            short_volume=total_big_out,
+            short_ratio=short_ratio,
         )
 
     # ------------------------------------------------------------------
@@ -274,11 +312,7 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def get_account_balance(self) -> float:
-        """口座の総資産を取得する.
-
-        Returns:
-            総資産額（取得失敗時は0.0）
-        """
+        """口座の総資産を取得する."""
         assert self._trade_ctx is not None
         ret, data = self._trade_ctx.accinfo_query(
             trd_env=self._trd_env,
@@ -294,14 +328,7 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def place_order(self, order: Order) -> OrderResult:
-        """注文を発注する.
-
-        Args:
-            order: 発注情報
-
-        Returns:
-            発注結果
-        """
+        """注文を発注する."""
         assert self._trade_ctx is not None
         code = f"US.{order.symbol}"
         side = TrdSide.BUY if order.side == "BUY" else TrdSide.SELL

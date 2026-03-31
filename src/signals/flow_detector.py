@@ -1,7 +1,7 @@
 """大口フロー・空売りデータ検出モジュール.
 
-MoomooClient から大口フローデータを取得し、
-過去15分間の買い超過比率を計算して FlowSignal を返す。
+MoomooClient の get_capital_flow() (分足時系列) から
+直近15分間の大口フロー累積を計算して FlowSignal を返す。
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from src.data.moomoo_client import MoomooClient, FlowData
 
 logger = logging.getLogger(__name__)
 
-# 空売り比率の閾値（30%以上でショートスクイーズ候補）
-SHORT_SQUEEZE_THRESHOLD = 0.3
+# 空売り比率の閾値（大口売り超過が60%以上でショートスクイーズ候補）
+SHORT_SQUEEZE_THRESHOLD = 0.6
 
 # フロー集計ウィンドウ（分）
 FLOW_WINDOW_MINUTES = 15
@@ -38,8 +38,8 @@ class FlowSignal:
 class FlowDetector:
     """大口投資家フロー検出エンジン.
 
-    過去15分間の大口フロー累積値を計算し、
-    買い超過比率が FLOW_BUY_THRESHOLD を超えた場合に BUY シグナルを出す。
+    get_capital_flow() の super_in_flow + big_in_flow を大口フローとして
+    15分ウィンドウで累積し、買い超過比率を計算する。
     """
 
     def __init__(self, client: MoomooClient) -> None:
@@ -67,6 +67,7 @@ class FlowDetector:
         # 過去15分のデータを集計
         recent = self._get_recent(symbol, minutes=FLOW_WINDOW_MINUTES)
         if not recent:
+            logger.debug("[%s] No recent flow data", symbol)
             return FlowSignal(direction="NEUTRAL", strength=0.0, short_squeeze=False)
 
         total_buy = sum(f.big_buy for f in recent)
@@ -74,6 +75,7 @@ class FlowDetector:
         total = total_buy + total_sell
 
         if total == 0:
+            logger.debug("[%s] Flow total=0 (no big order activity)", symbol)
             return FlowSignal(direction="NEUTRAL", strength=0.0, short_squeeze=False)
 
         buy_ratio = total_buy / total
@@ -92,6 +94,13 @@ class FlowDetector:
 
         # 強度: 0.5 からの乖離を [0.0, 1.0] にスケール
         strength = abs(buy_ratio - 0.5) * 2
+
+        logger.info(
+            "[%s] Flow: buy=%.0f sell=%.0f ratio=%.3f -> %s(%.2f) short_ratio=%.3f squeeze=%s [%d samples]",
+            symbol, total_buy, total_sell, buy_ratio,
+            direction, strength, short_data.short_ratio, short_squeeze,
+            len(recent),
+        )
 
         return FlowSignal(
             direction=direction,

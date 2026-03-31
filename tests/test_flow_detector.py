@@ -91,22 +91,22 @@ class TestFlowDetectorShortSqueeze:
     """ショートスクイーズ判定のテスト."""
 
     def test_short_squeeze_true(self) -> None:
-        """空売り比率 > 30% → short_squeeze=True."""
-        det, cli = _make_detector(short_ratio=0.4)
+        """空売り比率 > 60% → short_squeeze=True."""
+        det, cli = _make_detector(short_ratio=0.7)
         _set_flow(cli, 80.0, 20.0)
         sig = det.get_flow_signal("AAPL")
         assert sig.short_squeeze is True
 
     def test_short_squeeze_false(self) -> None:
-        """空売り比率 <= 30% → short_squeeze=False."""
-        det, cli = _make_detector(short_ratio=0.1)
+        """空売り比率 <= 60% → short_squeeze=False."""
+        det, cli = _make_detector(short_ratio=0.5)
         _set_flow(cli, 80.0, 20.0)
         sig = det.get_flow_signal("AAPL")
         assert sig.short_squeeze is False
 
     def test_short_squeeze_boundary(self) -> None:
-        """空売り比率ちょうど30% → > なので False."""
-        det, cli = _make_detector(short_ratio=0.3)
+        """空売り比率ちょうど60% → > なので False."""
+        det, cli = _make_detector(short_ratio=0.6)
         _set_flow(cli, 80.0, 20.0)
         sig = det.get_flow_signal("AAPL")
         assert sig.short_squeeze is False
