@@ -242,7 +242,10 @@ class OrderRouter:
     # ------------------------------------------------------------------
 
     async def monitor_positions(self) -> None:
-        """SL/TPを非同期で監視し、条件を満たしたら自動決済する."""
+        """SL/TPを非同期で監視し、条件を満たしたら自動決済する.
+
+        5秒間隔でポジションの株価をチェックする。
+        """
         while True:
             for order_id, pos in list(self._positions.items()):
                 if pos.levels is None:
@@ -270,6 +273,6 @@ class OrderRouter:
                         self.exit(order_id, "TP")
 
                 except Exception:
-                    logger.exception("Position monitor error: %s", order_id)
+                    logger.debug("Position monitor error: %s", order_id)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)

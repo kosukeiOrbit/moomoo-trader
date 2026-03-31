@@ -193,7 +193,7 @@ class MoomooClient:
         code = f"US.{symbol}"
         ret, data = self._quote_ctx.get_market_snapshot([code])
         if ret != RET_OK or data.empty:
-            logger.warning("株価取得失敗: %s", symbol)
+            logger.debug("Snapshot unavailable: %s (ret=%s)", symbol, ret)
             return QuoteSnapshot(symbol=symbol, last_price=0.0, volume=0.0, turnover=0.0)
 
         row = data.iloc[0]
