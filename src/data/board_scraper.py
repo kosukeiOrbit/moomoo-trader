@@ -3,6 +3,8 @@
 r/wallstreetbets, r/stocks の RSS フィードから
 銘柄シンボルに言及した投稿を収集する。
 APIキー不要。取得失敗時は空リストを返してシステムを止めない。
+
+フィードはキャッシュし、複数銘柄で共有して Reddit のレート制限を回避する。
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import aiohttp
 
@@ -28,6 +31,9 @@ ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 # 投稿の鮮度フィルター（直近N分）
 MAX_AGE_MINUTES = 60
 
+# フィードキャッシュの有効期間（秒）
+CACHE_TTL_SECONDS = 120
+
 
 @dataclass
 class Post:
@@ -40,11 +46,24 @@ class Post:
     post_id: str = ""
 
 
+@dataclass
+class _CachedFeed:
+    """フィードのキャッシュエントリ."""
+
+    entries: list[dict[str, Any]]
+    fetched_at: float  # time.monotonic()
+
+
 class BoardScraper:
-    """Reddit RSS ベースの掲示板スクレイパー."""
+    """Reddit RSS ベースの掲示板スクレイパー.
+
+    フィードを CACHE_TTL_SECONDS 間キャッシュし、
+    複数銘柄で共有して Reddit へのリクエスト数を最小化する。
+    """
 
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
+        self._cache: dict[str, _CachedFeed] = {}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -56,8 +75,7 @@ class BoardScraper:
     async def fetch_posts(self, symbol: str, limit: int = 30) -> list[Post]:
         """指定銘柄に言及した Reddit 投稿を取得する.
 
-        r/wallstreetbets と r/stocks の新着投稿から
-        銘柄シンボルを含むものをフィルタリングする。
+        フィードはキャッシュから取得し、シンボルフィルターのみ適用。
 
         Args:
             symbol: 銘柄シンボル (例: "AAPL")
@@ -68,24 +86,39 @@ class BoardScraper:
         """
         posts: list[Post] = []
         for feed_url in REDDIT_FEEDS:
-            fetched = await self._fetch_reddit_rss(feed_url, symbol)
-            posts.extend(fetched)
+            entries = await self._get_entries(feed_url)
+            filtered = self._filter_entries(entries, symbol)
+            posts.extend(filtered)
 
-        # 新しい順にソートして上限まで
         posts.sort(key=lambda p: p.timestamp, reverse=True)
         return posts[:limit]
 
-    async def _fetch_reddit_rss(self, feed_url: str, symbol: str) -> list[Post]:
-        """Reddit RSS (Atom) から銘柄に言及した投稿を取得する."""
+    async def _get_entries(self, feed_url: str) -> list[dict[str, Any]]:
+        """フィードのエントリをキャッシュ付きで取得する."""
+        import time as _time
+
+        cached = self._cache.get(feed_url)
+        if cached and (_time.monotonic() - cached.fetched_at) < CACHE_TTL_SECONDS:
+            return cached.entries
+
+        # キャッシュミス → フェッチ
+        entries = await self._fetch_feed(feed_url)
+        self._cache[feed_url] = _CachedFeed(
+            entries=entries,
+            fetched_at=_time.monotonic(),
+        )
+        return entries
+
+    async def _fetch_feed(self, feed_url: str) -> list[dict[str, Any]]:
+        """Reddit RSS (Atom) をフェッチしてエントリリストを返す."""
         session = await self._ensure_session()
-        posts: list[Post] = []
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=MAX_AGE_MINUTES)
+        entries: list[dict[str, Any]] = []
 
         try:
             async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    logger.warning("Reddit RSS failed: %s (status=%d)", feed_url, resp.status)
-                    return posts
+                    logger.warning("Reddit RSS %d: %s", resp.status, feed_url)
+                    return entries
 
                 text = await resp.text()
                 root = ET.fromstring(text)
@@ -99,23 +132,13 @@ class BoardScraper:
                     author = author_el.text if author_el is not None and author_el.text else ""
                     entry_id = entry.findtext("atom:id", "", ATOM_NS)
 
-                    # シンボルフィルター: $AAPL or "AAPL" (大文字)
-                    combined = f"{title} {content}"
-                    if not self._mentions_symbol(combined, symbol):
-                        continue
-
-                    # 日付パース
-                    published_at = self._parse_atom_date(updated_str)
-                    if published_at and published_at < cutoff:
-                        continue
-
-                    posts.append(Post(
-                        text=f"{title} {content}"[:500],  # 500文字に制限
-                        symbol=symbol,
-                        timestamp=published_at or datetime.now(timezone.utc),
-                        author=author,
-                        post_id=entry_id,
-                    ))
+                    entries.append({
+                        "title": title,
+                        "content": content,
+                        "updated": updated_str,
+                        "author": author,
+                        "id": entry_id,
+                    })
 
         except aiohttp.ClientError as e:
             logger.warning("Reddit RSS network error: %s — %s", feed_url, e)
@@ -124,20 +147,42 @@ class BoardScraper:
         except Exception:
             logger.exception("Reddit RSS unexpected error: %s", feed_url)
 
-        logger.debug("Reddit RSS: %s %s -> %d posts", feed_url[:40], symbol, len(posts))
+        return entries
+
+    def _filter_entries(
+        self,
+        entries: list[dict[str, Any]],
+        symbol: str,
+    ) -> list[Post]:
+        """エントリリストからシンボルに言及したものを抽出する."""
+        posts: list[Post] = []
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=MAX_AGE_MINUTES)
+
+        for e in entries:
+            combined = f"{e['title']} {e['content']}"
+            if not self._mentions_symbol(combined, symbol):
+                continue
+
+            published_at = self._parse_atom_date(e["updated"])
+            if published_at and published_at < cutoff:
+                continue
+
+            posts.append(Post(
+                text=f"{e['title']} {e['content']}"[:500],
+                symbol=symbol,
+                timestamp=published_at or datetime.now(timezone.utc),
+                author=e["author"],
+                post_id=e["id"],
+            ))
+
         return posts
 
     @staticmethod
     def _mentions_symbol(text: str, symbol: str) -> bool:
-        """テキストが銘柄シンボルに言及しているか判定する.
-
-        $AAPL, AAPL, Apple (AAPL) などのパターンを検出する。
-        """
+        """テキストが銘柄シンボルに言及しているか判定する."""
         upper = text.upper()
-        # $AAPL パターン
         if f"${symbol.upper()}" in upper:
             return True
-        # 単語として含まれるか（前後が非英数字）
         sym = symbol.upper()
         for i in range(len(upper) - len(sym) + 1):
             if upper[i:i + len(sym)] == sym:
