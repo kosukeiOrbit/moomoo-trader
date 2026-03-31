@@ -124,7 +124,8 @@ class MoomooClient:
             port=settings.MOOMOO_PORT,
         )
 
-        if settings.MOOMOO_TRADE_PWD:
+        # トレードパスワードでアンロック（本番のみ。ペーパートレードは不要）
+        if self._trd_env != TrdEnv.SIMULATE and settings.MOOMOO_TRADE_PWD:
             ret, data = self._trade_ctx.unlock_trade(settings.MOOMOO_TRADE_PWD)
             if ret != RET_OK:
                 logger.error("トレードアンロック失敗: %s", data)
@@ -280,6 +281,7 @@ class MoomooClient:
         assert self._trade_ctx is not None
         ret, data = self._trade_ctx.accinfo_query(
             trd_env=self._trd_env,
+            currency="USD",
         )
         if ret != RET_OK or data.empty:
             logger.warning("口座残高取得失敗")

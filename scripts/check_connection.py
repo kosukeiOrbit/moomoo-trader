@@ -166,15 +166,15 @@ def check_account_balance() -> bool:
             port=settings.MOOMOO_PORT,
         )
 
-        # トレードパスワードでアンロック
-        if settings.MOOMOO_TRADE_PWD:
+        # トレードパスワードでアンロック（本番のみ。ペーパートレードは不要）
+        if trd_env != TrdEnv.SIMULATE and settings.MOOMOO_TRADE_PWD:
             ret, data = trade_ctx.unlock_trade(settings.MOOMOO_TRADE_PWD)
             if ret != RET_OK:
                 fail(f"トレードアンロック: FAILED — {data}")
                 trade_ctx.close()
                 return False
 
-        ret, data = trade_ctx.accinfo_query(trd_env=trd_env)
+        ret, data = trade_ctx.accinfo_query(trd_env=trd_env, currency="USD")
         trade_ctx.close()
 
         if ret != RET_OK:
