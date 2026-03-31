@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pytest
 
-from src.signal.sentiment_analyzer import SentimentAnalyzer, SentimentResult, _clamp
+from src.signals.sentiment_analyzer import SentimentAnalyzer, SentimentResult, _clamp
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +22,7 @@ from src.signal.sentiment_analyzer import SentimentAnalyzer, SentimentResult, _c
 
 def _make_mock_analyzer() -> SentimentAnalyzer:
     """APIクライアントをモックしたAnalyzerを作成する."""
-    with patch("src.signal.sentiment_analyzer.anthropic.Anthropic"):
+    with patch("src.signals.sentiment_analyzer.anthropic.Anthropic"):
         return SentimentAnalyzer(api_key="test-key")
 
 
@@ -141,7 +141,7 @@ class TestSentimentAnalyzerUnit:
         assert result.score == 0.0
         assert "APIエラー" in result.reasoning
 
-    @patch("src.signal.sentiment_analyzer.time.sleep")
+    @patch("src.signals.sentiment_analyzer.time.sleep")
     def test_rate_limit_retries(self, mock_sleep: MagicMock) -> None:
         """RateLimitError 時にリトライしてから成功する."""
         analyzer = _make_mock_analyzer()
@@ -159,7 +159,7 @@ class TestSentimentAnalyzerUnit:
         assert result.score == 0.6
         assert mock_sleep.call_count == 1
 
-    @patch("src.signal.sentiment_analyzer.time.sleep")
+    @patch("src.signals.sentiment_analyzer.time.sleep")
     def test_connection_error_retries(self, mock_sleep: MagicMock) -> None:
         """APIConnectionError 時にリトライする."""
         analyzer = _make_mock_analyzer()
@@ -173,7 +173,7 @@ class TestSentimentAnalyzerUnit:
         assert result.score == 0.4
         assert mock_sleep.call_count == 1
 
-    @patch("src.signal.sentiment_analyzer.time.sleep")
+    @patch("src.signals.sentiment_analyzer.time.sleep")
     def test_all_retries_exhausted(self, mock_sleep: MagicMock) -> None:
         """全リトライが失敗した場合にスコア0を返す."""
         analyzer = _make_mock_analyzer()

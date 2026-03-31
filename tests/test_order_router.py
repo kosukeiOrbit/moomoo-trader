@@ -15,7 +15,7 @@ from src.data.moomoo_client import Order, OrderResult, QuoteSnapshot
 from src.execution.order_router import OrderRouter, Position
 from src.risk.circuit_breaker import CircuitBreaker
 from src.risk.stop_loss import Levels
-from src.signal.and_filter import EntryDecision
+from src.signals.and_filter import EntryDecision
 
 
 # ---------------------------------------------------------------------------

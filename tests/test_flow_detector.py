@@ -13,7 +13,7 @@ if "futu" not in sys.modules:
     sys.modules["futu"] = MagicMock()
 
 from src.data.moomoo_client import FlowData, ShortData
-from src.signal.flow_detector import FlowDetector, FlowSignal
+from src.signals.flow_detector import FlowDetector, FlowSignal
 
 
 # ---------------------------------------------------------------------------

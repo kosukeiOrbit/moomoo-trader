@@ -13,9 +13,9 @@ from datetime import datetime
 import pandas as pd
 
 from config import settings
-from src.signal.and_filter import AndFilter, EntryDecision
-from src.signal.sentiment_analyzer import SentimentResult
-from src.signal.flow_detector import FlowSignal
+from src.signals.and_filter import AndFilter, EntryDecision
+from src.signals.sentiment_analyzer import SentimentResult
+from src.signals.flow_detector import FlowSignal
 from src.risk.position_sizer import PositionSizer, TradeResult
 from src.risk.stop_loss import StopLossManager
 from src.execution.paper_trade import PaperTradeEngine

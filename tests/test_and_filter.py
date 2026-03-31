@@ -11,9 +11,9 @@ import pytest
 if "futu" not in sys.modules:
     sys.modules["futu"] = MagicMock()
 
-from src.signal.and_filter import AndFilter, EntryDecision
-from src.signal.sentiment_analyzer import SentimentResult
-from src.signal.flow_detector import FlowSignal
+from src.signals.and_filter import AndFilter, EntryDecision
+from src.signals.sentiment_analyzer import SentimentResult
+from src.signals.flow_detector import FlowSignal
 
 
 # ---------------------------------------------------------------------------

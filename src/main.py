@@ -18,9 +18,9 @@ from config import settings
 from src.data.moomoo_client import MoomooClient
 from src.data.board_scraper import BoardScraper
 from src.data.news_feed import NewsFeed
-from src.signal.sentiment_analyzer import SentimentAnalyzer
-from src.signal.flow_detector import FlowDetector
-from src.signal.and_filter import AndFilter
+from src.signals.sentiment_analyzer import SentimentAnalyzer
+from src.signals.flow_detector import FlowDetector
+from src.signals.and_filter import AndFilter
 from src.risk.position_sizer import PositionSizer, TradeResult
 from src.risk.stop_loss import StopLossManager
 from src.risk.circuit_breaker import CircuitBreaker, AccountState, BreakerAction

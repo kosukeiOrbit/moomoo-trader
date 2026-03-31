@@ -15,7 +15,7 @@ from config import settings
 from src.data.moomoo_client import MoomooClient, Order, OrderResult
 from src.risk.circuit_breaker import CircuitBreaker, AccountState, BreakerAction
 from src.risk.stop_loss import Levels, StopLossManager
-from src.signal.and_filter import EntryDecision
+from src.signals.and_filter import EntryDecision
 
 logger = logging.getLogger(__name__)
 
