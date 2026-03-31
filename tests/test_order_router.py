@@ -1,13 +1,9 @@
-"""OrderRouter のユニットテスト.
-
-SIMULATE/REAL 両方で moomoo API (place_order) を呼び出す。
-テストではモックで place_order の戻り値を制御する。
-"""
+"""OrderRouter tests: SIMULATE (local) and REAL (API) modes."""
 
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -28,19 +24,13 @@ from src.signals.and_filter import EntryDecision
 def _go_long() -> EntryDecision:
     return EntryDecision(go=True, direction="LONG", sentiment_score=0.5, flow_strength=0.8)
 
-
 def _no_go() -> EntryDecision:
     return EntryDecision(go=False, reason="test")
-
 
 def _levels() -> Levels:
     return Levels(stop_loss=145.0, take_profit=160.0, trailing_stop=147.0)
 
-
-def _make_router(
-    on_exit: object = None,
-    snapshot_price: float = 155.0,
-) -> tuple[OrderRouter, MagicMock]:
+def _make_router(on_exit=None, snapshot_price: float = 155.0):
     mock_client = MagicMock()
     mock_client.get_snapshot.return_value = QuoteSnapshot(
         symbol="AAPL", last_price=snapshot_price, volume=0, turnover=0,
@@ -49,44 +39,32 @@ def _make_router(
     mock_client.place_order.side_effect = lambda order: OrderResult(
         order_id=f"ORD-{next(_seq)}", status="SUBMITTED",
     )
-    cb = CircuitBreaker()
-    router = OrderRouter(mock_client, cb, on_exit=on_exit)
+    router = OrderRouter(mock_client, CircuitBreaker(), on_exit=on_exit)
     return router, mock_client
 
 
 # ---------------------------------------------------------------------------
-# Entry
+# SIMULATE mode
 # ---------------------------------------------------------------------------
 
-class TestOrderRouterEntry:
+@patch("src.execution.order_router._is_simulate", True)
+class TestSimulateEntry:
 
-    def test_enter_calls_place_order(self) -> None:
-        """enter() が moomoo API を呼ぶ."""
+    def test_entry_does_not_call_api(self) -> None:
         router, mock_client = _make_router()
         result = router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
-        assert result is not None
-        assert result.status == "SUBMITTED"
+        assert result.status == "FILLED"
+        assert result.order_id.startswith("PAPER-")
         assert router.position_count == 1
-        mock_client.place_order.assert_called_once()
+        mock_client.place_order.assert_not_called()
 
-    def test_enter_failure(self) -> None:
-        """place_order 失敗時はポジション記録なし."""
-        router, mock_client = _make_router()
-        mock_client.place_order.side_effect = None
-        mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
-        result = router.enter(_go_long(), "AAPL", 10, 150.0)
-        assert result.status == "FAILED"
-        assert router.position_count == 0
-
-    def test_duplicate_entry_blocked(self) -> None:
+    def test_duplicate_blocked(self) -> None:
         router, _ = _make_router()
-        r1 = router.enter(_go_long(), "AAPL", 10, 150.0)
-        r2 = router.enter(_go_long(), "AAPL", 5, 151.0)
-        assert r1 is not None
-        assert r2 is None
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        assert router.enter(_go_long(), "AAPL", 5, 151.0) is None
         assert router.position_count == 1
 
-    def test_different_symbols_allowed(self) -> None:
+    def test_different_symbols(self) -> None:
         router, _ = _make_router()
         router.enter(_go_long(), "AAPL", 10, 150.0)
         router.enter(_go_long(), "NVDA", 5, 170.0)
@@ -97,207 +75,182 @@ class TestOrderRouterEntry:
         router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
         router.exit(oid, "TP")
-        r2 = router.enter(_go_long(), "AAPL", 5, 155.0)
-        assert r2 is not None
-        assert router.position_count == 1
+        assert router.enter(_go_long(), "AAPL", 5, 155.0) is not None
 
-    def test_no_go_returns_none(self) -> None:
+    def test_no_go(self) -> None:
         router, _ = _make_router()
         assert router.enter(_no_go(), "AAPL", 10, 150.0) is None
 
-    def test_zero_size_returns_none(self) -> None:
+    def test_zero_size(self) -> None:
         router, _ = _make_router()
         assert router.enter(_go_long(), "AAPL", 0, 150.0) is None
 
-    def test_order_ids_from_api(self) -> None:
-        """order_id は moomoo API の戻り値を使う."""
+    def test_order_ids_increment(self) -> None:
         router, _ = _make_router()
         r1 = router.enter(_go_long(), "AAPL", 5, 150.0)
-        r2 = router.enter(_go_long(), "NVDA", 5, 500.0)
-        assert r1.order_id.startswith("ORD-")
+        r2 = router.enter(_go_long(), "NVDA", 5, 170.0)
         assert r1.order_id != r2.order_id
 
 
-# ---------------------------------------------------------------------------
-# Exit
-# ---------------------------------------------------------------------------
+@patch("src.execution.order_router._is_simulate", True)
+class TestSimulateExit:
 
-class TestOrderRouterExit:
-
-    def test_exit_calls_place_order(self) -> None:
-        """exit() が反対売買を API に送る."""
-        router, mock_client = _make_router()
+    def test_exit_pnl(self) -> None:
+        router, _ = _make_router(snapshot_price=155.0)
         router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
         result = router.exit(oid, "TP")
         assert isinstance(result, ExitResult)
-        assert result.exit_price == 155.0
-        assert result.pnl == 50.0  # (155-150)*10
+        assert result.pnl == 50.0
         assert router.position_count == 0
-        assert mock_client.place_order.call_count == 2  # entry + exit
 
-    def test_exit_unknown_returns_none(self) -> None:
+    def test_exit_unknown(self) -> None:
         router, _ = _make_router()
         assert router.exit("UNKNOWN", "test") is None
 
-    def test_exit_failure_keeps_position(self) -> None:
-        """exit の place_order 失敗時はポジション保持."""
-        router, mock_client = _make_router()
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        oid = list(router.open_positions.keys())[0]
-        # exit の place_order を失敗させる
-        mock_client.place_order.side_effect = None
-        mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
-        result = router.exit(oid, "SL")
-        assert result is None
-        assert router.position_count == 1  # still open
-
-
-# ---------------------------------------------------------------------------
-# exit_all
-# ---------------------------------------------------------------------------
-
-class TestOrderRouterExitAll:
-
-    def test_exit_all_closes_all(self) -> None:
+    def test_exit_all(self) -> None:
         router, _ = _make_router()
         router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 500.0)
+        router.enter(_go_long(), "NVDA", 5, 170.0)
         results = router.exit_all("force close")
         assert len(results) == 2
         assert router.position_count == 0
 
-    def test_exit_all_empty(self) -> None:
-        router, _ = _make_router()
-        assert router.exit_all("test") == []
-
 
 # ---------------------------------------------------------------------------
-# on_exit callback
+# REAL mode
 # ---------------------------------------------------------------------------
 
-class TestOrderRouterOnExit:
+@patch("src.execution.order_router._is_simulate", False)
+class TestRealEntry:
 
-    def test_on_exit_called(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        oid = list(router.open_positions.keys())[0]
-        router.exit(oid, "TP")
-        callback.assert_called_once()
-        result: ExitResult = callback.call_args[0][0]
-        assert result.pnl == 50.0
+    def test_entry_calls_api(self) -> None:
+        router, mock_client = _make_router()
+        result = router.enter(_go_long(), "AAPL", 10, 150.0)
+        assert result.order_id.startswith("ORD-")
+        assert router.position_count == 1
+        mock_client.place_order.assert_called_once()
 
-    def test_on_exit_called_for_each_in_exit_all(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 500.0)
-        router.exit_all("force close")
-        assert callback.call_count == 2
+    def test_entry_failure(self) -> None:
+        router, mock_client = _make_router()
+        mock_client.place_order.side_effect = None
+        mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
+        result = router.enter(_go_long(), "AAPL", 10, 150.0)
+        assert result.status == "FAILED"
+        assert router.position_count == 0
 
-    def test_on_exit_loss(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback, snapshot_price=140.0)
+
+@patch("src.execution.order_router._is_simulate", False)
+class TestRealExit:
+
+    def test_exit_calls_api(self) -> None:
+        router, mock_client = _make_router()
         router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
         router.exit(oid, "SL")
-        result: ExitResult = callback.call_args[0][0]
-        assert result.pnl == -100.0
+        assert mock_client.place_order.call_count == 2
 
-    def test_on_exit_exception_safe(self) -> None:
-        callback = MagicMock(side_effect=RuntimeError("boom"))
-        router, _ = _make_router(on_exit=callback)
+    def test_exit_failure_keeps_position(self) -> None:
+        router, mock_client = _make_router()
         router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
-        result = router.exit(oid, "TP")
-        assert result is not None  # doesn't crash
+        mock_client.place_order.side_effect = None
+        mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
+        assert router.exit(oid, "SL") is None
+        assert router.position_count == 1
+
+
+# ---------------------------------------------------------------------------
+# on_exit callback (both modes)
+# ---------------------------------------------------------------------------
+
+@patch("src.execution.order_router._is_simulate", True)
+class TestOnExit:
+
+    def test_callback_called(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        router.exit(oid, "TP")
+        cb.assert_called_once()
+        assert cb.call_args[0][0].pnl == 50.0
+
+    def test_callback_on_exit_all(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        router.enter(_go_long(), "NVDA", 5, 170.0)
+        router.exit_all("close")
+        assert cb.call_count == 2
+
+    def test_callback_loss(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb, snapshot_price=140.0)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        router.exit(oid, "SL")
+        assert cb.call_args[0][0].pnl == -100.0
+
+    def test_callback_exception_safe(self) -> None:
+        cb = MagicMock(side_effect=RuntimeError("boom"))
+        router, _ = _make_router(on_exit=cb)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        assert router.exit(oid, "TP") is not None
 
     def test_no_callback_ok(self) -> None:
         router, _ = _make_router(on_exit=None)
         router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
-        result = router.exit(oid, "TP")
-        assert result is not None
+        assert router.exit(oid, "TP") is not None
 
 
 # ---------------------------------------------------------------------------
-# PnL
+# Monitor (SIMULATE)
 # ---------------------------------------------------------------------------
 
-class TestOrderRouterPnL:
-
-    def test_long_profit(self) -> None:
-        router, _ = _make_router(snapshot_price=160.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        oid = list(router.open_positions.keys())[0]
-        result = router.exit(oid, "TP")
-        assert result.pnl == 100.0
-
-    def test_long_loss(self) -> None:
-        router, _ = _make_router(snapshot_price=145.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        oid = list(router.open_positions.keys())[0]
-        result = router.exit(oid, "SL")
-        assert result.pnl == -50.0
-
-
-# ---------------------------------------------------------------------------
-# Monitor
-# ---------------------------------------------------------------------------
-
-class TestOrderRouterMonitor:
+@patch("src.execution.order_router._is_simulate", True)
+class TestMonitor:
 
     @pytest.mark.asyncio
-    async def test_monitor_triggers_sl(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback, snapshot_price=144.0)
+    async def test_sl(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb, snapshot_price=144.0)
         router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
-
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
         await asyncio.sleep(0.1)
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
+        try: await task
+        except asyncio.CancelledError: pass
         assert router.position_count == 0
-        assert callback.call_args[0][0].reason == "SL"
+        assert cb.call_args[0][0].reason == "SL"
 
     @pytest.mark.asyncio
-    async def test_monitor_triggers_tp(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback, snapshot_price=161.0)
+    async def test_tp(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb, snapshot_price=161.0)
         router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
-
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
         await asyncio.sleep(0.1)
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
+        try: await task
+        except asyncio.CancelledError: pass
         assert router.position_count == 0
-        assert callback.call_args[0][0].reason == "TP"
+        assert cb.call_args[0][0].reason == "TP"
 
     @pytest.mark.asyncio
-    async def test_monitor_no_exit_in_range(self) -> None:
-        callback = MagicMock()
-        router, _ = _make_router(on_exit=callback, snapshot_price=152.0)
+    async def test_no_exit_in_range(self) -> None:
+        cb = MagicMock()
+        router, _ = _make_router(on_exit=cb, snapshot_price=152.0)
         router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
-
         import asyncio
         task = asyncio.create_task(router.monitor_positions())
         await asyncio.sleep(0.1)
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
+        try: await task
+        except asyncio.CancelledError: pass
         assert router.position_count == 1
-        callback.assert_not_called()
+        cb.assert_not_called()

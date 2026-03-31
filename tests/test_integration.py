@@ -11,6 +11,7 @@ if "futu" not in sys.modules:
     sys.modules["futu"] = MagicMock()
 
 from src.data.moomoo_client import QuoteSnapshot, OrderResult
+from unittest.mock import patch
 from src.execution.order_router import OrderRouter, ExitResult
 from src.risk.circuit_breaker import CircuitBreaker, AccountState
 from src.risk.position_sizer import PositionSizer, TradeResult
@@ -61,6 +62,7 @@ def _setup(exit_price: float = 155.0):
 # Integration: exit triggers all downstream updates
 # ---------------------------------------------------------------------------
 
+@patch("src.execution.order_router._is_simulate", True)
 class TestExitIntegration:
 
     def test_exit_updates_pnl_tracker(self) -> None:
