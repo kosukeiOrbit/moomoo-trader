@@ -101,6 +101,12 @@ class OrderRouter:
         if not signal.go or size <= 0:
             return None
 
+        # 同一銘柄の重複エントリーを防止
+        for pos in self._positions.values():
+            if pos.symbol == symbol:
+                logger.info("Duplicate entry blocked: %s already has position", symbol)
+                return None
+
         # ペーパートレード
         if self._paper_trade:
             self._order_seq += 1

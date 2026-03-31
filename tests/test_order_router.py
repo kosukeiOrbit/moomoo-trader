@@ -61,6 +61,32 @@ class TestOrderRouterPaper:
         assert result.status == "PAPER_FILLED"
         assert router.position_count == 1
 
+    def test_duplicate_entry_blocked(self) -> None:
+        """Same symbol cannot have two positions."""
+        router, _ = _make_router(paper=True)
+        r1 = router.enter(_go_long(), "AAPL", 10, 150.0)
+        r2 = router.enter(_go_long(), "AAPL", 5, 151.0)
+        assert r1 is not None
+        assert r2 is None  # blocked
+        assert router.position_count == 1
+
+    def test_different_symbols_allowed(self) -> None:
+        """Different symbols can have separate positions."""
+        router, _ = _make_router(paper=True)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        router.enter(_go_long(), "NVDA", 5, 170.0)
+        assert router.position_count == 2
+
+    def test_reentry_after_exit(self) -> None:
+        """Can re-enter same symbol after exiting."""
+        router, _ = _make_router(paper=True)
+        router.enter(_go_long(), "AAPL", 10, 150.0)
+        oid = list(router.open_positions.keys())[0]
+        router.exit(oid, "TP")
+        r2 = router.enter(_go_long(), "AAPL", 5, 155.0)
+        assert r2 is not None
+        assert router.position_count == 1
+
     def test_exit_paper_returns_exit_result(self) -> None:
         router, _ = _make_router(paper=True)
         router.enter(_go_long(), "AAPL", 10, 150.0)
