@@ -41,8 +41,9 @@ JST = ZoneInfo("Asia/Tokyo")
 MARKET_OPEN = time(9, 30)   # ET
 MARKET_CLOSE = time(16, 0)  # ET
 
-# 全ポジション強制決済時刻 (JST 05:50 = ET 15:50)
-FORCE_EXIT_JST = time(5, 50)
+# 全ポジション強制決済時刻 (ET 15:50 = 市場クローズ10分前)
+# ET ベースで判定するため DST/EST を自動処理する
+FORCE_EXIT_ET = time(15, 50)
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,11 @@ FORCE_EXIT_JST = time(5, 50)
 # ---------------------------------------------------------------------------
 
 def market_is_open() -> bool:
-    """米国市場がオープンしているか判定する."""
+    """米国市場がオープンしているか判定する.
+
+    ZoneInfo("America/New_York") は DST/EST を自動判定するため
+    サマータイム切り替え時もコード変更は不要。
+    """
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
@@ -58,9 +63,12 @@ def market_is_open() -> bool:
 
 
 def should_force_exit() -> bool:
-    """全ポジション強制決済の時刻かどうか (JST 05:50)."""
-    now_jst = datetime.now(JST)
-    return now_jst.time() >= FORCE_EXIT_JST
+    """全ポジション強制決済の時刻かどうか (ET 15:50).
+
+    ET ベースで判定するため DST/EST を自動処理する。
+    """
+    now_et = datetime.now(ET)
+    return now_et.time() >= FORCE_EXIT_ET
 
 
 # ---------------------------------------------------------------------------

@@ -158,7 +158,18 @@ function Register-MoomooTask {
 }
 
 # ---------------------------------------------------------------------------
-# Task 1: Start OpenD (23:20 Mon-Fri)
+# Schedule times (JST)
+#   DST (Mar-Nov): US market 22:30-05:00 JST -> start 22:10, stop 05:10
+#   EST (Nov-Mar): US market 23:30-06:00 JST -> start 23:10, stop 06:10
+# Change these values when DST transitions occur, or run this script again.
+# ---------------------------------------------------------------------------
+
+$OpenDTime = "22:10"   # Start OpenD 20 min before market open
+$BotTime   = "22:15"   # Start Bot 15 min before market open
+$StopTime  = "05:10"   # Stop 10 min after market close
+
+# ---------------------------------------------------------------------------
+# Task 1: Start OpenD (Mon-Fri)
 # ---------------------------------------------------------------------------
 
 Write-Host ""
@@ -166,33 +177,33 @@ Write-Host "--- Registering tasks ---" -ForegroundColor Cyan
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-OpenD" `
-    -Description "Start moomoo OpenD (Mon-Fri 23:20)" `
-    -Time "23:20" `
+    -Description "Start moomoo OpenD (Mon-Fri $OpenDTime JST, DST)" `
+    -Time $OpenDTime `
     -DaysOfWeek @("Monday","Tuesday","Wednesday","Thursday","Friday") `
     -Execute $OpenDExe `
     -WorkingDirectory $OpenDDir
 
 # ---------------------------------------------------------------------------
-# Task 2: Start Bot (23:25 Mon-Fri)
+# Task 2: Start Bot (Mon-Fri)
 # ---------------------------------------------------------------------------
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-Bot" `
-    -Description "Start moomoo-trader Bot (Mon-Fri 23:25)" `
-    -Time "23:25" `
+    -Description "Start moomoo-trader Bot (Mon-Fri $BotTime JST, DST)" `
+    -Time $BotTime `
     -DaysOfWeek @("Monday","Tuesday","Wednesday","Thursday","Friday") `
     -Execute $PythonExe `
     -Arguments $MainPy `
     -WorkingDirectory $ProjectRoot
 
 # ---------------------------------------------------------------------------
-# Task 3: Stop all (06:10 Tue-Sat)
+# Task 3: Stop all (Tue-Sat)
 # ---------------------------------------------------------------------------
 
 Register-MoomooTask `
     -TaskName "MoomooTrader-Stop" `
-    -Description "Stop moomoo-trader Bot and OpenD (Tue-Sat 06:10)" `
-    -Time "06:10" `
+    -Description "Stop moomoo-trader Bot and OpenD (Tue-Sat $StopTime JST, DST)" `
+    -Time $StopTime `
     -DaysOfWeek @("Tuesday","Wednesday","Thursday","Friday","Saturday") `
     -Execute "powershell.exe" `
     -Arguments "-ExecutionPolicy Bypass -File `"$StopScript`"" `
@@ -207,9 +218,12 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " Registration complete" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  23:20  MoomooTrader-OpenD   Start OpenD.exe      (Mon-Fri)"
-Write-Host "  23:25  MoomooTrader-Bot     Start python main.py (Mon-Fri)"
-Write-Host "  06:10  MoomooTrader-Stop    Stop Bot + OpenD     (Tue-Sat)"
+Write-Host "  $OpenDTime  MoomooTrader-OpenD   Start OpenD.exe      (Mon-Fri)"
+Write-Host "  $BotTime  MoomooTrader-Bot     Start python main.py (Mon-Fri)"
+Write-Host "  $StopTime  MoomooTrader-Stop    Stop Bot + OpenD     (Tue-Sat)"
+Write-Host ""
+Write-Host "  Current: DST (summer time) schedule" -ForegroundColor Cyan
+Write-Host "  When EST resumes (Nov): change to 23:10 / 23:15 / 06:10"
 Write-Host ""
 Write-Host "Verify:" -ForegroundColor Yellow
 Write-Host "  Get-ScheduledTask -TaskName 'MoomooTrader-*' | Format-Table TaskName, State"

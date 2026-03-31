@@ -78,25 +78,25 @@ class TestMarketIsOpen:
 # ---------------------------------------------------------------------------
 
 class TestShouldForceExit:
-    """should_force_exit() のテスト."""
+    """should_force_exit() のテスト (ET-based, DST-aware)."""
 
     @patch("src.main.datetime")
-    def test_force_exit_at_0550(self, mock_dt: MagicMock) -> None:
-        """JST 05:50 → True."""
-        mock_now = datetime(2026, 3, 24, 5, 50, tzinfo=JST)
+    def test_force_exit_at_1550_et(self, mock_dt: MagicMock) -> None:
+        """ET 15:50 → True."""
+        mock_now = datetime(2026, 3, 24, 15, 50, tzinfo=ET)
         mock_dt.now.return_value = mock_now
         assert should_force_exit() is True
 
     @patch("src.main.datetime")
-    def test_no_force_exit_at_0549(self, mock_dt: MagicMock) -> None:
-        """JST 05:49 → False."""
-        mock_now = datetime(2026, 3, 24, 5, 49, tzinfo=JST)
+    def test_no_force_exit_at_1549_et(self, mock_dt: MagicMock) -> None:
+        """ET 15:49 → False."""
+        mock_now = datetime(2026, 3, 24, 15, 49, tzinfo=ET)
         mock_dt.now.return_value = mock_now
         assert should_force_exit() is False
 
     @patch("src.main.datetime")
-    def test_force_exit_after_0550(self, mock_dt: MagicMock) -> None:
-        """JST 06:00 → True（05:50以降）."""
-        mock_now = datetime(2026, 3, 24, 6, 0, tzinfo=JST)
+    def test_force_exit_at_1600_et(self, mock_dt: MagicMock) -> None:
+        """ET 16:00 → True (after 15:50)."""
+        mock_now = datetime(2026, 3, 24, 16, 0, tzinfo=ET)
         mock_dt.now.return_value = mock_now
         assert should_force_exit() is True
