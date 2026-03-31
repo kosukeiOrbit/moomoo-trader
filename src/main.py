@@ -157,10 +157,7 @@ async def main_loop() -> None:
             "WIN" if is_win else "LOSS",
         )
 
-    paper_trade = settings.TRADE_ENV == "SIMULATE"
-    order_router = OrderRouter(
-        client, circuit_breaker, paper_trade=paper_trade, on_exit=_on_exit,
-    )
+    order_router = OrderRouter(client, circuit_breaker, on_exit=_on_exit)
 
     # ポジション監視タスク
     monitor_task = asyncio.create_task(order_router.monitor_positions())

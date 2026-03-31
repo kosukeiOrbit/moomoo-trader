@@ -34,6 +34,10 @@ def _setup(exit_price: float = 155.0):
     mock_client.get_snapshot.return_value = QuoteSnapshot(
         symbol="AAPL", last_price=exit_price, volume=0, turnover=0,
     )
+    _seq = iter(range(1, 100))
+    mock_client.place_order.side_effect = lambda order: OrderResult(
+        order_id=f"ORD-{next(_seq)}", status="SUBMITTED",
+    )
 
     cb = CircuitBreaker()
     pnl_tracker = PnLTracker()
@@ -49,7 +53,7 @@ def _setup(exit_price: float = 155.0):
             symbol=result.position.symbol, pnl=pnl, is_win=is_win,
         ))
 
-    router = OrderRouter(mock_client, cb, paper_trade=True, on_exit=_on_exit)
+    router = OrderRouter(mock_client, cb, on_exit=_on_exit)
     return router, pnl_tracker, position_sizer, mock_client
 
 
@@ -140,12 +144,16 @@ class TestExitIntegration:
         mock_client2.get_snapshot.return_value = QuoteSnapshot(
             symbol="AAPL", last_price=160.0, volume=0, turnover=0,
         )
+        _seq2 = iter(range(100, 200))
+        mock_client2.place_order.side_effect = lambda order: OrderResult(
+            order_id=f"ORD-{next(_seq2)}", status="SUBMITTED",
+        )
 
         def _on_exit2(result: ExitResult) -> None:
             p = pnl_loss.close_trade(result.position.order_id, result.exit_price, result.reason)
             sizer.update_stats(TradeResult(symbol="AAPL", pnl=p, is_win=p > 0))
 
-        router_win = OrderRouter(mock_client2, CircuitBreaker(), paper_trade=True, on_exit=_on_exit2)
+        router_win = OrderRouter(mock_client2, CircuitBreaker(), on_exit=_on_exit2)
         router_win.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router_win.open_positions.keys())[0]
         pnl_loss.register(oid, "AAPL", "LONG", 10, 150.0)

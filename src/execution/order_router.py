@@ -1,7 +1,8 @@
 """moomoo OpenAPI経由での発注・決済管理モジュール.
 
-CircuitBreaker で安全確認 → StopLossManager から SL/TP 取得 →
-MoomooClient で発注。SIMULATE/REAL モード切り替え対応。
+SIMULATE / REAL どちらでも moomoo API (place_order) を呼び出す。
+SIMULATE = moomoo ペーパートレードサーバーに仮想発注
+REAL     = 本番発注
 決済時は on_exit コールバックで pnl_tracker / notifier / position_sizer を更新する。
 """
 
@@ -51,24 +52,22 @@ OnExitCallback = Callable[[ExitResult], None]
 
 
 class OrderRouter:
-    """発注ルーター: 安全チェック → 発注 → ポジション管理.
+    """発注ルーター: moomoo API 経由で発注・決済を行う.
 
-    決済時に on_exit コールバックを呼び出し、
-    pnl_tracker / notifier / position_sizer を一元的に更新する。
+    SIMULATE でも REAL でも place_order() を呼び出す。
+    SIMULATE → moomoo ペーパートレードサーバーに仮想発注
+    REAL     → 本番発注
     """
 
     def __init__(
         self,
         client: MoomooClient,
         circuit_breaker: CircuitBreaker,
-        paper_trade: bool = True,
         on_exit: OnExitCallback | None = None,
     ) -> None:
         self._client = client
         self._circuit_breaker = circuit_breaker
-        self._paper_trade = paper_trade
         self._positions: dict[str, Position] = {}
-        self._order_seq: int = 0
         self._on_exit = on_exit
 
     # ------------------------------------------------------------------
@@ -97,7 +96,11 @@ class OrderRouter:
         price: float,
         levels: Levels | None = None,
     ) -> OrderResult | None:
-        """エントリー注文を発注する."""
+        """エントリー注文を発注する.
+
+        SIMULATE → moomoo ペーパートレードサーバーに成行注文
+        REAL     → 本番に成行注文
+        """
         if not signal.go or size <= 0:
             return None
 
@@ -107,47 +110,28 @@ class OrderRouter:
                 logger.info("Duplicate entry blocked: %s already has position", symbol)
                 return None
 
-        # ペーパートレード
-        if self._paper_trade:
-            self._order_seq += 1
-            order_id = f"PAPER-{symbol}-{self._order_seq}"
-            self._positions[order_id] = Position(
-                order_id=order_id,
-                symbol=symbol,
-                direction=signal.direction,
-                size=size,
-                entry_price=price,
-                levels=levels,
-            )
-            logger.info(
-                "[PAPER] ENTRY: %s %s %d shares @ $%.2f",
-                signal.direction, symbol, size, price,
-            )
-            return OrderResult(
-                order_id=order_id,
-                status="PAPER_FILLED",
-                filled_price=price,
-                filled_quantity=size,
-            )
-
-        # 実弾発注
+        # moomoo API で発注 (SIMULATE / REAL 両方)
         side = "BUY" if signal.direction == "LONG" else "SELL"
         order = Order(symbol=symbol, side=side, quantity=size)
         result = self._client.place_order(order)
 
-        if result.status != "FAILED":
-            self._positions[result.order_id] = Position(
-                order_id=result.order_id,
-                symbol=symbol,
-                direction=signal.direction,
-                size=size,
-                entry_price=price,
-                levels=levels,
-            )
-            logger.info(
-                "ENTRY: %s %s %d shares order_id=%s",
-                signal.direction, symbol, size, result.order_id,
-            )
+        if result.status == "FAILED":
+            logger.error("ENTRY order failed: %s %s", symbol, result)
+            return result
+
+        self._positions[result.order_id] = Position(
+            order_id=result.order_id,
+            symbol=symbol,
+            direction=signal.direction,
+            size=size,
+            entry_price=price,
+            levels=levels,
+        )
+        logger.info(
+            "ENTRY: %s %s %d shares @ $%.2f order_id=%s (env=%s)",
+            signal.direction, symbol, size, price,
+            result.order_id, settings.TRADE_ENV,
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -159,15 +143,8 @@ class OrderRouter:
 
         1. 現在価格を取得
         2. PnL を計算
-        3. ポジションを閉じる
+        3. moomoo API で反対売買
         4. on_exit コールバックを呼ぶ
-
-        Args:
-            order_id: 決済対象の注文ID
-            reason: 決済理由
-
-        Returns:
-            決済結果（ポジション不存在なら None）
         """
         position = self._positions.get(order_id)
         if position is None:
@@ -184,25 +161,21 @@ class OrderRouter:
             pnl = (position.entry_price - exit_price) * position.size
 
         logger.info(
-            "EXIT: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+            "EXIT: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s (env=%s)",
             order_id, position.symbol, position.entry_price,
-            exit_price, pnl, reason,
+            exit_price, pnl, reason, settings.TRADE_ENV,
         )
 
-        # 発注 (実弾モードのみ)
-        order_result: OrderResult
-        if self._paper_trade:
-            del self._positions[order_id]
-            order_result = OrderResult(order_id=order_id, status="PAPER_CLOSED")
-        else:
-            side = "SELL" if position.direction == "LONG" else "BUY"
-            order = Order(symbol=position.symbol, side=side, quantity=position.size)
-            order_result = self._client.place_order(order)
-            if order_result.status != "FAILED":
-                del self._positions[order_id]
-            else:
-                logger.error("EXIT order failed: %s", order_id)
-                return None
+        # moomoo API で反対売買 (SIMULATE / REAL 両方)
+        side = "SELL" if position.direction == "LONG" else "BUY"
+        order = Order(symbol=position.symbol, side=side, quantity=position.size)
+        order_result = self._client.place_order(order)
+
+        if order_result.status == "FAILED":
+            logger.error("EXIT order failed: %s", order_id)
+            return None
+
+        del self._positions[order_id]
 
         # コールバック
         exit_result = ExitResult(
@@ -248,10 +221,7 @@ class OrderRouter:
     # ------------------------------------------------------------------
 
     async def monitor_positions(self) -> None:
-        """SL/TPを非同期で監視し、条件を満たしたら自動決済する.
-
-        5秒間隔でポジションの株価をチェックする。
-        """
+        """SL/TPを非同期で監視し、条件を満たしたら自動決済する."""
         while True:
             for order_id, pos in list(self._positions.items()):
                 if pos.levels is None:
@@ -262,7 +232,6 @@ class OrderRouter:
                     if price <= 0:
                         continue
 
-                    # ストップロス
                     if price <= pos.levels.stop_loss:
                         logger.warning(
                             "SL triggered: %s $%.2f <= $%.2f",
@@ -270,7 +239,6 @@ class OrderRouter:
                         )
                         self.exit(order_id, "SL")
 
-                    # テイクプロフィット
                     elif price >= pos.levels.take_profit:
                         logger.info(
                             "TP triggered: %s $%.2f >= $%.2f",
