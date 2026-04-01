@@ -302,3 +302,73 @@ class TestSentimentAnalyzerIntegration:
         analyzer.analyze(["MSFT cloud revenue is booming", "AI integration is great"], "MSFT")
         rolling = analyzer.get_rolling_score("MSFT", window_minutes=5)
         assert rolling != 0.0, "Rolling score should be non-zero after a real API call"
+
+
+# ---------------------------------------------------------------------------
+# テキストキャッシュのテスト
+# ---------------------------------------------------------------------------
+
+class TestSentimentCache:
+    """テキストキャッシュの動作テスト."""
+
+    def test_cache_hit_skips_api(self) -> None:
+        """同じテキストの2回目はAPI呼び出しをスキップしてキャッシュを返す."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create.return_value = _mock_response(
+            '{"score": 0.5, "confidence": 0.8, "reasoning": "Bullish"}'
+        )
+
+        texts = ["NVDA earnings beat expectations", "GPU demand is insane"]
+        result1 = analyzer.analyze(texts, "NVDA")
+        result2 = analyzer.analyze(texts, "NVDA")
+
+        assert result1.score == result2.score
+        assert result1.confidence == result2.confidence
+        # API は1回だけ呼ばれる
+        assert analyzer._client.messages.create.call_count == 1
+
+    def test_cache_miss_on_different_texts(self) -> None:
+        """テキストが変わればAPI を再呼び出しする."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create.return_value = _mock_response(
+            '{"score": 0.5, "confidence": 0.8, "reasoning": "Bullish"}'
+        )
+
+        texts_a = ["Good earnings report", "Revenue up 20%"]
+        texts_b = ["Bad earnings report", "Revenue down 20%"]
+        analyzer.analyze(texts_a, "AAPL")
+        analyzer.analyze(texts_b, "AAPL")
+
+        assert analyzer._client.messages.create.call_count == 2
+
+    def test_cache_expires_after_ttl(self) -> None:
+        """キャッシュはTTL経過後に期限切れになる."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create.return_value = _mock_response(
+            '{"score": 0.5, "confidence": 0.8, "reasoning": "Bullish"}'
+        )
+
+        texts = ["TSLA deliveries record high", "New factory opens"]
+        analyzer.analyze(texts, "TSLA")
+
+        # キャッシュのタイムスタンプを31分前に巻き戻す
+        h, result, ts = analyzer._cache["TSLA"]
+        analyzer._cache["TSLA"] = (h, result, ts - timedelta(minutes=31))
+
+        analyzer.analyze(texts, "TSLA")
+        # TTL切れなのでAPI が再度呼ばれる
+        assert analyzer._client.messages.create.call_count == 2
+
+    def test_cache_independent_per_symbol(self) -> None:
+        """キャッシュは銘柄ごとに独立している."""
+        analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create.return_value = _mock_response(
+            '{"score": 0.5, "confidence": 0.8, "reasoning": "Bullish"}'
+        )
+
+        texts = ["Great earnings", "Revenue up"]
+        analyzer.analyze(texts, "AAPL")
+        analyzer.analyze(texts, "NVDA")
+
+        # 別銘柄なので2回呼ばれる
+        assert analyzer._client.messages.create.call_count == 2

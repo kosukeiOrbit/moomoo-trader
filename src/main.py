@@ -213,16 +213,36 @@ async def main_loop() -> None:
                 if _shutdown_requested:
                     break
                 try:
-                    # データ収集
+                    # 1) フロー先行取得（API不要・低コスト）
+                    flow = flow_detector.get_flow_signal(symbol)
+
+                    # 2) flow=SELL ならClaude APIをスキップ
+                    if flow.direction != "BUY":
+                        logger.info(
+                            "[%s] flow=%s(%.2f) -> SKIP(flow not BUY, API skipped)",
+                            symbol, flow.direction, flow.strength,
+                        )
+                        continue
+
+                    # 3) テキスト収集
                     posts = await board_scraper.fetch_posts(symbol)
                     news_articles = await news_feed.get_latest(symbol)
                     texts = [p.text for p in posts] + [
                         f"{a.title} {a.body}" for a in news_articles
                     ]
 
-                    # シグナル生成
+                    # 4) テキスト不足ならClaude APIをスキップ
+                    filtered_count = len([t for t in texts if t.strip()])
+                    if filtered_count < settings.MIN_TEXTS_FOR_ANALYSIS:
+                        logger.info(
+                            "[%s] flow=%s(%.2f) texts=%d -> SKIP(texts < %d, API skipped)",
+                            symbol, flow.direction, flow.strength,
+                            filtered_count, settings.MIN_TEXTS_FOR_ANALYSIS,
+                        )
+                        continue
+
+                    # 5) Claude APIでセンチメント分析（flow=BUY + texts十分の場合のみ）
                     sentiment = sentiment_analyzer.analyze(texts, symbol)
-                    flow = flow_detector.get_flow_signal(symbol)
                     decision = and_filter.should_enter(sentiment, flow)
 
                     logger.info(

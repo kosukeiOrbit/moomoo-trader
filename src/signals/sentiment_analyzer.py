@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections import defaultdict
@@ -50,6 +51,8 @@ class SentimentAnalyzer:
 
     BATCH_LIMIT = 20  # 1回のAPIコールで処理する最大テキスト数
 
+    CACHE_TTL_MINUTES = 30  # テキストキャッシュ有効期限
+
     def __init__(self, api_key: str | None = None) -> None:
         self._client = anthropic.Anthropic(
             api_key=api_key or settings.ANTHROPIC_API_KEY,
@@ -58,6 +61,14 @@ class SentimentAnalyzer:
         )
         # symbol -> [(timestamp, score)] のローリングウィンドウ
         self._score_history: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+        # テキストキャッシュ: symbol -> (texts_hash, result, timestamp)
+        self._cache: dict[str, tuple[str, SentimentResult, datetime]] = {}
+
+    @staticmethod
+    def _hash_texts(texts: list[str]) -> str:
+        """テキストリストのハッシュ値を計算する."""
+        combined = "\n".join(sorted(texts))
+        return hashlib.md5(combined.encode("utf-8")).hexdigest()
 
     def analyze(self, texts: list[str], symbol: str) -> SentimentResult:
         """テキストリストを一括分析してセンチメントスコアを返す.
@@ -80,6 +91,15 @@ class SentimentAnalyzer:
                 reasoning=f"Skipped: {len(filtered)} texts < {settings.MIN_TEXTS_FOR_ANALYSIS}",
             )
 
+        # キャッシュチェック: 同じテキストなら前回の結果を返す
+        texts_hash = self._hash_texts(filtered)
+        if symbol in self._cache:
+            cached_hash, cached_result, cached_at = self._cache[symbol]
+            age = datetime.now() - cached_at
+            if cached_hash == texts_hash and age < timedelta(minutes=self.CACHE_TTL_MINUTES):
+                logger.debug("[%s] Cache hit (age=%.0fs)", symbol, age.total_seconds())
+                return cached_result
+
         combined = "\n---\n".join(filtered)
         user_message = (
             f"銘柄: {symbol}\n"
@@ -88,6 +108,9 @@ class SentimentAnalyzer:
         )
 
         result = self._call_api(user_message)
+
+        # キャッシュに保存
+        self._cache[symbol] = (texts_hash, result, datetime.now())
 
         # ローリングウィンドウに記録
         if result.score != 0.0 or result.confidence != 0.0:
