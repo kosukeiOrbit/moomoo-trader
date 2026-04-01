@@ -354,6 +354,16 @@ class MoomooClient:
         positions = self.get_positions()
         return symbol in positions and positions[symbol]["qty"] > 0
 
+    def get_order_status(self, order_id: str) -> str:
+        """指定 order_id の注文ステータスを取得する."""
+        assert self._trade_ctx is not None
+        ret, data = self._trade_ctx.order_list_query(
+            order_id=order_id, trd_env=self._trd_env,
+        )
+        if ret != RET_OK or data.empty:
+            return "UNKNOWN"
+        return str(data.iloc[0].get("order_status", "UNKNOWN"))
+
     # ------------------------------------------------------------------
     # 発注
     # ------------------------------------------------------------------

@@ -142,8 +142,8 @@ class OrderRouter:
             return result
 
         # position_list_query() で約定確認（最大5秒待機）
-        logger.info("[%s] 約定確認開始 (最大%.0fs)", symbol, FILL_CHECK_MAX_WAIT)
-        filled = self._wait_for_fill(symbol)
+        logger.info("[%s] 約定確認開始 (最大%.0fs, order_id=%s)", symbol, FILL_CHECK_MAX_WAIT, result.order_id)
+        filled = self._wait_for_fill(symbol, order_id=result.order_id)
         if filled:
             fill_price = filled.get("cost_price", price)
             fill_qty = int(filled.get("qty", size))
@@ -177,20 +177,34 @@ class OrderRouter:
             filled_price=fill_price, filled_quantity=fill_qty,
         )
 
-    def _wait_for_fill(self, symbol: str) -> dict | None:
-        """position_list_query() で約定を確認する（最大 FILL_CHECK_MAX_WAIT 秒）."""
+    def _wait_for_fill(self, symbol: str, order_id: str = "") -> dict | None:
+        """position_list_query() で約定を確認する（最大 FILL_CHECK_MAX_WAIT 秒）.
+
+        同時に order_list_query() で order_status の変化もログに記録する。
+        """
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
             time.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
             attempt += 1
+
+            # position_list で約定確認
             t0 = time.monotonic()
             positions = self._client.get_positions()
             api_time = time.monotonic() - t0
-            logger.debug(
-                "[%s] fill check #%d: get_positions() took %.2fs, found=%s",
-                symbol, attempt, api_time, list(positions.keys()),
+
+            # order_list で order_status も取得
+            order_status = "?"
+            try:
+                order_status = self._client.get_order_status(order_id) if order_id else "?"
+            except Exception:
+                pass
+
+            logger.info(
+                "[%s] fill check #%d (%.1fs): order_status=%s positions=%s (api %.2fs)",
+                symbol, attempt, elapsed, order_status,
+                list(positions.keys()), api_time,
             )
             if symbol in positions and positions[symbol]["qty"] > 0:
                 return positions[symbol]
