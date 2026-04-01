@@ -1,14 +1,15 @@
 """発注・決済管理モジュール.
 
-SIMULATE → ローカルポジション管理（FUTUJP API 未対応のため）
-REAL     → moomoo API 経由で発注
-SL/TP監視・P&L記録・Discord通知は両モードで同じ動作。
+SIMULATE / REAL 両対応。
+約定確認は position_list_query() ベースで行う（order_status は不正確なため）。
+SL/TP監視は内部 dict の価格比較で判定する。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
@@ -21,7 +22,9 @@ from src.signals.and_filter import EntryDecision
 
 logger = logging.getLogger(__name__)
 
-_is_simulate = settings.TRADE_ENV == "SIMULATE"
+# 約定確認のリトライ設定
+FILL_CHECK_INTERVAL = 1.0  # 秒
+FILL_CHECK_MAX_WAIT = 5.0  # 最大待機秒数
 
 
 @dataclass
@@ -54,8 +57,10 @@ OnExitCallback = Callable[[ExitResult], None]
 class OrderRouter:
     """発注ルーター.
 
-    SIMULATE: ローカル dict でポジション管理 (PAPER-{symbol}-{n})
-    REAL:     moomoo API place_order() で発注
+    SIMULATE / REAL 共通:
+      - moomoo API の place_order() で発注
+      - position_list_query() で約定確認
+      - 内部 dict で SL/TP 監視
     """
 
     def __init__(
@@ -68,7 +73,6 @@ class OrderRouter:
         self._circuit_breaker = circuit_breaker
         self._positions: dict[str, Position] = {}
         self._on_exit = on_exit
-        self._paper_seq: int = 0
 
     @property
     def open_positions(self) -> dict[str, Position]:
@@ -98,54 +102,60 @@ class OrderRouter:
             logger.info("[%s] MAX_POSITIONS(%d)に達しているためスキップ", symbol, settings.MAX_POSITIONS)
             return None
 
+        # 重複エントリー防止: 内部 dict チェック
         for pos in self._positions.values():
             if pos.symbol == symbol:
-                logger.info("Duplicate entry blocked: %s", symbol)
+                logger.info("Duplicate entry blocked (internal): %s", symbol)
                 return None
 
-        if _is_simulate:
-            return self._enter_simulate(signal, symbol, size, price, levels)
-        return self._enter_real(signal, symbol, size, price, levels)
+        # moomoo API にも重複チェック
+        if self._client.has_position(symbol):
+            logger.info("Duplicate entry blocked (moomoo): %s", symbol)
+            return None
 
-    def _enter_simulate(
-        self, signal: EntryDecision, symbol: str,
-        size: int, price: float, levels: Levels | None,
-    ) -> OrderResult:
-        self._paper_seq += 1
-        order_id = f"PAPER-{symbol}-{self._paper_seq}"
-        self._positions[order_id] = Position(
-            order_id=order_id, symbol=symbol,
-            direction=signal.direction, size=size,
-            entry_price=price, levels=levels,
-        )
-        logger.info(
-            "[SIMULATE] ENTRY: %s %s %d shares @ $%.2f id=%s",
-            signal.direction, symbol, size, price, order_id,
-        )
-        return OrderResult(
-            order_id=order_id, status="FILLED",
-            filled_price=price, filled_quantity=size,
-        )
-
-    def _enter_real(
-        self, signal: EntryDecision, symbol: str,
-        size: int, price: float, levels: Levels | None,
-    ) -> OrderResult:
         side = "BUY" if signal.direction == "LONG" else "SELL"
         result = self._client.place_order(Order(symbol=symbol, side=side, quantity=size))
         if result.status == "FAILED":
             logger.error("ENTRY failed: %s %s", symbol, result)
             return result
-        self._positions[result.order_id] = Position(
-            order_id=result.order_id, symbol=symbol,
-            direction=signal.direction, size=size,
-            entry_price=price, levels=levels,
+
+        # position_list_query() で約定確認（最大5秒待機）
+        filled = self._wait_for_fill(symbol)
+        if filled:
+            fill_price = filled.get("cost_price", price)
+            fill_qty = int(filled.get("qty", size))
+        else:
+            # position_list に出なくても内部管理はする（ラグ対応）
+            logger.warning("[%s] 約定確認タイムアウト — 内部管理で続行", symbol)
+            fill_price = price
+            fill_qty = size
+
+        order_id = result.order_id
+        self._positions[order_id] = Position(
+            order_id=order_id, symbol=symbol,
+            direction=signal.direction, size=fill_qty,
+            entry_price=fill_price, levels=levels,
         )
         logger.info(
-            "[REAL] ENTRY: %s %s %d shares @ $%.2f id=%s",
-            signal.direction, symbol, size, price, result.order_id,
+            "ENTRY: %s %s %d shares @ $%.2f id=%s",
+            signal.direction, symbol, fill_qty, fill_price, order_id,
         )
-        return result
+        return OrderResult(
+            order_id=order_id, status="FILLED",
+            filled_price=fill_price, filled_quantity=fill_qty,
+        )
+
+    def _wait_for_fill(self, symbol: str) -> dict | None:
+        """position_list_query() で約定を確認する（最大 FILL_CHECK_MAX_WAIT 秒）."""
+        elapsed = 0.0
+        while elapsed < FILL_CHECK_MAX_WAIT:
+            time.sleep(FILL_CHECK_INTERVAL)
+            elapsed += FILL_CHECK_INTERVAL
+            positions = self._client.get_positions()
+            if symbol in positions and positions[symbol]["qty"] > 0:
+                logger.info("[%s] 約定確認OK (%.1fs)", symbol, elapsed)
+                return positions[symbol]
+        return None
 
     # ------------------------------------------------------------------
     # Exit
@@ -160,6 +170,18 @@ class OrderRouter:
 
         exit_price = self._get_exit_price(position.symbol)
 
+        # 決済注文を発注
+        side = "SELL" if position.direction == "LONG" else "BUY"
+        result = self._client.place_order(
+            Order(symbol=position.symbol, side=side, quantity=position.size),
+        )
+        if result.status == "FAILED":
+            logger.error("EXIT order failed: %s %s", order_id, position.symbol)
+            return None
+
+        # position_list_query() でポジション消滅を確認
+        self._wait_for_close(position.symbol)
+
         if position.direction == "LONG":
             pnl = (exit_price - position.entry_price) * position.size
         else:
@@ -171,15 +193,10 @@ class OrderRouter:
             exit_price, pnl, reason,
         )
 
-        if _is_simulate:
-            order_result = self._exit_simulate(order_id)
-        else:
-            order_result = self._exit_real(order_id, position)
-            if order_result is None:
-                return None
+        del self._positions[order_id]
 
         exit_result = ExitResult(
-            order_result=order_result, position=position,
+            order_result=result, position=position,
             exit_price=exit_price, pnl=pnl, reason=reason,
         )
         if self._on_exit:
@@ -189,20 +206,17 @@ class OrderRouter:
                 logger.exception("on_exit callback error")
         return exit_result
 
-    def _exit_simulate(self, order_id: str) -> OrderResult:
-        del self._positions[order_id]
-        return OrderResult(order_id=order_id, status="CLOSED")
-
-    def _exit_real(self, order_id: str, position: Position) -> OrderResult | None:
-        side = "SELL" if position.direction == "LONG" else "BUY"
-        result = self._client.place_order(
-            Order(symbol=position.symbol, side=side, quantity=position.size),
-        )
-        if result.status == "FAILED":
-            logger.error("EXIT order failed: %s", order_id)
-            return None
-        del self._positions[order_id]
-        return result
+    def _wait_for_close(self, symbol: str) -> bool:
+        """position_list_query() でポジション消滅を確認する."""
+        elapsed = 0.0
+        while elapsed < FILL_CHECK_MAX_WAIT:
+            time.sleep(FILL_CHECK_INTERVAL)
+            elapsed += FILL_CHECK_INTERVAL
+            if not self._client.has_position(symbol):
+                logger.info("[%s] 決済確認OK (%.1fs)", symbol, elapsed)
+                return True
+        logger.warning("[%s] 決済確認タイムアウト — 内部管理で続行", symbol)
+        return False
 
     def exit_all(self, reason: str) -> list[ExitResult]:
         """全ポジション決済."""
@@ -231,7 +245,11 @@ class OrderRouter:
     # ------------------------------------------------------------------
 
     async def monitor_positions(self) -> None:
-        """SL/TP監視ループ（5秒間隔）."""
+        """SL/TP監視ループ（5秒間隔）.
+
+        内部 dict のポジション情報と現在価格を比較して SL/TP を判定する。
+        moomoo API のポーリングは get_snapshot() のみ。
+        """
         while True:
             for order_id, pos in list(self._positions.items()):
                 if pos.levels is None:

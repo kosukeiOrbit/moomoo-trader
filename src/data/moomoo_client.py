@@ -324,6 +324,37 @@ class MoomooClient:
         return float(data.iloc[0].get("total_assets", 0))
 
     # ------------------------------------------------------------------
+    # ポジション照会
+    # ------------------------------------------------------------------
+
+    def get_positions(self) -> dict[str, dict]:
+        """ペーパー/本番口座の保有ポジションを取得する.
+
+        Returns:
+            {symbol: {"qty": float, "cost_price": float, "market_val": float, "pl_val": float}}
+        """
+        assert self._trade_ctx is not None
+        ret, data = self._trade_ctx.position_list_query(trd_env=self._trd_env)
+        if ret != RET_OK or data.empty:
+            return {}
+        result: dict[str, dict] = {}
+        for _, row in data.iterrows():
+            code = str(row["code"])  # "US.NVDA"
+            symbol = code.replace("US.", "")
+            result[symbol] = {
+                "qty": float(row["qty"]),
+                "cost_price": float(row["cost_price"]),
+                "market_val": float(row.get("market_val", 0)),
+                "pl_val": float(row.get("pl_val", 0)),
+            }
+        return result
+
+    def has_position(self, symbol: str) -> bool:
+        """指定銘柄のポジションを保有しているか."""
+        positions = self.get_positions()
+        return symbol in positions and positions[symbol]["qty"] > 0
+
+    # ------------------------------------------------------------------
     # 発注
     # ------------------------------------------------------------------
 
