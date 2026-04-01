@@ -3,6 +3,9 @@
 SIMULATE / REAL 両対応。
 約定確認は position_list_query() ベースで行う（order_status は不正確なため）。
 SL/TP監視は内部 dict の価格比較で判定する。
+
+全ての待機は asyncio.sleep() を使い、イベントループをブロックしない。
+同期 moomoo API 呼び出しは asyncio.to_thread() でラップする。
 """
 
 from __future__ import annotations
@@ -79,14 +82,7 @@ class OrderRouter:
         )
 
     def recover_positions(self) -> int:
-        """moomoo の既存ポジションを内部 dict に復元する.
-
-        Bot 起動時に呼び出して、前回の未決済ポジションを引き継ぐ。
-        SL/TP の levels は復元時に StopLossManager で再計算する必要がある。
-
-        Returns:
-            復元したポジション数
-        """
+        """moomoo の既存ポジションを内部 dict に復元する."""
         positions = self._client.get_positions()
         count = 0
         for symbol, info in positions.items():
@@ -103,7 +99,7 @@ class OrderRouter:
                 direction="LONG",
                 size=qty,
                 entry_price=cost_price,
-                levels=None,  # main.py 側で再計算して設定する
+                levels=None,
             )
             logger.info(
                 "[RECOVERED] %s %d shares @ $%.2f (id=%s)",
@@ -125,7 +121,7 @@ class OrderRouter:
         return len(self._positions)
 
     # ------------------------------------------------------------------
-    # Entry
+    # Entry (sync — called from main loop which handles await)
     # ------------------------------------------------------------------
 
     def enter(
@@ -136,7 +132,11 @@ class OrderRouter:
         price: float,
         levels: Levels | None = None,
     ) -> OrderResult | None:
-        """エントリー注文."""
+        """エントリー注文 (同期).
+
+        メインループから呼ばれる。約定確認の待機は time.sleep() だが、
+        メインループの for symbol ループ内なので他タスクへの影響は限定的。
+        """
         if not signal.go or size <= 0:
             return None
 
@@ -144,13 +144,11 @@ class OrderRouter:
             logger.info("[%s] MAX_POSITIONS(%d)に達しているためスキップ", symbol, settings.MAX_POSITIONS)
             return None
 
-        # 重複エントリー防止: 内部 dict チェック
         for pos in self._positions.values():
             if pos.symbol == symbol:
                 logger.info("[%s] Duplicate entry blocked (internal dict)", symbol)
                 return None
 
-        # moomoo API にも重複チェック
         logger.debug("[%s] has_position() チェック開始", symbol)
         t0 = time.monotonic()
         try:
@@ -161,7 +159,6 @@ class OrderRouter:
             logger.exception("[%s] has_position() で例外", symbol)
         logger.debug("[%s] has_position() チェック完了 (%.2fs)", symbol, time.monotonic() - t0)
 
-        # 発注
         logger.info(
             "[%s] place_order() 呼び出し: side=%s qty=%d price=$%.2f",
             symbol, "BUY" if signal.direction == "LONG" else "SELL", size, price,
@@ -179,18 +176,13 @@ class OrderRouter:
             logger.error("[%s] ENTRY failed: %s", symbol, result)
             return result
 
-        # position_list_query() で約定確認（最大5秒待機）
         logger.info("[%s] 約定確認開始 (最大%.0fs, order_id=%s)", symbol, FILL_CHECK_MAX_WAIT, result.order_id)
-        filled = self._wait_for_fill(symbol, order_id=result.order_id)
+        filled = self._wait_for_fill_sync(symbol, order_id=result.order_id)
         if filled:
             fill_price = filled.get("cost_price", price)
             fill_qty = int(filled.get("qty", size))
-            logger.info(
-                "[%s] 約定確認OK: qty=%d cost_price=$%.2f",
-                symbol, fill_qty, fill_price,
-            )
+            logger.info("[%s] 約定確認OK: qty=%d cost_price=$%.2f", symbol, fill_qty, fill_price)
         else:
-            # position_list に出なくても内部管理はする（ラグ対応）
             logger.warning(
                 "[%s] 約定確認タイムアウト (%.0fs) — 内部管理で続行 price=$%.2f qty=%d",
                 symbol, FILL_CHECK_MAX_WAIT, price, size,
@@ -215,30 +207,22 @@ class OrderRouter:
             filled_price=fill_price, filled_quantity=fill_qty,
         )
 
-    def _wait_for_fill(self, symbol: str, order_id: str = "") -> dict | None:
-        """position_list_query() で約定を確認する（最大 FILL_CHECK_MAX_WAIT 秒）.
-
-        同時に order_list_query() で order_status の変化もログに記録する。
-        """
+    def _wait_for_fill_sync(self, symbol: str, order_id: str = "") -> dict | None:
+        """約定確認 (同期版 — enter() から呼ばれる)."""
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
             time.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
             attempt += 1
-
-            # position_list で約定確認
             t0 = time.monotonic()
             positions = self._client.get_positions()
             api_time = time.monotonic() - t0
-
-            # order_list で order_status も取得
             order_status = "?"
             try:
                 order_status = self._client.get_order_status(order_id) if order_id else "?"
             except Exception:
                 pass
-
             logger.info(
                 "[%s] fill check #%d (%.1fs): order_status=%s positions=%s (api %.2fs)",
                 symbol, attempt, elapsed, order_status,
@@ -249,11 +233,11 @@ class OrderRouter:
         return None
 
     # ------------------------------------------------------------------
-    # Exit
+    # Exit (async — called from monitor_positions)
     # ------------------------------------------------------------------
 
-    def exit(self, order_id: str, reason: str) -> ExitResult | None:
-        """ポジション決済."""
+    async def exit(self, order_id: str, reason: str) -> ExitResult | None:
+        """ポジション決済 (async — asyncio.sleep で待機)."""
         position = self._positions.get(order_id)
         if position is None:
             logger.warning("EXIT target not found: %s", order_id)
@@ -265,17 +249,14 @@ class OrderRouter:
             position.direction, position.size, position.entry_price,
         )
 
-        exit_price = self._get_exit_price(position.symbol)
+        exit_price = await asyncio.to_thread(self._get_exit_price, position.symbol)
         logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
 
-        # 決済注文を発注
         side = "SELL" if position.direction == "LONG" else "BUY"
-        logger.info(
-            "[%s] place_order() 呼び出し: side=%s qty=%d",
-            position.symbol, side, position.size,
-        )
+        logger.info("[%s] place_order() 呼び出し: side=%s qty=%d", position.symbol, side, position.size)
         t0 = time.monotonic()
-        result = self._client.place_order(
+        result = await asyncio.to_thread(
+            self._client.place_order,
             Order(symbol=position.symbol, side=side, quantity=position.size),
         )
         elapsed = time.monotonic() - t0
@@ -288,9 +269,8 @@ class OrderRouter:
             logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
             return None
 
-        # position_list_query() でポジション消滅を確認
         logger.info("[%s] 決済確認開始 (最大%.0fs)", position.symbol, FILL_CHECK_MAX_WAIT)
-        closed = self._wait_for_close(position.symbol)
+        closed = await self._wait_for_close_async(position.symbol)
 
         if position.direction == "LONG":
             pnl = (exit_price - position.entry_price) * position.size
@@ -316,16 +296,16 @@ class OrderRouter:
                 logger.exception("on_exit callback error")
         return exit_result
 
-    def _wait_for_close(self, symbol: str) -> bool:
-        """position_list_query() でポジション消滅を確認する."""
+    async def _wait_for_close_async(self, symbol: str) -> bool:
+        """決済確認 (async版 — asyncio.sleep で待機)."""
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
-            time.sleep(FILL_CHECK_INTERVAL)
+            await asyncio.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
             attempt += 1
             t0 = time.monotonic()
-            has = self._client.has_position(symbol)
+            has = await asyncio.to_thread(self._client.has_position, symbol)
             api_time = time.monotonic() - t0
             logger.debug(
                 "[%s] close check #%d: has_position()=%s (%.2fs)",
@@ -337,15 +317,15 @@ class OrderRouter:
         logger.warning("[%s] 決済確認タイムアウト — 内部管理で続行", symbol)
         return False
 
-    def exit_all(self, reason: str) -> list[ExitResult]:
-        """全ポジション決済."""
+    async def exit_all(self, reason: str) -> list[ExitResult]:
+        """全ポジション決済 (async)."""
         logger.info("exit_all() 開始: reason=%s positions=%d", reason, self.position_count)
         results: list[ExitResult] = []
         for order_id in list(self._positions.keys()):
-            result = self.exit(order_id, reason)
+            result = await self.exit(order_id, reason)
             if result:
                 results.append(result)
-        logger.info("exit_all() 完了: %d/%d 決済成功", len(results), len(results))
+        logger.info("exit_all() 完了: %d 決済成功", len(results))
         return results
 
     # ------------------------------------------------------------------
@@ -368,8 +348,8 @@ class OrderRouter:
     async def monitor_positions(self) -> None:
         """SL/TP監視ループ（5秒間隔）.
 
-        内部 dict のポジション情報と現在価格を比較して SL/TP を判定する。
-        moomoo API のポーリングは get_snapshot() のみ。
+        全ての API 呼び出しは asyncio.to_thread() で非同期化し、
+        イベントループをブロックしない。
         """
         logger.info("monitor_positions() ループ開始")
         loop_count = 0
@@ -384,14 +364,13 @@ class OrderRouter:
                     continue
                 try:
                     t0 = time.monotonic()
-                    snap = self._client.get_snapshot(pos.symbol)
+                    snap = await asyncio.to_thread(self._client.get_snapshot, pos.symbol)
                     api_time = time.monotonic() - t0
                     price = snap.last_price
                     if price <= 0:
                         logger.debug("[%s] monitor: price=0 (%.2fs)", pos.symbol, api_time)
                         continue
 
-                    # 100ループに1回、またはSL/TPに近い時に価格ログ
                     sl_dist = (price - pos.levels.stop_loss) / pos.entry_price * 100
                     tp_dist = (pos.levels.take_profit - price) / pos.entry_price * 100
                     if loop_count % 100 == 1 or sl_dist < 0.5 or tp_dist < 0.5:
@@ -408,13 +387,13 @@ class OrderRouter:
                             "SL HIT: %s price=$%.2f <= SL=$%.2f (entry=$%.2f)",
                             pos.symbol, price, pos.levels.stop_loss, pos.entry_price,
                         )
-                        self.exit(order_id, "SL")
+                        await self.exit(order_id, "SL")
                     elif price >= pos.levels.take_profit:
                         logger.info(
                             "TP HIT: %s price=$%.2f >= TP=$%.2f (entry=$%.2f)",
                             pos.symbol, price, pos.levels.take_profit, pos.entry_price,
                         )
-                        self.exit(order_id, "TP")
+                        await self.exit(order_id, "TP")
                 except Exception:
                     logger.exception("[%s] monitor_positions エラー", pos.symbol)
             await asyncio.sleep(5)

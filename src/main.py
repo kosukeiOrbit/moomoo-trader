@@ -206,7 +206,7 @@ async def main_loop() -> None:
             # --- ET 15:50 強制決済 ---
             if should_force_exit() and order_router.position_count > 0:
                 logger.warning("ET 15:50 — Force closing all positions")
-                order_router.exit_all("ET 15:50 force close")
+                await order_router.exit_all("ET 15:50 force close")
                 notifier.notify_circuit_breaker("ET 15:50 all positions force-closed")
                 break
 
@@ -239,7 +239,7 @@ async def main_loop() -> None:
                 logger.warning("サーキットブレーカー: %s", breaker_status.reason)
                 notifier.notify_circuit_breaker(breaker_status.reason)
                 if breaker_status.action == BreakerAction.FORCE_CLOSE_ALL:
-                    order_router.exit_all("Circuit breaker: force close")
+                    await order_router.exit_all("Circuit breaker: force close")
                     break
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 continue
