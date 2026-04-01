@@ -61,13 +61,15 @@ class TestSentimentAnalyzerUnit:
         assert result.confidence == 0.0
         analyzer._client.messages.create.assert_not_called()
 
-    def test_single_text_skipped(self) -> None:
-        """1件のみではAPIを呼ばずスキップ (MIN_TEXTS_FOR_ANALYSIS=2)."""
+    def test_single_text_calls_api(self) -> None:
+        """1件でもAPIを呼ぶ (MIN_TEXTS_FOR_ANALYSIS=1)."""
         analyzer = _make_mock_analyzer()
+        analyzer._client.messages.create.return_value = _mock_response(
+            '{"score": 0.3, "confidence": 0.5, "reasoning": "Slightly bullish"}'
+        )
         result = analyzer.analyze(["only one text"], "AAPL")
-        assert result.score == 0.0
-        assert "Skipped" in result.reasoning
-        analyzer._client.messages.create.assert_not_called()
+        assert result.score == 0.3
+        analyzer._client.messages.create.assert_called_once()
 
     def test_whitespace_only_texts_skipped(self) -> None:
         """空白のみのテキストは有効テキスト0件でスキップ."""
