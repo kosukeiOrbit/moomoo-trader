@@ -351,9 +351,9 @@ class TestSentimentCache:
         texts = ["TSLA deliveries record high", "New factory opens"]
         analyzer.analyze(texts, "TSLA")
 
-        # キャッシュのタイムスタンプを31分前に巻き戻す
+        # キャッシュのタイムスタンプを6分前に巻き戻す（TTL=5分）
         h, result, ts = analyzer._cache["TSLA"]
-        analyzer._cache["TSLA"] = (h, result, ts - timedelta(minutes=31))
+        analyzer._cache["TSLA"] = (h, result, ts - timedelta(minutes=6))
 
         analyzer.analyze(texts, "TSLA")
         # TTL切れなのでAPI が再度呼ばれる

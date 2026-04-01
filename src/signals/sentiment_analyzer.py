@@ -51,7 +51,7 @@ class SentimentAnalyzer:
 
     BATCH_LIMIT = 20  # 1回のAPIコールで処理する最大テキスト数
 
-    CACHE_TTL_MINUTES = 30  # テキストキャッシュ有効期限
+    CACHE_TTL_MINUTES = 5  # テキストキャッシュ有効期限
 
     def __init__(self, api_key: str | None = None) -> None:
         self._client = anthropic.Anthropic(
