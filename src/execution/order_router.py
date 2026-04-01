@@ -4,8 +4,8 @@ SIMULATE / REAL 両対応。
 約定確認は position_list_query() ベースで行う（order_status は不正確なため）。
 SL/TP監視は内部 dict の価格比較で判定する。
 
-全ての待機は asyncio.sleep() を使い、イベントループをブロックしない。
-同期 moomoo API 呼び出しは asyncio.to_thread() でラップする。
+注意: futu SDK はスレッドセーフでないため asyncio.to_thread() は使わない。
+同期 API 呼び出しは直接行い、待機のみ asyncio.sleep() を使う。
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ class OrderRouter:
         return len(self._positions)
 
     # ------------------------------------------------------------------
-    # Entry (sync — called from main loop which handles await)
+    # Entry (sync — called from main loop)
     # ------------------------------------------------------------------
 
     def enter(
@@ -132,11 +132,7 @@ class OrderRouter:
         price: float,
         levels: Levels | None = None,
     ) -> OrderResult | None:
-        """エントリー注文 (同期).
-
-        メインループから呼ばれる。約定確認の待機は time.sleep() だが、
-        メインループの for symbol ループ内なので他タスクへの影響は限定的。
-        """
+        """エントリー注文 (同期)."""
         if not signal.go or size <= 0:
             return None
 
@@ -208,7 +204,7 @@ class OrderRouter:
         )
 
     def _wait_for_fill_sync(self, symbol: str, order_id: str = "") -> dict | None:
-        """約定確認 (同期版 — enter() から呼ばれる)."""
+        """約定確認 (同期版)."""
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
@@ -233,11 +229,11 @@ class OrderRouter:
         return None
 
     # ------------------------------------------------------------------
-    # Exit (async — called from monitor_positions)
+    # Exit (async — 待機のみ asyncio.sleep、API は同期で直接呼ぶ)
     # ------------------------------------------------------------------
 
     async def exit(self, order_id: str, reason: str) -> ExitResult | None:
-        """ポジション決済 (async — asyncio.sleep で待機)."""
+        """ポジション決済."""
         position = self._positions.get(order_id)
         if position is None:
             logger.warning("EXIT target not found: %s", order_id)
@@ -249,14 +245,13 @@ class OrderRouter:
             position.direction, position.size, position.entry_price,
         )
 
-        exit_price = await asyncio.to_thread(self._get_exit_price, position.symbol)
+        exit_price = self._get_exit_price(position.symbol)
         logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
 
         side = "SELL" if position.direction == "LONG" else "BUY"
         logger.info("[%s] place_order() 呼び出し: side=%s qty=%d", position.symbol, side, position.size)
         t0 = time.monotonic()
-        result = await asyncio.to_thread(
-            self._client.place_order,
+        result = self._client.place_order(
             Order(symbol=position.symbol, side=side, quantity=position.size),
         )
         elapsed = time.monotonic() - t0
@@ -269,6 +264,7 @@ class OrderRouter:
             logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
             return None
 
+        # 決済確認: asyncio.sleep で待機（イベントループをブロックしない）
         logger.info("[%s] 決済確認開始 (最大%.0fs)", position.symbol, FILL_CHECK_MAX_WAIT)
         closed = await self._wait_for_close_async(position.symbol)
 
@@ -297,7 +293,7 @@ class OrderRouter:
         return exit_result
 
     async def _wait_for_close_async(self, symbol: str) -> bool:
-        """決済確認 (async版 — asyncio.sleep で待機)."""
+        """決済確認 (asyncio.sleep で待機、API は同期で直接呼ぶ)."""
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
@@ -305,7 +301,7 @@ class OrderRouter:
             elapsed += FILL_CHECK_INTERVAL
             attempt += 1
             t0 = time.monotonic()
-            has = await asyncio.to_thread(self._client.has_position, symbol)
+            has = self._client.has_position(symbol)
             api_time = time.monotonic() - t0
             logger.debug(
                 "[%s] close check #%d: has_position()=%s (%.2fs)",
@@ -318,7 +314,7 @@ class OrderRouter:
         return False
 
     async def exit_all(self, reason: str) -> list[ExitResult]:
-        """全ポジション決済 (async)."""
+        """全ポジション決済."""
         logger.info("exit_all() 開始: reason=%s positions=%d", reason, self.position_count)
         results: list[ExitResult] = []
         for order_id in list(self._positions.keys()):
@@ -348,8 +344,8 @@ class OrderRouter:
     async def monitor_positions(self) -> None:
         """SL/TP監視ループ（5秒間隔）.
 
-        全ての API 呼び出しは asyncio.to_thread() で非同期化し、
-        イベントループをブロックしない。
+        API は同期で直接呼ぶ (futu SDK はスレッドセーフでないため)。
+        ループの合間に await asyncio.sleep() でイベントループに制御を返す。
         """
         logger.info("monitor_positions() ループ開始")
         loop_count = 0
@@ -364,7 +360,7 @@ class OrderRouter:
                     continue
                 try:
                     t0 = time.monotonic()
-                    snap = await asyncio.to_thread(self._client.get_snapshot, pos.symbol)
+                    snap = self._client.get_snapshot(pos.symbol)
                     api_time = time.monotonic() - t0
                     price = snap.last_price
                     if price <= 0:
@@ -396,4 +392,8 @@ class OrderRouter:
                         await self.exit(order_id, "TP")
                 except Exception:
                     logger.exception("[%s] monitor_positions エラー", pos.symbol)
+
+                # 各銘柄の処理後にイベントループに制御を返す
+                await asyncio.sleep(0)
+
             await asyncio.sleep(5)
