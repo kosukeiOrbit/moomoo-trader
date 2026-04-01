@@ -249,6 +249,18 @@ async def main_loop() -> None:
                 "--- scan start (positions=%d, balance=$%.0f, daily_pnl=$%.2f) ---",
                 order_router.position_count, balance, pnl_tracker.daily_pnl,
             )
+            # MAX_POSITIONS に達していたらスキャン自体をスキップ
+            if order_router.position_count >= settings.MAX_POSITIONS:
+                logger.info(
+                    "MAX_POSITIONS(%d) reached — scan skipped (saving API cost)",
+                    settings.MAX_POSITIONS,
+                )
+                logger.info("--- scan end (0.0s) --- next in %ds", settings.LOOP_INTERVAL_SECONDS)
+                logger.info("=== loop #%d end === sleeping %ds", _loop_count, settings.LOOP_INTERVAL_SECONDS)
+                await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
+                logger.info("=== loop #%d wake ===", _loop_count)
+                continue
+
             for symbol in settings.WATCHLIST:
                 if _shutdown_requested:
                     break
