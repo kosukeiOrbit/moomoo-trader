@@ -167,8 +167,8 @@ def check_account_balance() -> bool:
             security_firm=settings.SECURITY_FIRM,
         )
 
-        # トレードパスワードでアンロック（本番のみ。ペーパートレードは不要）
-        if trd_env != TrdEnv.SIMULATE and settings.MOOMOO_TRADE_PWD:
+        # トレードパスワードでアンロック（SIMULATE / REAL 両方で必要）
+        if settings.MOOMOO_TRADE_PWD:
             ret, data = trade_ctx.unlock_trade(settings.MOOMOO_TRADE_PWD)
             if ret != RET_OK:
                 fail(f"トレードアンロック: FAILED — {data}")
