@@ -17,6 +17,11 @@ from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Ensure project root is in sys.path (for Task Scheduler / direct execution)
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 from config import settings
 from src.data.moomoo_client import MoomooClient
 from src.data.board_scraper import BoardScraper
