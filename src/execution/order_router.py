@@ -94,6 +94,10 @@ class OrderRouter:
         if not signal.go or size <= 0:
             return None
 
+        if self.position_count >= settings.MAX_POSITIONS:
+            logger.info("[%s] MAX_POSITIONS(%d)に達しているためスキップ", symbol, settings.MAX_POSITIONS)
+            return None
+
         for pos in self._positions.values():
             if pos.symbol == symbol:
                 logger.info("Duplicate entry blocked: %s", symbol)
