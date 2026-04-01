@@ -13,6 +13,7 @@ import logging.handlers
 import os
 import signal
 import sys
+import time as _time
 from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -173,7 +174,12 @@ async def main_loop() -> None:
     )
 
     try:
+        _loop_count = 0
         while not _shutdown_requested:
+            _loop_count += 1
+            _loop_t0 = _time.monotonic()
+            logger.info("=== loop #%d start ===", _loop_count)
+
             # --- ET 15:50 強制決済 ---
             if should_force_exit() and order_router.position_count > 0:
                 logger.warning("ET 15:50 — Force closing all positions")
@@ -183,12 +189,19 @@ async def main_loop() -> None:
 
             # --- 市場クローズ中は待機 ---
             if not market_is_open():
-                logger.info("Market closed. Waiting 60s...")
+                now_et = datetime.now(ET)
+                logger.info(
+                    "Market closed (ET %s, weekday=%d). Waiting 60s...",
+                    now_et.strftime("%H:%M:%S"), now_et.weekday(),
+                )
                 await asyncio.sleep(60)
                 continue
 
             # --- 口座状態を取得してサーキットブレーカーチェック ---
+            logger.debug("get_account_balance() 呼び出し")
+            _t = _time.monotonic()
             balance = client.get_account_balance() or 100_000.0
+            logger.info("get_account_balance(): $%.2f (%.2fs)", balance, _time.monotonic() - _t)
             pnl_tracker.update_peak_balance(balance)
 
             account_state = AccountState(
@@ -291,8 +304,14 @@ async def main_loop() -> None:
                 except Exception:
                     logger.exception("銘柄 %s の処理でエラー", symbol)
 
-            logger.info("--- scan end --- next in %ds", settings.LOOP_INTERVAL_SECONDS)
+            _loop_elapsed = _time.monotonic() - _loop_t0
+            logger.info(
+                "--- scan end (%.1fs) --- next in %ds",
+                _loop_elapsed, settings.LOOP_INTERVAL_SECONDS,
+            )
+            logger.info("=== loop #%d end === sleeping %ds", _loop_count, settings.LOOP_INTERVAL_SECONDS)
             await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
+            logger.info("=== loop #%d wake ===", _loop_count)
 
     finally:
         # --- クリーンアップ ---
