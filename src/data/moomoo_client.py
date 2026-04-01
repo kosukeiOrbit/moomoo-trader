@@ -17,6 +17,7 @@ from futu import (
     OpenSecTradeContext,
     RET_OK,
     OrderType,
+    SubAccType,
     SubType,
     TrdEnv,
     TrdMarket,
@@ -368,6 +369,12 @@ class MoomooClient:
     # 発注
     # ------------------------------------------------------------------
 
+    def _get_sub_acc_type(self) -> Any:
+        """settings.JP_ACC_TYPE から SubAccType を返す."""
+        if settings.JP_ACC_TYPE == "SPECIFIC":
+            return SubAccType.JP_GAIKOKU_TOKUTEI
+        return SubAccType.JP_GAIKOKU_GENERAL
+
     def place_order(self, order: Order) -> OrderResult:
         """注文を発注する."""
         assert self._trade_ctx is not None
@@ -383,6 +390,7 @@ class MoomooClient:
             trd_side=side,
             order_type=order_type,
             trd_env=self._trd_env,
+            sub_acc_type=self._get_sub_acc_type(),
         )
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)
