@@ -73,6 +73,10 @@ class OrderRouter:
         self._circuit_breaker = circuit_breaker
         self._positions: dict[str, Position] = {}
         self._on_exit = on_exit
+        logger.info(
+            "OrderRouter initialized (env=%s, max_positions=%d)",
+            settings.TRADE_ENV, settings.MAX_POSITIONS,
+        )
 
     @property
     def open_positions(self) -> dict[str, Position]:
@@ -105,28 +109,54 @@ class OrderRouter:
         # 重複エントリー防止: 内部 dict チェック
         for pos in self._positions.values():
             if pos.symbol == symbol:
-                logger.info("Duplicate entry blocked (internal): %s", symbol)
+                logger.info("[%s] Duplicate entry blocked (internal dict)", symbol)
                 return None
 
         # moomoo API にも重複チェック
-        if self._client.has_position(symbol):
-            logger.info("Duplicate entry blocked (moomoo): %s", symbol)
-            return None
+        logger.debug("[%s] has_position() チェック開始", symbol)
+        t0 = time.monotonic()
+        try:
+            if self._client.has_position(symbol):
+                logger.info("[%s] Duplicate entry blocked (moomoo position_list)", symbol)
+                return None
+        except Exception:
+            logger.exception("[%s] has_position() で例外", symbol)
+        logger.debug("[%s] has_position() チェック完了 (%.2fs)", symbol, time.monotonic() - t0)
 
+        # 発注
+        logger.info(
+            "[%s] place_order() 呼び出し: side=%s qty=%d price=$%.2f",
+            symbol, "BUY" if signal.direction == "LONG" else "SELL", size, price,
+        )
+        t0 = time.monotonic()
         side = "BUY" if signal.direction == "LONG" else "SELL"
         result = self._client.place_order(Order(symbol=symbol, side=side, quantity=size))
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[%s] place_order() 応答: order_id=%s status=%s (%.2fs)",
+            symbol, result.order_id, result.status, elapsed,
+        )
+
         if result.status == "FAILED":
-            logger.error("ENTRY failed: %s %s", symbol, result)
+            logger.error("[%s] ENTRY failed: %s", symbol, result)
             return result
 
         # position_list_query() で約定確認（最大5秒待機）
+        logger.info("[%s] 約定確認開始 (最大%.0fs)", symbol, FILL_CHECK_MAX_WAIT)
         filled = self._wait_for_fill(symbol)
         if filled:
             fill_price = filled.get("cost_price", price)
             fill_qty = int(filled.get("qty", size))
+            logger.info(
+                "[%s] 約定確認OK: qty=%d cost_price=$%.2f",
+                symbol, fill_qty, fill_price,
+            )
         else:
             # position_list に出なくても内部管理はする（ラグ対応）
-            logger.warning("[%s] 約定確認タイムアウト — 内部管理で続行", symbol)
+            logger.warning(
+                "[%s] 約定確認タイムアウト (%.0fs) — 内部管理で続行 price=$%.2f qty=%d",
+                symbol, FILL_CHECK_MAX_WAIT, price, size,
+            )
             fill_price = price
             fill_qty = size
 
@@ -137,8 +167,10 @@ class OrderRouter:
             entry_price=fill_price, levels=levels,
         )
         logger.info(
-            "ENTRY: %s %s %d shares @ $%.2f id=%s",
+            "ENTRY COMPLETE: %s %s %d shares @ $%.2f id=%s (SL=$%.2f TP=$%.2f)",
             signal.direction, symbol, fill_qty, fill_price, order_id,
+            levels.stop_loss if levels else 0,
+            levels.take_profit if levels else 0,
         )
         return OrderResult(
             order_id=order_id, status="FILLED",
@@ -148,12 +180,19 @@ class OrderRouter:
     def _wait_for_fill(self, symbol: str) -> dict | None:
         """position_list_query() で約定を確認する（最大 FILL_CHECK_MAX_WAIT 秒）."""
         elapsed = 0.0
+        attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
             time.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
+            attempt += 1
+            t0 = time.monotonic()
             positions = self._client.get_positions()
+            api_time = time.monotonic() - t0
+            logger.debug(
+                "[%s] fill check #%d: get_positions() took %.2fs, found=%s",
+                symbol, attempt, api_time, list(positions.keys()),
+            )
             if symbol in positions and positions[symbol]["qty"] > 0:
-                logger.info("[%s] 約定確認OK (%.1fs)", symbol, elapsed)
                 return positions[symbol]
         return None
 
@@ -168,19 +207,38 @@ class OrderRouter:
             logger.warning("EXIT target not found: %s", order_id)
             return None
 
+        logger.info(
+            "[%s] EXIT 開始: id=%s reason=%s direction=%s size=%d entry=$%.2f",
+            position.symbol, order_id, reason,
+            position.direction, position.size, position.entry_price,
+        )
+
         exit_price = self._get_exit_price(position.symbol)
+        logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
 
         # 決済注文を発注
         side = "SELL" if position.direction == "LONG" else "BUY"
+        logger.info(
+            "[%s] place_order() 呼び出し: side=%s qty=%d",
+            position.symbol, side, position.size,
+        )
+        t0 = time.monotonic()
         result = self._client.place_order(
             Order(symbol=position.symbol, side=side, quantity=position.size),
         )
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[%s] place_order() 応答: order_id=%s status=%s (%.2fs)",
+            position.symbol, result.order_id, result.status, elapsed,
+        )
+
         if result.status == "FAILED":
-            logger.error("EXIT order failed: %s %s", order_id, position.symbol)
+            logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
             return None
 
         # position_list_query() でポジション消滅を確認
-        self._wait_for_close(position.symbol)
+        logger.info("[%s] 決済確認開始 (最大%.0fs)", position.symbol, FILL_CHECK_MAX_WAIT)
+        closed = self._wait_for_close(position.symbol)
 
         if position.direction == "LONG":
             pnl = (exit_price - position.entry_price) * position.size
@@ -188,9 +246,9 @@ class OrderRouter:
             pnl = (position.entry_price - exit_price) * position.size
 
         logger.info(
-            "EXIT: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+            "EXIT COMPLETE: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s closed=%s",
             order_id, position.symbol, position.entry_price,
-            exit_price, pnl, reason,
+            exit_price, pnl, reason, closed,
         )
 
         del self._positions[order_id]
@@ -209,10 +267,19 @@ class OrderRouter:
     def _wait_for_close(self, symbol: str) -> bool:
         """position_list_query() でポジション消滅を確認する."""
         elapsed = 0.0
+        attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
             time.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
-            if not self._client.has_position(symbol):
+            attempt += 1
+            t0 = time.monotonic()
+            has = self._client.has_position(symbol)
+            api_time = time.monotonic() - t0
+            logger.debug(
+                "[%s] close check #%d: has_position()=%s (%.2fs)",
+                symbol, attempt, has, api_time,
+            )
+            if not has:
                 logger.info("[%s] 決済確認OK (%.1fs)", symbol, elapsed)
                 return True
         logger.warning("[%s] 決済確認タイムアウト — 内部管理で続行", symbol)
@@ -220,11 +287,13 @@ class OrderRouter:
 
     def exit_all(self, reason: str) -> list[ExitResult]:
         """全ポジション決済."""
+        logger.info("exit_all() 開始: reason=%s positions=%d", reason, self.position_count)
         results: list[ExitResult] = []
         for order_id in list(self._positions.keys()):
             result = self.exit(order_id, reason)
             if result:
                 results.append(result)
+        logger.info("exit_all() 完了: %d/%d 決済成功", len(results), len(results))
         return results
 
     # ------------------------------------------------------------------
@@ -250,21 +319,50 @@ class OrderRouter:
         内部 dict のポジション情報と現在価格を比較して SL/TP を判定する。
         moomoo API のポーリングは get_snapshot() のみ。
         """
+        logger.info("monitor_positions() ループ開始")
+        loop_count = 0
         while True:
+            loop_count += 1
+            pos_count = len(self._positions)
+            if pos_count > 0:
+                logger.debug("monitor loop #%d: %d positions", loop_count, pos_count)
+
             for order_id, pos in list(self._positions.items()):
                 if pos.levels is None:
                     continue
                 try:
+                    t0 = time.monotonic()
                     snap = self._client.get_snapshot(pos.symbol)
+                    api_time = time.monotonic() - t0
                     price = snap.last_price
                     if price <= 0:
+                        logger.debug("[%s] monitor: price=0 (%.2fs)", pos.symbol, api_time)
                         continue
+
+                    # 100ループに1回、またはSL/TPに近い時に価格ログ
+                    sl_dist = (price - pos.levels.stop_loss) / pos.entry_price * 100
+                    tp_dist = (pos.levels.take_profit - price) / pos.entry_price * 100
+                    if loop_count % 100 == 1 or sl_dist < 0.5 or tp_dist < 0.5:
+                        logger.info(
+                            "[%s] monitor: price=$%.2f SL=$%.2f(%.1f%%) TP=$%.2f(%.1f%%) (%.2fs)",
+                            pos.symbol, price,
+                            pos.levels.stop_loss, sl_dist,
+                            pos.levels.take_profit, tp_dist,
+                            api_time,
+                        )
+
                     if price <= pos.levels.stop_loss:
-                        logger.warning("SL: %s $%.2f <= $%.2f", pos.symbol, price, pos.levels.stop_loss)
+                        logger.warning(
+                            "SL HIT: %s price=$%.2f <= SL=$%.2f (entry=$%.2f)",
+                            pos.symbol, price, pos.levels.stop_loss, pos.entry_price,
+                        )
                         self.exit(order_id, "SL")
                     elif price >= pos.levels.take_profit:
-                        logger.info("TP: %s $%.2f >= $%.2f", pos.symbol, price, pos.levels.take_profit)
+                        logger.info(
+                            "TP HIT: %s price=$%.2f >= TP=$%.2f (entry=$%.2f)",
+                            pos.symbol, price, pos.levels.take_profit, pos.entry_price,
+                        )
                         self.exit(order_id, "TP")
                 except Exception:
-                    logger.debug("Monitor error: %s", order_id)
+                    logger.exception("[%s] monitor_positions エラー", pos.symbol)
             await asyncio.sleep(5)

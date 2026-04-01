@@ -209,6 +209,10 @@ async def main_loop() -> None:
                 continue
 
             # --- 銘柄ごとのスキャンループ ---
+            logger.info(
+                "--- scan start (positions=%d, balance=$%.0f, daily_pnl=$%.2f) ---",
+                order_router.position_count, balance, pnl_tracker.daily_pnl,
+            )
             for symbol in settings.WATCHLIST:
                 if _shutdown_requested:
                     break
@@ -287,6 +291,7 @@ async def main_loop() -> None:
                 except Exception:
                     logger.exception("銘柄 %s の処理でエラー", symbol)
 
+            logger.info("--- scan end --- next in %ds", settings.LOOP_INTERVAL_SECONDS)
             await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
 
     finally:
