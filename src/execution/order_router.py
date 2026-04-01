@@ -78,6 +78,44 @@ class OrderRouter:
             settings.TRADE_ENV, settings.MAX_POSITIONS,
         )
 
+    def recover_positions(self) -> int:
+        """moomoo の既存ポジションを内部 dict に復元する.
+
+        Bot 起動時に呼び出して、前回の未決済ポジションを引き継ぐ。
+        SL/TP の levels は復元時に StopLossManager で再計算する必要がある。
+
+        Returns:
+            復元したポジション数
+        """
+        positions = self._client.get_positions()
+        count = 0
+        for symbol, info in positions.items():
+            qty = int(info["qty"])
+            if qty <= 0:
+                continue
+            order_id = f"RECOVERED-{symbol}"
+            if order_id in self._positions:
+                continue
+            cost_price = info["cost_price"]
+            self._positions[order_id] = Position(
+                order_id=order_id,
+                symbol=symbol,
+                direction="LONG",
+                size=qty,
+                entry_price=cost_price,
+                levels=None,  # main.py 側で再計算して設定する
+            )
+            logger.info(
+                "[RECOVERED] %s %d shares @ $%.2f (id=%s)",
+                symbol, qty, cost_price, order_id,
+            )
+            count += 1
+        if count == 0:
+            logger.info("No existing positions to recover")
+        else:
+            logger.info("Recovered %d positions from moomoo", count)
+        return count
+
     @property
     def open_positions(self) -> dict[str, Position]:
         return dict(self._positions)

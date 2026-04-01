@@ -165,12 +165,35 @@ async def main_loop() -> None:
 
     order_router = OrderRouter(client, circuit_breaker, on_exit=_on_exit)
 
+    # --- 既存ポジションの復元 ---
+    recovered = order_router.recover_positions()
+    if recovered > 0:
+        # 復元したポジションに SL/TP を再計算して設定
+        for order_id, pos in order_router.open_positions.items():
+            if pos.levels is None:
+                try:
+                    levels = stop_loss_manager.calculate_levels(
+                        pos.symbol, pos.entry_price,
+                    )
+                    pos.levels = levels
+                    logger.info(
+                        "[%s] SL/TP再設定: SL=$%.2f TP=$%.2f",
+                        pos.symbol, levels.stop_loss, levels.take_profit,
+                    )
+                except Exception:
+                    logger.exception("[%s] SL/TP再計算エラー", pos.symbol)
+        # P&L tracker にも登録
+        for order_id, pos in order_router.open_positions.items():
+            pnl_tracker.register(
+                order_id, pos.symbol, pos.direction, pos.size, pos.entry_price,
+            )
+
     # ポジション監視タスク
     monitor_task = asyncio.create_task(order_router.monitor_positions())
 
     logger.info(
-        "=== moomoo AI Daytrade Bot 起動 (env=%s, symbols=%s) ===",
-        settings.TRADE_ENV, settings.WATCHLIST,
+        "=== moomoo AI Daytrade Bot 起動 (env=%s, symbols=%s, recovered=%d) ===",
+        settings.TRADE_ENV, settings.WATCHLIST, recovered,
     )
 
     try:
