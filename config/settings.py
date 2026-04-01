@@ -18,7 +18,18 @@ CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
 MIN_TEXTS_FOR_ANALYSIS: int = 2  # これ未満のテキスト数ではAPI呼び出しをスキップ
 
 # --- 監視銘柄 ---
-WATCHLIST: list[str] = ["AAPL", "NVDA", "TSLA", "META", "MSFT"]
+WATCHLIST: list[str] = [
+    # ハイテク・グロース
+    "AAPL", "NVDA", "TSLA", "META", "MSFT",
+    # 金融（セクターローテーション対応）
+    "JPM", "GS",
+    # エネルギー（原油・地政学リスク対応）
+    "XOM",
+    # 景気敏感（ダウ牽引役）
+    "CAT",
+    # ヘルスケア（ディフェンシブ）
+    "UNH",
+]
 
 # --- シグナル閾値 ---
 SENTIMENT_THRESHOLD: float = 0.3      # センチメントスコアの最低閾値
