@@ -17,6 +17,10 @@ env/
 
 # Environment variables
 .env
+.env.*
+!.env.example
+*.env
+config/secrets.py
 
 # IDE
 .vscode/

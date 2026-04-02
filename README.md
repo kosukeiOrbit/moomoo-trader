@@ -2,6 +2,17 @@
 
 > Version: 1.0 | 作成日: 2026-03-24
 
+## Security Notice
+
+- Never commit `.env` file — it contains API keys and passwords
+- Copy `.env.example` and fill in your own credentials
+- API keys and passwords must be set via environment variables
+
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
+
 ## 概要
 
 moomoo OpenAPIを使い、LLMセンチメント解析と大口フロー検出を組み合わせた米国株デイトレードの自動売買システム。
