@@ -370,11 +370,11 @@ class MoomooClient:
     # 発注
     # ------------------------------------------------------------------
 
-    def _get_sub_acc_type(self) -> Any:
+    def _get_jp_acc_type(self) -> Any:
         """settings.JP_ACC_TYPE から SubAccType を返す."""
         if settings.JP_ACC_TYPE == "SPECIFIC":
-            return SubAccType.JP_GAIKOKU_TOKUTEI
-        return SubAccType.JP_GAIKOKU_GENERAL
+            return SubAccType.JP_TOKUTEI
+        return SubAccType.JP_GENERAL
 
     def place_order(self, order: Order) -> OrderResult:
         """注文を発注する.
@@ -388,8 +388,6 @@ class MoomooClient:
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
-        # jp_acc_type は省略（FUTUJP では JP_GAIKOKU_TOKUTEI が API 未サポート）
-        # moomoo がデフォルトの口座区分を使用する
         ret, data = self._trade_ctx.place_order(
             price=price,
             qty=order.quantity,
@@ -397,6 +395,7 @@ class MoomooClient:
             trd_side=side,
             order_type=order_type,
             trd_env=self._trd_env,
+            jp_acc_type=self._get_jp_acc_type(),
         )
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)
