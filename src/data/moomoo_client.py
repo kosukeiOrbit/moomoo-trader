@@ -377,29 +377,53 @@ class MoomooClient:
         return SubAccType.JP_GAIKOKU_GENERAL
 
     def place_order(self, order: Order) -> OrderResult:
-        """注文を発注する."""
+        """注文を発注する.
+
+        SELL 時はポジションの口座区分と一致しない場合があるため、
+        設定の口座区分で失敗したらもう一方でリトライする。
+        """
         assert self._trade_ctx is not None
         code = f"US.{order.symbol}"
         side = TrdSide.BUY if order.side == "BUY" else TrdSide.SELL
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
-        ret, data = self._trade_ctx.place_order(
-            price=price,
-            qty=order.quantity,
-            code=code,
-            trd_side=side,
-            order_type=order_type,
-            trd_env=self._trd_env,
-            jp_acc_type=self._get_sub_acc_type(),
+        # 試行する口座区分リスト: 設定値 → もう一方
+        primary = self._get_sub_acc_type()
+        fallback = (
+            SubAccType.JP_GAIKOKU_GENERAL
+            if primary == SubAccType.JP_GAIKOKU_TOKUTEI
+            else SubAccType.JP_GAIKOKU_TOKUTEI
         )
-        if ret != RET_OK:
-            logger.error("発注失敗: %s — %s", order, data)
+        acc_types = [primary] if order.side == "BUY" else [primary, fallback]
+
+        for acc_type in acc_types:
+            ret, data = self._trade_ctx.place_order(
+                price=price,
+                qty=order.quantity,
+                code=code,
+                trd_side=side,
+                order_type=order_type,
+                trd_env=self._trd_env,
+                jp_acc_type=acc_type,
+            )
+            if ret == RET_OK and not data.empty:
+                order_id = str(data["order_id"].iloc[0])
+                logger.info("発注成功: %s order_id=%s (acc_type=%s)", order, order_id, acc_type)
+                return OrderResult(order_id=order_id, status="SUBMITTED")
+
+            error_msg = str(data) if not isinstance(data, str) else data
+            if order.side == "SELL" and "Sub account type" in error_msg and acc_type != fallback:
+                logger.warning(
+                    "SELL 口座区分不一致 — %s でリトライ: %s", fallback, order.symbol,
+                )
+                continue
+
+            logger.error("発注失敗: %s (acc_type=%s) — %s", order, acc_type, data)
             return OrderResult(order_id="", status="FAILED")
 
-        order_id = str(data["order_id"].iloc[0])
-        logger.info("発注成功: %s order_id=%s", order, order_id)
-        return OrderResult(order_id=order_id, status="SUBMITTED")
+        logger.error("発注失敗: %s — 全口座区分で失敗", order)
+        return OrderResult(order_id="", status="FAILED")
 
     def cancel_order(self, order_id: str) -> bool:
         """注文をキャンセルする."""
