@@ -388,7 +388,9 @@ class MoomooClient:
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
-        kwargs: dict = dict(
+        # jp_acc_type は省略（FUTUJP では JP_GAIKOKU_TOKUTEI が API 未サポート）
+        # moomoo がデフォルトの口座区分を使用する
+        ret, data = self._trade_ctx.place_order(
             price=price,
             qty=order.quantity,
             code=code,
@@ -396,11 +398,6 @@ class MoomooClient:
             order_type=order_type,
             trd_env=self._trd_env,
         )
-        # BUY のみ口座区分を指定、SELL は省略して自動マッチ
-        if order.side == "BUY":
-            kwargs["jp_acc_type"] = self._get_sub_acc_type()
-
-        ret, data = self._trade_ctx.place_order(**kwargs)
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)
             return OrderResult(order_id="", status="FAILED")
