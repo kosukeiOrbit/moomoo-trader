@@ -314,7 +314,7 @@ class OrderRouter:
         return False
 
     async def exit_all(self, reason: str) -> list[ExitResult]:
-        """全ポジション決済."""
+        """全ポジション決済 (async版)."""
         logger.info("exit_all() 開始: reason=%s positions=%d", reason, self.position_count)
         results: list[ExitResult] = []
         for order_id in list(self._positions.keys()):
@@ -323,6 +323,88 @@ class OrderRouter:
                 results.append(result)
         logger.info("exit_all() 完了: %d 決済成功", len(results))
         return results
+
+    def exit_all_sync(self, reason: str) -> list[ExitResult]:
+        """全ポジション決済 (同期版 — 強制決済用).
+
+        asyncio.sleep() を使わず time.sleep() で待機するため、
+        イベントループの状態に関係なく確実に全注文を送信する。
+        monitor_positions() を停止してから呼ぶこと。
+        """
+        logger.info("exit_all_sync() 開始: reason=%s positions=%d", reason, self.position_count)
+        results: list[ExitResult] = []
+        for order_id in list(self._positions.keys()):
+            result = self._exit_sync(order_id, reason)
+            if result:
+                results.append(result)
+        logger.info("exit_all_sync() 完了: %d 決済成功", len(results))
+        return results
+
+    def _exit_sync(self, order_id: str, reason: str) -> ExitResult | None:
+        """ポジション決済 (同期版 — 強制決済用)."""
+        position = self._positions.get(order_id)
+        if position is None:
+            logger.warning("EXIT target not found: %s", order_id)
+            return None
+
+        logger.info(
+            "[%s] EXIT_SYNC 開始: id=%s reason=%s size=%d entry=$%.2f",
+            position.symbol, order_id, reason, position.size, position.entry_price,
+        )
+
+        exit_price = self._get_exit_price(position.symbol)
+        logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
+
+        side = "SELL" if position.direction == "LONG" else "BUY"
+        t0 = time.monotonic()
+        result = self._client.place_order(
+            Order(symbol=position.symbol, side=side, quantity=position.size),
+        )
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[%s] place_order() 応答: order_id=%s status=%s (%.2fs)",
+            position.symbol, result.order_id, result.status, elapsed,
+        )
+
+        if result.status == "FAILED":
+            logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
+            return None
+
+        # 同期で決済確認
+        closed = False
+        wait_elapsed = 0.0
+        while wait_elapsed < FILL_CHECK_MAX_WAIT:
+            time.sleep(FILL_CHECK_INTERVAL)
+            wait_elapsed += FILL_CHECK_INTERVAL
+            if not self._client.has_position(position.symbol):
+                logger.info("[%s] 決済確認OK (%.1fs)", position.symbol, wait_elapsed)
+                closed = True
+                break
+        if not closed:
+            logger.warning("[%s] 決済確認タイムアウト — 内部管理で続行", position.symbol)
+
+        if position.direction == "LONG":
+            pnl = (exit_price - position.entry_price) * position.size
+        else:
+            pnl = (position.entry_price - exit_price) * position.size
+
+        logger.info(
+            "EXIT_SYNC COMPLETE: %s %s entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+            order_id, position.symbol, position.entry_price, exit_price, pnl, reason,
+        )
+
+        del self._positions[order_id]
+
+        exit_result = ExitResult(
+            order_result=result, position=position,
+            exit_price=exit_price, pnl=pnl, reason=reason,
+        )
+        if self._on_exit:
+            try:
+                self._on_exit(exit_result)
+            except Exception:
+                logger.exception("on_exit callback error")
+        return exit_result
 
     # ------------------------------------------------------------------
     # Internal

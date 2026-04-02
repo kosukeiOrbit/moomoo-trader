@@ -206,7 +206,18 @@ async def main_loop() -> None:
             # --- ET 15:50 強制決済 ---
             if should_force_exit() and order_router.position_count > 0:
                 logger.warning("ET 15:50 — Force closing all positions")
-                await order_router.exit_all("ET 15:50 force close")
+
+                # 1) monitor タスクを先に停止（asyncio.sleep 中の割り込みを防ぐ）
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("monitor_positions() 停止完了")
+
+                # 2) 全ポジションを同期で決済（確実に全注文を送る）
+                order_router.exit_all_sync("ET 15:50 force close")
+
                 notifier.notify_circuit_breaker("ET 15:50 all positions force-closed")
                 break
 
@@ -239,7 +250,12 @@ async def main_loop() -> None:
                 logger.warning("サーキットブレーカー: %s", breaker_status.reason)
                 notifier.notify_circuit_breaker(breaker_status.reason)
                 if breaker_status.action == BreakerAction.FORCE_CLOSE_ALL:
-                    await order_router.exit_all("Circuit breaker: force close")
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+                    order_router.exit_all_sync("Circuit breaker: force close")
                     break
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 continue
@@ -350,11 +366,12 @@ async def main_loop() -> None:
 
     finally:
         # --- クリーンアップ ---
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+        if not monitor_task.done():
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
         # 残りのポジションを警告
         if order_router.position_count > 0:

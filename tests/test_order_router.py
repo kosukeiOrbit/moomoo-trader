@@ -122,6 +122,7 @@ class TestEntry:
         assert result.status == "FILLED"
         assert result.filled_price == 150.0
 
+    @patch("config.settings.MAX_POSITIONS", 3)
     def test_max_positions(self) -> None:
         router, _ = _make_router_with_fill()
         router.enter(_go_long(), "AAPL", 10, 150.0)
