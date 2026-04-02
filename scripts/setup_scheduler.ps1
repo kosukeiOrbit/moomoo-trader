@@ -138,12 +138,12 @@ function Register-MoomooTask {
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
         -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 8)
+        -ExecutionTimeLimit (New-TimeSpan -Duration 0)  # No time limit
 
-    # Principal: current user, highest privileges
+    # Principal: run whether user is logged on or not
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
-        -LogonType Interactive `
+        -LogonType S4U `
         -RunLevel Highest
 
     Register-ScheduledTask `
