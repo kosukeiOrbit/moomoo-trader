@@ -314,7 +314,7 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def get_account_balance(self) -> float:
-        """口座の総資産を取得する."""
+        """口座の現金余力（buying power）を取得する."""
         assert self._trade_ctx is not None
         ret, data = self._trade_ctx.accinfo_query(
             trd_env=self._trd_env,
@@ -323,7 +323,15 @@ class MoomooClient:
         if ret != RET_OK or data.empty:
             logger.warning("口座残高取得失敗")
             return 0.0
-        return float(data.iloc[0].get("total_assets", 0))
+        # power (buying power) > cash > total_assets の優先順で取得
+        row = data.iloc[0]
+        power = float(row.get("power", 0) or 0)
+        if power > 0:
+            return power
+        cash = float(row.get("cash", 0) or 0)
+        if cash > 0:
+            return cash
+        return float(row.get("total_assets", 0) or 0)
 
     # ------------------------------------------------------------------
     # ポジション照会
