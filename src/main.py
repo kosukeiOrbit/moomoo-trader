@@ -332,10 +332,10 @@ async def main_loop() -> None:
                         levels = stop_loss_manager.calculate_levels(
                             symbol, current_price,
                         )
-                        result = order_router.enter(
+                        result = await order_router.enter(
                             decision, symbol, size, current_price, levels,
                         )
-                        if result and result.status != "FAILED":
+                        if result and result.status not in ("FAILED", "CANCELLED"):
                             logger.info(
                                 "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
                                 symbol, decision.direction, size, current_price, result.order_id,

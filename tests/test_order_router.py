@@ -1,7 +1,4 @@
-"""OrderRouter tests: unified moomoo API + position_list_query() based confirmation.
-
-exit() and exit_all() are async, so tests that call them must be async too.
-"""
+"""OrderRouter tests: async enter/exit with full fill verification."""
 
 from __future__ import annotations
 
@@ -45,6 +42,7 @@ def _make_router(on_exit=None, snapshot_price: float = 155.0):
     )
     mock_client.has_position.return_value = False
     mock_client.get_positions.return_value = {}
+    mock_client.cancel_order.return_value = True
     router = OrderRouter(mock_client, CircuitBreaker(), on_exit=on_exit)
     return router, mock_client
 
@@ -54,81 +52,105 @@ def _make_router_with_fill(on_exit=None, snapshot_price: float = 155.0, fill_pri
     mock_client.get_positions.return_value = {
         "AAPL": {"qty": 10, "cost_price": fill_price, "market_val": 0, "pl_val": 0},
         "NVDA": {"qty": 5, "cost_price": 170.0, "market_val": 0, "pl_val": 0},
+        "TSLA": {"qty": 3, "cost_price": 300.0, "market_val": 0, "pl_val": 0},
     }
     return router, mock_client
 
 
-def _enter_one(router, mock_client, symbol="AAPL", price=150.0, levels=None):
+async def _enter_one(router, mock_client, symbol="AAPL", price=150.0, qty=10, levels=None):
     mock_client.get_positions.return_value = {
-        symbol: {"qty": 10, "cost_price": price, "market_val": 0, "pl_val": 0},
+        symbol: {"qty": qty, "cost_price": price, "market_val": 0, "pl_val": 0},
     }
-    router.enter(_go_long(), symbol, 10, price, levels or _levels())
+    await router.enter(_go_long(), symbol, qty, price, levels or _levels())
     return list(router.open_positions.keys())[0]
 
 
 # ---------------------------------------------------------------------------
-# Entry (sync)
+# Entry (async)
 # ---------------------------------------------------------------------------
 
 @patch("src.execution.order_router.FILL_CHECK_INTERVAL", 0.01)
 @patch("src.execution.order_router.FILL_CHECK_MAX_WAIT", 0.05)
 class TestEntry:
 
-    def test_entry_calls_api(self) -> None:
+    @pytest.mark.asyncio
+    async def test_entry_calls_api(self) -> None:
         router, mock_client = _make_router_with_fill()
-        result = router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
+        result = await router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
         assert result.status == "FILLED"
         assert result.order_id.startswith("ORD-")
         assert router.position_count == 1
         mock_client.place_order.assert_called_once()
 
-    def test_duplicate_blocked_internal(self) -> None:
+    @pytest.mark.asyncio
+    async def test_full_qty_check(self) -> None:
+        """部分約定(qty=5)ではrequestedqty=10に足りずタイムアウト→キャンセル."""
+        router, mock_client = _make_router()
+        mock_client.get_positions.return_value = {
+            "AAPL": {"qty": 5, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
+        }
+        result = await router.enter(_go_long(), "AAPL", 10, 150.0, _levels())
+        assert result.status == "CANCELLED"
+        assert router.position_count == 0
+        mock_client.cancel_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_order(self) -> None:
+        """約定しない場合はキャンセルしてポジションを作らない."""
+        router, mock_client = _make_router()
+        mock_client.get_positions.return_value = {}
+        result = await router.enter(_go_long(), "AAPL", 10, 150.0)
+        assert result.status == "CANCELLED"
+        assert router.position_count == 0
+        mock_client.cancel_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_blocked_internal(self) -> None:
         router, _ = _make_router_with_fill()
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        assert router.enter(_go_long(), "AAPL", 5, 151.0) is None
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
+        assert await router.enter(_go_long(), "AAPL", 5, 151.0) is None
         assert router.position_count == 1
 
-    def test_duplicate_blocked_moomoo(self) -> None:
+    @pytest.mark.asyncio
+    async def test_duplicate_blocked_moomoo(self) -> None:
         router, mock_client = _make_router_with_fill()
         mock_client.has_position.return_value = True
-        assert router.enter(_go_long(), "AAPL", 10, 150.0) is None
+        assert await router.enter(_go_long(), "AAPL", 10, 150.0) is None
 
-    def test_different_symbols(self) -> None:
+    @pytest.mark.asyncio
+    async def test_different_symbols(self) -> None:
         router, _ = _make_router_with_fill()
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 170.0)
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
+        await router.enter(_go_long(), "NVDA", 5, 170.0)
         assert router.position_count == 2
 
-    def test_no_go(self) -> None:
+    @pytest.mark.asyncio
+    async def test_no_go(self) -> None:
         router, _ = _make_router()
-        assert router.enter(_no_go(), "AAPL", 10, 150.0) is None
+        assert await router.enter(_no_go(), "AAPL", 10, 150.0) is None
 
-    def test_zero_size(self) -> None:
+    @pytest.mark.asyncio
+    async def test_zero_size(self) -> None:
         router, _ = _make_router()
-        assert router.enter(_go_long(), "AAPL", 0, 150.0) is None
+        assert await router.enter(_go_long(), "AAPL", 0, 150.0) is None
 
-    def test_entry_failure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_entry_failure(self) -> None:
         router, mock_client = _make_router()
         mock_client.place_order.side_effect = None
         mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
-        result = router.enter(_go_long(), "AAPL", 10, 150.0)
+        result = await router.enter(_go_long(), "AAPL", 10, 150.0)
         assert result.status == "FAILED"
         assert router.position_count == 0
 
-    def test_fill_timeout_uses_local_price(self) -> None:
-        router, mock_client = _make_router()
-        mock_client.get_positions.return_value = {}
-        result = router.enter(_go_long(), "AAPL", 10, 150.0)
-        assert result.status == "FILLED"
-        assert result.filled_price == 150.0
-
+    @pytest.mark.asyncio
     @patch("config.settings.MAX_POSITIONS", 3)
-    def test_max_positions(self) -> None:
+    async def test_max_positions(self) -> None:
         router, _ = _make_router_with_fill()
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 170.0)
-        router.enter(_go_long(), "TSLA", 3, 300.0)
-        assert router.enter(_go_long(), "META", 5, 400.0) is None
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
+        await router.enter(_go_long(), "NVDA", 5, 170.0)
+        await router.enter(_go_long(), "TSLA", 3, 300.0)
+        assert await router.enter(_go_long(), "META", 5, 400.0) is None
         assert router.position_count == 3
 
 
@@ -143,7 +165,7 @@ class TestExit:
     @pytest.mark.asyncio
     async def test_exit_pnl_profit(self) -> None:
         router, mock_client = _make_router(snapshot_price=155.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         result = await router.exit(oid, "TP")
@@ -154,7 +176,7 @@ class TestExit:
     @pytest.mark.asyncio
     async def test_exit_pnl_loss(self) -> None:
         router, mock_client = _make_router(snapshot_price=140.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         result = await router.exit(oid, "SL")
@@ -168,7 +190,7 @@ class TestExit:
     @pytest.mark.asyncio
     async def test_exit_calls_api(self) -> None:
         router, mock_client = _make_router(snapshot_price=155.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         await router.exit(oid, "SL")
@@ -177,7 +199,7 @@ class TestExit:
     @pytest.mark.asyncio
     async def test_exit_failure_keeps_position(self) -> None:
         router, mock_client = _make_router()
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.place_order.side_effect = None
         mock_client.place_order.return_value = OrderResult(order_id="", status="FAILED")
         assert await router.exit(oid, "SL") is None
@@ -190,8 +212,8 @@ class TestExit:
             "AAPL": {"qty": 10, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
             "NVDA": {"qty": 5, "cost_price": 170.0, "market_val": 0, "pl_val": 0},
         }
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 170.0)
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
+        await router.enter(_go_long(), "NVDA", 5, 170.0)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         results = await router.exit_all("force close")
@@ -211,7 +233,7 @@ class TestOnExit:
     async def test_callback_called(self) -> None:
         cb = MagicMock()
         router, mock_client = _make_router(on_exit=cb, snapshot_price=155.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         await router.exit(oid, "TP")
@@ -222,7 +244,7 @@ class TestOnExit:
     async def test_callback_exception_safe(self) -> None:
         cb = MagicMock(side_effect=RuntimeError("boom"))
         router, mock_client = _make_router(on_exit=cb, snapshot_price=155.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         assert await router.exit(oid, "TP") is not None
@@ -230,7 +252,7 @@ class TestOnExit:
     @pytest.mark.asyncio
     async def test_no_callback_ok(self) -> None:
         router, mock_client = _make_router(on_exit=None, snapshot_price=155.0)
-        oid = _enter_one(router, mock_client)
+        oid = await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         assert await router.exit(oid, "TP") is not None
@@ -248,7 +270,7 @@ class TestMonitor:
     async def test_sl(self) -> None:
         cb = MagicMock()
         router, mock_client = _make_router(on_exit=cb, snapshot_price=144.0)
-        _enter_one(router, mock_client)
+        await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         task = asyncio.create_task(router.monitor_positions())
@@ -263,7 +285,7 @@ class TestMonitor:
     async def test_tp(self) -> None:
         cb = MagicMock()
         router, mock_client = _make_router(on_exit=cb, snapshot_price=161.0)
-        _enter_one(router, mock_client)
+        await _enter_one(router, mock_client)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         task = asyncio.create_task(router.monitor_positions())
@@ -278,7 +300,7 @@ class TestMonitor:
     async def test_no_exit_in_range(self) -> None:
         cb = MagicMock()
         router, mock_client = _make_router(on_exit=cb, snapshot_price=152.0)
-        _enter_one(router, mock_client)
+        await _enter_one(router, mock_client)
         task = asyncio.create_task(router.monitor_positions())
         await asyncio.sleep(0.2)
         task.cancel()

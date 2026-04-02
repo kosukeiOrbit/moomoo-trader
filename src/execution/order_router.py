@@ -121,10 +121,10 @@ class OrderRouter:
         return len(self._positions)
 
     # ------------------------------------------------------------------
-    # Entry (sync — called from main loop)
+    # Entry (async — asyncio.sleep で待機、イベントループをブロックしない)
     # ------------------------------------------------------------------
 
-    def enter(
+    async def enter(
         self,
         signal: EntryDecision,
         symbol: str,
@@ -132,7 +132,7 @@ class OrderRouter:
         price: float,
         levels: Levels | None = None,
     ) -> OrderResult | None:
-        """エントリー注文 (同期)."""
+        """エントリー注文."""
         if not signal.go or size <= 0:
             return None
 
@@ -172,19 +172,22 @@ class OrderRouter:
             logger.error("[%s] ENTRY failed: %s", symbol, result)
             return result
 
-        logger.info("[%s] 約定確認開始 (最大%.0fs, order_id=%s)", symbol, FILL_CHECK_MAX_WAIT, result.order_id)
-        filled = self._wait_for_fill_sync(symbol, order_id=result.order_id)
-        if filled:
-            fill_price = filled.get("cost_price", price)
-            fill_qty = int(filled.get("qty", size))
-            logger.info("[%s] 約定確認OK: qty=%d cost_price=$%.2f", symbol, fill_qty, fill_price)
-        else:
+        # 約定確認: 全量一致を確認（asyncio.sleep で待機）
+        logger.info("[%s] 約定確認開始 (最大%.0fs, order_id=%s, qty=%d)", symbol, FILL_CHECK_MAX_WAIT, result.order_id, size)
+        filled = await self._wait_for_fill(symbol, size, order_id=result.order_id)
+
+        if filled is None:
+            # タイムアウト: 未約定 → キャンセルしてポジション作成しない
             logger.warning(
-                "[%s] 約定確認タイムアウト (%.0fs) — 内部管理で続行 price=$%.2f qty=%d",
-                symbol, FILL_CHECK_MAX_WAIT, price, size,
+                "[%s] 約定確認タイムアウト (%.0fs) — 注文キャンセル order_id=%s",
+                symbol, FILL_CHECK_MAX_WAIT, result.order_id,
             )
-            fill_price = price
-            fill_qty = size
+            self._client.cancel_order(result.order_id)
+            return OrderResult(order_id=result.order_id, status="CANCELLED")
+
+        fill_price = filled.get("cost_price", price)
+        fill_qty = int(filled.get("qty", size))
+        logger.info("[%s] 約定確認OK: qty=%d/%d cost_price=$%.2f", symbol, fill_qty, size, fill_price)
 
         order_id = result.order_id
         self._positions[order_id] = Position(
@@ -203,12 +206,12 @@ class OrderRouter:
             filled_price=fill_price, filled_quantity=fill_qty,
         )
 
-    def _wait_for_fill_sync(self, symbol: str, order_id: str = "") -> dict | None:
-        """約定確認 (同期版)."""
+    async def _wait_for_fill(self, symbol: str, expected_qty: int, order_id: str = "") -> dict | None:
+        """約定確認: 全量約定を確認する (asyncio.sleep で待機)."""
         elapsed = 0.0
         attempt = 0
         while elapsed < FILL_CHECK_MAX_WAIT:
-            time.sleep(FILL_CHECK_INTERVAL)
+            await asyncio.sleep(FILL_CHECK_INTERVAL)
             elapsed += FILL_CHECK_INTERVAL
             attempt += 1
             t0 = time.monotonic()
@@ -219,12 +222,14 @@ class OrderRouter:
                 order_status = self._client.get_order_status(order_id) if order_id else "?"
             except Exception:
                 pass
+            pos_qty = int(positions.get(symbol, {}).get("qty", 0))
             logger.info(
-                "[%s] fill check #%d (%.1fs): order_status=%s positions=%s (api %.2fs)",
-                symbol, attempt, elapsed, order_status,
+                "[%s] fill check #%d (%.1fs): order_status=%s pos_qty=%d/%d positions=%s (api %.2fs)",
+                symbol, attempt, elapsed, order_status, pos_qty, expected_qty,
                 list(positions.keys()), api_time,
             )
-            if symbol in positions and positions[symbol]["qty"] > 0:
+            # 全量約定を確認
+            if symbol in positions and pos_qty >= expected_qty:
                 return positions[symbol]
         return None
 

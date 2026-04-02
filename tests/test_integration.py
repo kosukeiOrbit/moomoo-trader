@@ -1,7 +1,4 @@
-"""Integration tests: exit flow triggers pnl_tracker, position_sizer, notifier.
-
-exit() and exit_all() are async.
-"""
+"""Integration tests: exit flow triggers pnl_tracker, position_sizer, notifier."""
 
 from __future__ import annotations
 
@@ -23,10 +20,6 @@ from src.monitor.notifier import Notifier
 from src.signals.and_filter import EntryDecision
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _go_long() -> EntryDecision:
     return EntryDecision(go=True, direction="LONG")
 
@@ -45,6 +38,7 @@ def _setup(exit_price: float = 155.0):
         "AAPL": {"qty": 10, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
         "NVDA": {"qty": 5, "cost_price": 500.0, "market_val": 0, "pl_val": 0},
     }
+    mock_client.cancel_order.return_value = True
 
     cb = CircuitBreaker()
     pnl_tracker = PnLTracker()
@@ -64,16 +58,12 @@ def _setup(exit_price: float = 155.0):
     return router, pnl_tracker, position_sizer, mock_client
 
 
-def _enter_one(router, mock_client, pnl):
-    router.enter(_go_long(), "AAPL", 10, 150.0)
+async def _enter_one(router, mock_client, pnl):
+    await router.enter(_go_long(), "AAPL", 10, 150.0)
     oid = list(router.open_positions.keys())[0]
     pnl.register(oid, "AAPL", "LONG", 10, 150.0)
     return oid
 
-
-# ---------------------------------------------------------------------------
-# Integration: exit triggers all downstream updates
-# ---------------------------------------------------------------------------
 
 @patch("src.execution.order_router.FILL_CHECK_INTERVAL", 0.01)
 @patch("src.execution.order_router.FILL_CHECK_MAX_WAIT", 0.05)
@@ -82,7 +72,7 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_exit_updates_pnl_tracker(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=155.0)
-        oid = _enter_one(router, mock_client, pnl)
+        oid = await _enter_one(router, mock_client, pnl)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         await router.exit(oid, "TP")
@@ -92,7 +82,7 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_exit_updates_position_sizer_win(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=160.0)
-        oid = _enter_one(router, mock_client, pnl)
+        oid = await _enter_one(router, mock_client, pnl)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         await router.exit(oid, "TP")
@@ -102,7 +92,7 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_exit_updates_position_sizer_loss(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=145.0)
-        oid = _enter_one(router, mock_client, pnl)
+        oid = await _enter_one(router, mock_client, pnl)
         mock_client.has_position.return_value = False
         mock_client.get_positions.return_value = {}
         await router.exit(oid, "SL")
@@ -112,8 +102,8 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_exit_all_updates_all_trackers(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=155.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
-        router.enter(_go_long(), "NVDA", 5, 500.0)
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
+        await router.enter(_go_long(), "NVDA", 5, 500.0)
         for oid, pos in router.open_positions.items():
             pnl.register(oid, pos.symbol, "LONG", pos.size, pos.entry_price)
         mock_client.has_position.return_value = False
@@ -130,7 +120,7 @@ class TestExitIntegration:
             mock_client.get_positions.return_value = {
                 "AAPL": {"qty": 10, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
             }
-            router.enter(_go_long(), "AAPL", 10, 150.0)
+            await router.enter(_go_long(), "AAPL", 10, 150.0)
             oid = list(router.open_positions.keys())[0]
             pnl.register(oid, "AAPL", "LONG", 10, 150.0)
             mock_client.get_positions.return_value = {}
@@ -141,20 +131,18 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_win_resets_consecutive_losses(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=145.0)
-        # 2 losses
         for i in range(2):
             mock_client.has_position.return_value = False
             mock_client.get_positions.return_value = {
                 "AAPL": {"qty": 10, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
             }
-            router.enter(_go_long(), "AAPL", 10, 150.0)
+            await router.enter(_go_long(), "AAPL", 10, 150.0)
             oid = list(router.open_positions.keys())[0]
             pnl.register(oid, "AAPL", "LONG", 10, 150.0)
             mock_client.get_positions.return_value = {}
             await router.exit(oid, "SL")
         assert sizer.consecutive_losses == 2
 
-        # 1 win
         mock_client2 = MagicMock()
         mock_client2.get_snapshot.return_value = QuoteSnapshot(
             symbol="AAPL", last_price=160.0, volume=0, turnover=0,
@@ -167,13 +155,14 @@ class TestExitIntegration:
         mock_client2.get_positions.return_value = {
             "AAPL": {"qty": 10, "cost_price": 150.0, "market_val": 0, "pl_val": 0},
         }
+        mock_client2.cancel_order.return_value = True
 
         def _on_exit2(result: ExitResult) -> None:
             p = pnl.close_trade(result.position.order_id, result.exit_price, result.reason)
             sizer.update_stats(TradeResult(symbol="AAPL", pnl=p, is_win=p > 0))
 
         router_win = OrderRouter(mock_client2, CircuitBreaker(), on_exit=_on_exit2)
-        router_win.enter(_go_long(), "AAPL", 10, 150.0)
+        await router_win.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router_win.open_positions.keys())[0]
         pnl.register(oid, "AAPL", "LONG", 10, 150.0)
         mock_client2.get_positions.return_value = {}
@@ -193,7 +182,7 @@ class TestExitIntegration:
     @pytest.mark.asyncio
     async def test_force_exit_uses_real_price(self) -> None:
         router, pnl, sizer, mock_client = _setup(exit_price=152.0)
-        router.enter(_go_long(), "AAPL", 10, 150.0)
+        await router.enter(_go_long(), "AAPL", 10, 150.0)
         oid = list(router.open_positions.keys())[0]
         pnl.register(oid, "AAPL", "LONG", 10, 150.0)
         mock_client.has_position.return_value = False

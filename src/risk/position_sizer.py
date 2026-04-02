@@ -130,17 +130,27 @@ class PositionSizer:
         max_shares = int(account_balance * max_pct / price)
 
         # Kelly=0 でも最低 MIN_POSITION_SHARES を保証
-        # ただし1株すら買えない場合（price > balance）のみ 0 にする
         shares = max(kelly_shares, settings.MIN_POSITION_SHARES)
-        if price > account_balance:
+
+        # 口座残高の絶対上限: shares * price <= account_balance
+        max_affordable = int(account_balance / price) if price > 0 else 0
+        shares = min(shares, max_affordable)
+
+        # POSITION_MAX_PCT 上限も適用
+        shares = min(shares, max_shares) if max_shares > 0 else shares
+
+        # MIN_POSITION_SHARES を可能な範囲で保証
+        if shares < settings.MIN_POSITION_SHARES and max_affordable >= settings.MIN_POSITION_SHARES:
+            shares = settings.MIN_POSITION_SHARES
+
+        # 本当に1株も買えない場合のみ 0
+        if max_affordable < 1:
             shares = 0
-        else:
-            shares = max(shares, settings.MIN_POSITION_SHARES)
 
         logger.info(
-            "Position size: %s kelly=%.4f shares=%d (kelly=%d, min=%d, max=%d, affordable=%s)",
+            "Position size: %s kelly=%.4f shares=%d (kelly=%d, min=%d, max=%d, affordable=%d)",
             symbol, kelly_pct, shares, kelly_shares,
-            settings.MIN_POSITION_SHARES, max_shares, price <= account_balance,
+            settings.MIN_POSITION_SHARES, max_shares, max_affordable,
         )
         return shares
 

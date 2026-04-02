@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from futu import (
+    ModifyOrderOp,
     OpenQuoteContext,
     OpenSecTradeContext,
     RET_OK,
@@ -399,3 +400,19 @@ class MoomooClient:
         order_id = str(data["order_id"].iloc[0])
         logger.info("発注成功: %s order_id=%s", order, order_id)
         return OrderResult(order_id=order_id, status="SUBMITTED")
+
+    def cancel_order(self, order_id: str) -> bool:
+        """注文をキャンセルする."""
+        assert self._trade_ctx is not None
+        ret, data = self._trade_ctx.modify_order(
+            modify_order_op=ModifyOrderOp.CANCEL,
+            order_id=order_id,
+            qty=0,
+            price=0,
+            trd_env=self._trd_env,
+        )
+        if ret != RET_OK:
+            logger.warning("キャンセル失敗: order_id=%s — %s", order_id, data)
+            return False
+        logger.info("キャンセル成功: order_id=%s", order_id)
+        return True
