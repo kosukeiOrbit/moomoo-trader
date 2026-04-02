@@ -390,7 +390,7 @@ class MoomooClient:
             trd_side=side,
             order_type=order_type,
             trd_env=self._trd_env,
-            sub_acc_type=self._get_sub_acc_type(),
+            jp_acc_type=self._get_sub_acc_type(),
         )
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)
