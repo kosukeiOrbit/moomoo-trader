@@ -11,7 +11,7 @@ MOOMOO_PORT: int = int(os.getenv("MOOMOO_PORT", "11111"))
 MOOMOO_TRADE_PWD: str = os.getenv("MOOMOO_TRADE_PWD", "")
 TRADE_ENV: str = os.getenv("TRADE_ENV", "SIMULATE")  # "SIMULATE" or "REAL"
 SECURITY_FIRM: str = os.getenv("SECURITY_FIRM", "FUTUJP")  # moomoo証券（日本）
-JP_ACC_TYPE: str = os.getenv("JP_ACC_TYPE", "SPECIFIC")  # "GENERAL" or "SPECIFIC"
+JP_ACC_TYPE: str = os.getenv("JP_ACC_TYPE", "GENERAL")  # "GENERAL" or "SPECIFIC" (SPECIFIC は futu API 未対応)
 
 # --- Anthropic Claude API ---
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
@@ -43,7 +43,7 @@ MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
 POSITION_MAX_PCT: float = float(os.getenv("POSITION_MAX_PCT", "0.02"))
 KELLY_FRACTION: float = 0.5           # ハーフケリー
 MIN_POSITION_SHARES: int = 1          # 最低保証株数（Kelly=0でもデータ蓄積用に発注）
-MAX_POSITIONS: int = 3                # 同時保有ポジション上限
+MAX_POSITIONS: int = 5                # 同時保有ポジション上限
 CONSECUTIVE_LOSS_LIMIT: int = 3       # 連続敗北でサイズ縮小
 
 # --- ストップロス ---
