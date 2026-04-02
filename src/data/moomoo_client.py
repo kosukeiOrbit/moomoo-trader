@@ -396,15 +396,20 @@ class MoomooClient:
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
-        ret, data = self._trade_ctx.place_order(
+        kwargs: dict = dict(
             price=price,
             qty=order.quantity,
             code=code,
             trd_side=side,
             order_type=order_type,
             trd_env=self._trd_env,
-            jp_acc_type=self._get_jp_acc_type(),
         )
+        # BUY: 指定の口座区分（特定口座）で新規購入
+        # SELL: 省略してmoomooが保有ポジションの口座区分に自動マッチ
+        if order.side == "BUY":
+            kwargs["jp_acc_type"] = self._get_jp_acc_type()
+
+        ret, data = self._trade_ctx.place_order(**kwargs)
         if ret != RET_OK:
             logger.error("発注失敗: %s — %s", order, data)
             return OrderResult(order_id="", status="FAILED")
