@@ -29,7 +29,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $OpenDDir    = Join-Path $ProjectRoot "moomoo_OpenD_10.2.6208_Windows\moomoo_OpenD_10.2.6208_Windows"
 $OpenDExe    = Join-Path $OpenDDir "OpenD.exe"
-$PythonExe   = (Get-Command python -ErrorAction SilentlyContinue).Source
+$PythonExe   = Join-Path $ProjectRoot "venv\Scripts\python.exe"
 $MainPy      = Join-Path $ProjectRoot "src\main.py"
 $StopScript  = Join-Path $ProjectRoot "scripts\stop_all.ps1"
 
@@ -140,10 +140,10 @@ function Register-MoomooTask {
         -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero)  # No time limit
 
-    # Principal: run only when user is logged on (S4U blocked by MS Store Python)
+    # Principal: run whether user is logged on or not (venv Python, not MS Store)
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
-        -LogonType Interactive `
+        -LogonType S4U `
         -RunLevel Highest
 
     Register-ScheduledTask `
