@@ -140,10 +140,10 @@ function Register-MoomooTask {
         -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero)  # No time limit
 
-    # Principal: run whether user is logged on or not
+    # Principal: run only when user is logged on (S4U blocked by MS Store Python)
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
-        -LogonType S4U `
+        -LogonType Interactive `
         -RunLevel Highest
 
     Register-ScheduledTask `
