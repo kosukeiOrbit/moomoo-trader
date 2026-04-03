@@ -1,9 +1,12 @@
 """全設定値の一元管理モジュール."""
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# プロジェクトルートの .env を絶対パスで読み込む（S4U スケジューラ対応）
+_project_root = Path(__file__).resolve().parent.parent
+load_dotenv(_project_root / ".env")
 
 # --- moomoo OpenAPI ---
 MOOMOO_HOST: str = os.getenv("MOOMOO_HOST", "127.0.0.1")
@@ -19,17 +22,34 @@ CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
 MIN_TEXTS_FOR_ANALYSIS: int = 1  # これ未満のテキスト数ではAPI呼び出しをスキップ
 
 # --- 監視銘柄 ---
-WATCHLIST: list[str] = [
-    # ハイテク・グロース
+# WATCHLIST: list[str] = [
+#     # ハイテク・グロース
+#     "AAPL", "NVDA", "TSLA", "META", "MSFT",
+#     # 金融（セクターローテーション対応）
+#     "JPM", "GS",
+#     # エネルギー（原油・地政学リスク対応）
+#     "XOM",
+#     # 景気敏感（ダウ牽引役）
+#     "CAT",
+#     # ヘルスケア（ディフェンシブ）
+#     "UNH",
+# ]
+WATCHLIST = [
+    # ハイテク・グロース（既存）
     "AAPL", "NVDA", "TSLA", "META", "MSFT",
-    # 金融（セクターローテーション対応）
+    # 金融（既存）
     "JPM", "GS",
-    # エネルギー（原油・地政学リスク対応）
+    # エネルギー（既存）
     "XOM",
-    # 景気敏感（ダウ牽引役）
+    # 景気敏感（既存）
     "CAT",
-    # ヘルスケア（ディフェンシブ）
+    # ヘルスケア（既存）
     "UNH",
+    # 追加
+    "AVGO",  # AI半導体
+    "PLTR",  # AI・防衛
+    "CRWD",  # サイバーセキュリティ
+    "TSM",   # 半導体製造
 ]
 
 # --- シグナル閾値 ---
