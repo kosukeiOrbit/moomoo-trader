@@ -59,7 +59,9 @@ Write-Host "  main.py:  $MainPy"
 Write-Host ""
 
 # Password for task scheduler (run whether logged on or not)
-$cred = Get-Credential -UserName $env:USERNAME -Message "Enter Windows password for Task Scheduler (run whether logged on or not)"
+$TaskUser = Read-Host "Task user (default: $env:USERNAME)"
+if (-not $TaskUser) { $TaskUser = $env:USERNAME }
+$cred = Get-Credential -UserName $TaskUser -Message "Enter Windows password for Task Scheduler"
 $UserPassword = $cred.GetNetworkCredential().Password
 
 # ---------------------------------------------------------------------------
@@ -157,7 +159,7 @@ function Register-MoomooTask {
         -Trigger $trigger `
         -Action $action `
         -Settings $taskSettings `
-        -User $env:USERNAME `
+        -User $TaskUser `
         -Password $UserPassword `
         -RunLevel Highest | Out-Null
 
