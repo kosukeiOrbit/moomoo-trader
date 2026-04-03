@@ -387,8 +387,9 @@ class MoomooClient:
     def place_order(self, order: Order) -> OrderResult:
         """注文を発注する.
 
-        BUY: jp_acc_type を指定して口座区分を選択
-        SELL: jp_acc_type を省略（moomoo が保有ポジションの口座区分に自動マッチ）
+        BUY: 設定の口座区分 (JP_TOKUTEI) で発注
+        SELL: JP_TOKUTEI → 省略(デフォルト) → JP_GENERAL の順でリトライ
+              （特定口座・一般口座どちらのポジションも売れるようにする）
         """
         assert self._trade_ctx is not None
         code = f"US.{order.symbol}"
@@ -396,7 +397,7 @@ class MoomooClient:
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
-        kwargs: dict = dict(
+        base_kwargs: dict = dict(
             price=price,
             qty=order.quantity,
             code=code,
@@ -404,19 +405,35 @@ class MoomooClient:
             order_type=order_type,
             trd_env=self._trd_env,
         )
-        # BUY: 指定の口座区分（特定口座）で新規購入
-        # SELL: 省略してmoomooが保有ポジションの口座区分に自動マッチ
-        if order.side == "BUY":
-            kwargs["jp_acc_type"] = self._get_jp_acc_type()
 
-        ret, data = self._trade_ctx.place_order(**kwargs)
-        if ret != RET_OK:
-            logger.error("発注失敗: %s — %s", order, data)
+        if order.side == "BUY":
+            # BUY は設定の口座区分で1回だけ
+            attempts = [("BUY", {**base_kwargs, "jp_acc_type": self._get_jp_acc_type()})]
+        else:
+            # SELL はリトライ: 特定口座 → 省略(デフォルト) → 一般口座
+            attempts = [
+                ("SELL/TOKUTEI", {**base_kwargs, "jp_acc_type": SubAccType.JP_TOKUTEI}),
+                ("SELL/DEFAULT", {**base_kwargs}),  # jp_acc_type 省略
+                ("SELL/GENERAL", {**base_kwargs, "jp_acc_type": SubAccType.JP_GENERAL}),
+            ]
+
+        for label, kwargs in attempts:
+            ret, data = self._trade_ctx.place_order(**kwargs)
+            if ret == RET_OK and not (hasattr(data, "empty") and data.empty):
+                order_id = str(data["order_id"].iloc[0])
+                logger.info("発注成功: %s order_id=%s (%s)", order, order_id, label)
+                return OrderResult(order_id=order_id, status="SUBMITTED")
+
+            error_msg = str(data)
+            if "Insufficient positions" in error_msg and label != attempts[-1][0]:
+                logger.info("[%s] %s: Insufficient positions — next acc_type", order.symbol, label)
+                continue
+
+            logger.error("発注失敗: %s (%s) — %s", order, label, data)
             return OrderResult(order_id="", status="FAILED")
 
-        order_id = str(data["order_id"].iloc[0])
-        logger.info("発注成功: %s order_id=%s", order, order_id)
-        return OrderResult(order_id=order_id, status="SUBMITTED")
+        logger.error("発注失敗: %s — 全口座区分で失敗", order)
+        return OrderResult(order_id="", status="FAILED")
 
     def cancel_order(self, order_id: str) -> bool:
         """注文をキャンセルする."""
