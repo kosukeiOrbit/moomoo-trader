@@ -40,7 +40,7 @@ from src.monitor.notifier import Notifier
 
 def _setup_logging() -> None:
     """Console + daily rotating file logging."""
-    log_dir = Path("logs")
+    log_dir = Path(_project_root) / "logs"
     log_dir.mkdir(exist_ok=True)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")

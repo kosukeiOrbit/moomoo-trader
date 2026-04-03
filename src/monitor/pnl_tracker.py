@@ -16,7 +16,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # CSV保存先のデフォルトディレクトリ
-DEFAULT_CSV_DIR = Path("data/trades")
+DEFAULT_CSV_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "trades"
 
 
 @dataclass
