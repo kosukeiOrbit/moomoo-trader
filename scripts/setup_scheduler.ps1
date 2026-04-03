@@ -140,10 +140,10 @@ function Register-MoomooTask {
         -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero)  # No time limit
 
-    # Principal: run whether user is logged on or not (venv Python, not MS Store)
+    # Principal: Interactive + no time limit (S4U fails with futu SDK access)
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
-        -LogonType S4U `
+        -LogonType Interactive `
         -RunLevel Highest
 
     Register-ScheduledTask `
