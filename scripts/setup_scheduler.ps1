@@ -58,6 +58,10 @@ Write-Host "  Python:   $PythonExe"
 Write-Host "  main.py:  $MainPy"
 Write-Host ""
 
+# Password for task scheduler (run whether logged on or not)
+$cred = Get-Credential -UserName $env:USERNAME -Message "Enter Windows password for Task Scheduler (run whether logged on or not)"
+$UserPassword = $cred.GetNetworkCredential().Password
+
 # ---------------------------------------------------------------------------
 # Generate stop script
 # ---------------------------------------------------------------------------
@@ -140,10 +144,11 @@ function Register-MoomooTask {
         -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero)  # No time limit
 
-    # Principal: Interactive + no time limit (S4U fails with futu SDK access)
+    # Principal: Password mode — runs with full user credentials even when logged off
+    # (S4U fails with futu SDK, Interactive freezes when monitor off)
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
-        -LogonType Interactive `
+        -LogonType Password `
         -RunLevel Highest
 
     Register-ScheduledTask `
@@ -152,7 +157,9 @@ function Register-MoomooTask {
         -Trigger $trigger `
         -Action $action `
         -Settings $taskSettings `
-        -Principal $principal | Out-Null
+        -User $env:USERNAME `
+        -Password $UserPassword `
+        -RunLevel Highest | Out-Null
 
     Write-Host "  [OK] $TaskName ($Time)" -ForegroundColor Green
 }
