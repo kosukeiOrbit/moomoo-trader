@@ -2,11 +2,14 @@
 
 APIキー不要の RSS フィードから銘柄ごとのニュース記事を取得する。
 取得失敗時は空リストを返してシステムを止めない。
+Google News RSS は銘柄ごとに最低60秒間隔でフェッチする（レート制限対策）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time as _time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +27,9 @@ GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
 # 記事の鮮度フィルター（直近N分）
 MAX_AGE_MINUTES = 30
+
+# Google News のフェッチ間隔（秒）— レート制限対策
+GOOGLE_FETCH_INTERVAL = 60.0
 
 
 @dataclass
@@ -43,6 +49,8 @@ class NewsFeed:
 
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
+        # Google News のフェッチ時刻キャッシュ: symbol -> (monotonic_time, articles)
+        self._google_cache: dict[str, tuple[float, list[NewsArticle]]] = {}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -55,7 +63,7 @@ class NewsFeed:
         """指定銘柄の最新ニュースを取得する.
 
         Yahoo Finance RSS + Google News RSS から直近30分以内の記事を取得。
-        タイトルで重複除去する。
+        URL で重複除去する。
 
         Args:
             symbol: 銘柄シンボル (例: "AAPL")
@@ -65,18 +73,22 @@ class NewsFeed:
             ニュース記事リスト（取得失敗時は空リスト）
         """
         # 並行取得
-        yahoo, google = await self._fetch_yahoo_rss(symbol, limit), []
-        google = await self._fetch_google_news_rss(symbol, limit)
+        yahoo_task = asyncio.ensure_future(self._fetch_yahoo_rss(symbol, limit))
+        google_task = asyncio.ensure_future(self._fetch_google_news_rss(symbol, limit))
+        yahoo, google = await asyncio.gather(yahoo_task, google_task)
 
-        # タイトルで重複除去
-        seen_titles: set[str] = set()
+        # URL で重複除去（URL が空の場合はタイトルでフォールバック）
+        seen: set[str] = set()
         articles: list[NewsArticle] = []
         for article in yahoo + google:
-            title_key = article.title.strip().lower()
-            if title_key in seen_titles:
+            key = article.url.strip() if article.url.strip() else article.title.strip().lower()
+            if key in seen:
                 continue
-            seen_titles.add(title_key)
+            seen.add(key)
             articles.append(article)
+
+        if articles:
+            logger.info("[%s] News: Yahoo=%d Google=%d total=%d", symbol, len(yahoo), len(google), len(articles))
 
         return articles[:limit]
 
@@ -90,7 +102,7 @@ class NewsFeed:
             params = {"s": symbol, "region": "US", "lang": "en-US"}
             async with session.get(YAHOO_RSS_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    logger.warning("Yahoo RSS failed: %s (status=%d)", symbol, resp.status)
+                    logger.debug("Yahoo RSS failed: %s (status=%d)", symbol, resp.status)
                     return articles
 
                 text = await resp.text()
@@ -120,17 +132,24 @@ class NewsFeed:
                         break
 
         except aiohttp.ClientError as e:
-            logger.warning("Yahoo RSS network error: %s — %s", symbol, e)
+            logger.debug("Yahoo RSS network error: %s — %s", symbol, e)
         except ET.ParseError as e:
-            logger.warning("Yahoo RSS XML parse error: %s — %s", symbol, e)
+            logger.debug("Yahoo RSS XML parse error: %s — %s", symbol, e)
         except Exception:
             logger.exception("Yahoo RSS unexpected error: %s", symbol)
 
-        logger.debug("Yahoo RSS: %s -> %d articles", symbol, len(articles))
         return articles
 
     async def _fetch_google_news_rss(self, symbol: str, limit: int) -> list[NewsArticle]:
-        """Google News RSS からニュースを取得する."""
+        """Google News RSS からニュースを取得する（60秒キャッシュ付き）."""
+        # レート制限: 前回フェッチから60秒以内はキャッシュを返す
+        now = _time.monotonic()
+        cached = self._google_cache.get(symbol)
+        if cached:
+            last_fetch, cached_articles = cached
+            if now - last_fetch < GOOGLE_FETCH_INTERVAL:
+                return cached_articles
+
         session = await self._ensure_session()
         articles: list[NewsArticle] = []
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=MAX_AGE_MINUTES)
@@ -144,7 +163,8 @@ class NewsFeed:
             }
             async with session.get(GOOGLE_NEWS_RSS_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    logger.warning("Google News RSS failed: %s (status=%d)", symbol, resp.status)
+                    logger.debug("Google News RSS failed: %s (status=%d)", symbol, resp.status)
+                    self._google_cache[symbol] = (now, [])
                     return articles
 
                 text = await resp.text()
@@ -174,13 +194,13 @@ class NewsFeed:
                         break
 
         except aiohttp.ClientError as e:
-            logger.warning("Google News RSS network error: %s — %s", symbol, e)
+            logger.debug("Google News RSS network error: %s — %s", symbol, e)
         except ET.ParseError as e:
-            logger.warning("Google News RSS XML parse error: %s — %s", symbol, e)
+            logger.debug("Google News RSS XML parse error: %s — %s", symbol, e)
         except Exception:
             logger.exception("Google News RSS unexpected error: %s", symbol)
 
-        logger.debug("Google News RSS: %s -> %d articles", symbol, len(articles))
+        self._google_cache[symbol] = (now, articles)
         return articles
 
     @staticmethod
