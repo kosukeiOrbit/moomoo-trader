@@ -184,7 +184,7 @@ async def main_loop() -> None:
             if pos.levels is None:
                 try:
                     levels = stop_loss_manager.calculate_levels(
-                        pos.symbol, pos.entry_price,
+                        pos.symbol, pos.entry_price, direction=pos.direction,
                     )
                     pos.levels = levels
                     logger.info(
@@ -295,11 +295,19 @@ async def main_loop() -> None:
                     # 1) フロー先行取得（API不要・低コスト）
                     flow = flow_detector.get_flow_signal(symbol)
 
-                    # 2) flow=SELL ならClaude APIをスキップ
-                    if flow.direction != "BUY":
+                    # 2) flow=NEUTRAL ならスキップ（BUY/SELL のみ処理）
+                    if flow.direction == "NEUTRAL":
                         logger.info(
-                            "[%s] flow=%s(%.2f) -> SKIP(flow not BUY, API skipped)",
-                            symbol, flow.direction, flow.strength,
+                            "[%s] flow=NEUTRAL(%.2f) -> SKIP(API skipped)",
+                            symbol, flow.strength,
+                        )
+                        continue
+
+                    # flow=SELL + SHORT無効 ならスキップ
+                    if flow.direction == "SELL" and not settings.ENABLE_SHORT:
+                        logger.info(
+                            "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
+                            symbol, flow.strength,
                         )
                         continue
 
@@ -341,7 +349,7 @@ async def main_loop() -> None:
                             symbol, current_price, account_state.balance,
                         )
                         levels = stop_loss_manager.calculate_levels(
-                            symbol, current_price,
+                            symbol, current_price, direction=decision.direction,
                         )
                         result = await order_router.enter(
                             decision, symbol, size, current_price, levels,

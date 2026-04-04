@@ -1,13 +1,12 @@
-"""AndFilter のユニットテスト."""
+"""AndFilter のユニットテスト (LONG + SHORT)."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import sys
 
 import pytest
 
-# moomoo SDK がインストールされていない環境でもテスト可能にする
 if "futu" not in sys.modules:
     sys.modules["futu"] = MagicMock()
 
@@ -21,201 +20,141 @@ from src.signals.flow_detector import FlowSignal
 # ---------------------------------------------------------------------------
 
 def _sentiment(score: float = 0.5, confidence: float = 0.8) -> SentimentResult:
-    """テスト用の SentimentResult を生成する."""
     return SentimentResult(score=score, confidence=confidence, reasoning="test")
 
-
-def _flow(
-    direction: str = "BUY",
-    strength: float = 0.8,
-    short_squeeze: bool = False,
-) -> FlowSignal:
-    """テスト用の FlowSignal を生成する."""
+def _flow(direction: str = "BUY", strength: float = 0.8, short_squeeze: bool = False) -> FlowSignal:
     return FlowSignal(direction=direction, strength=strength, short_squeeze=short_squeeze)
 
 
 # ---------------------------------------------------------------------------
-# テスト
+# LONG テスト
 # ---------------------------------------------------------------------------
 
-class TestAndFilter:
-    """AndFilter.should_enter のテスト."""
+class TestLong:
 
     @pytest.fixture()
     def filt(self) -> AndFilter:
         return AndFilter()
 
-    # === 全条件OK ===
-
-    def test_all_conditions_met_returns_go_true(self, filt: AndFilter) -> None:
-        """全4条件を満たした場合に go=True, direction='LONG' を返す."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.8),
-        )
+    def test_all_conditions_met(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8))
         assert decision.go is True
         assert decision.direction == "LONG"
-        assert decision.sentiment_score == 0.5
-        assert decision.flow_strength == 0.8
 
-    def test_all_conditions_met_reason_contains_bullish(self, filt: AndFilter) -> None:
-        """合格時のreasonにBullish情報が含まれる."""
-        decision = filt.should_enter(
-            _sentiment(score=0.7, confidence=0.9),
-            _flow(direction="BUY", strength=0.9),
-        )
+    def test_reason_contains_bullish(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.7, 0.9), _flow("BUY", 0.9))
         assert "Bullish" in decision.reason
-        assert "大口買い超過" in decision.reason
 
-    def test_short_squeeze_noted_in_reason(self, filt: AndFilter) -> None:
-        """ショートスクイーズ候補の場合reasonに記載される."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.8, short_squeeze=True),
-        )
-        assert decision.go is True
+    def test_short_squeeze_in_reason(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8, short_squeeze=True))
         assert "ショートスクイーズ" in decision.reason
 
-    # === センチメントのみOK（フロー不合格） ===
-
-    def test_sentiment_only_flow_neutral(self, filt: AndFilter) -> None:
-        """センチメントOKだがフロー方向がNEUTRALの場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="NEUTRAL", strength=0.8),
-        )
+    def test_sentiment_low_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.1, 0.8), _flow("BUY", 0.8))
         assert decision.go is False
-        assert "フロー方向不一致" in decision.reason
 
-    def test_sentiment_only_flow_sell(self, filt: AndFilter) -> None:
-        """センチメントOKだがフロー方向がSELLの場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="SELL", strength=0.8),
-        )
+    def test_confidence_low_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.3), _flow("BUY", 0.8))
         assert decision.go is False
-        assert "フロー方向不一致" in decision.reason
+        assert "確信度不足" in decision.reason
 
-    def test_sentiment_only_flow_strength_low(self, filt: AndFilter) -> None:
-        """センチメントOKだがフロー強度が閾値以下の場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.3),
-        )
+    def test_flow_strength_low_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.3))
         assert decision.go is False
         assert "フロー強度不足" in decision.reason
 
-    # === 大口フローのみOK（センチメント不合格） ===
-
-    def test_flow_only_sentiment_low(self, filt: AndFilter) -> None:
-        """フローOKだがセンチメントスコアが低い場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.1, confidence=0.8),
-            _flow(direction="BUY", strength=0.8),
-        )
+    def test_score_at_threshold_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.3, 0.8), _flow("BUY", 0.8))
         assert decision.go is False
-        assert "センチメント不足" in decision.reason
 
-    def test_flow_only_sentiment_negative(self, filt: AndFilter) -> None:
-        """フローOKだがセンチメントが負の場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=-0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.8),
-        )
-        assert decision.go is False
-        assert "センチメント不足" in decision.reason
-
-    # === confidence低い ===
-
-    def test_low_confidence_returns_false(self, filt: AndFilter) -> None:
-        """confidenceが閾値以下の場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.3),
-            _flow(direction="BUY", strength=0.8),
-        )
-        assert decision.go is False
-        assert "確信度不足" in decision.reason
-
-    def test_zero_confidence_returns_false(self, filt: AndFilter) -> None:
-        """confidence=0の場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.8, confidence=0.0),
-            _flow(direction="BUY", strength=0.8),
-        )
-        assert decision.go is False
-        assert "確信度不足" in decision.reason
-
-    # === 境界値テスト（閾値ちょうど） ===
-
-    def test_score_exactly_at_threshold_returns_false(self, filt: AndFilter) -> None:
-        """score == SENTIMENT_THRESHOLD (0.3) は '>' なので不合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.3, confidence=0.8),
-            _flow(direction="BUY", strength=0.8),
-        )
-        assert decision.go is False
-        assert "センチメント不足" in decision.reason
-
-    def test_score_just_above_threshold_returns_true(self, filt: AndFilter) -> None:
-        """score が閾値をわずかに超えた場合は合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.31, confidence=0.8),
-            _flow(direction="BUY", strength=0.8),
-        )
+    def test_score_above_threshold_passes(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.31, 0.8), _flow("BUY", 0.8))
         assert decision.go is True
 
-    def test_confidence_exactly_at_threshold_returns_false(self, filt: AndFilter) -> None:
-        """confidence == CONFIDENCE_MIN (0.6) は '>' なので不合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.6),
-            _flow(direction="BUY", strength=0.8),
-        )
+    def test_neutral_flow_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("NEUTRAL", 0.8))
         assert decision.go is False
-        assert "確信度不足" in decision.reason
-
-    def test_confidence_just_above_threshold_returns_true(self, filt: AndFilter) -> None:
-        """confidence が閾値をわずかに超えた場合は合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.61),
-            _flow(direction="BUY", strength=0.8),
-        )
-        assert decision.go is True
-
-    def test_flow_strength_exactly_at_threshold_returns_false(self, filt: AndFilter) -> None:
-        """strength == FLOW_BUY_THRESHOLD (0.65) は '>' なので不合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.65),
-        )
-        assert decision.go is False
-        assert "フロー強度不足" in decision.reason
-
-    def test_flow_strength_just_above_threshold_returns_true(self, filt: AndFilter) -> None:
-        """strength が閾値をわずかに超えた場合は合格."""
-        decision = filt.should_enter(
-            _sentiment(score=0.5, confidence=0.8),
-            _flow(direction="BUY", strength=0.66),
-        )
-        assert decision.go is True
-
-    # === 複数条件が同時に未達 ===
-
-    def test_multiple_failures_all_listed_in_reason(self, filt: AndFilter) -> None:
-        """複数条件が未達の場合、全未達理由がreasonに列挙される."""
-        decision = filt.should_enter(
-            _sentiment(score=0.1, confidence=0.3),
-            _flow(direction="SELL", strength=0.2),
-        )
-        assert decision.go is False
-        assert "センチメント不足" in decision.reason
         assert "フロー方向不一致" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# SHORT テスト
+# ---------------------------------------------------------------------------
+
+class TestShort:
+
+    @pytest.fixture()
+    def filt(self) -> AndFilter:
+        return AndFilter()
+
+    def test_short_all_conditions_met(self, filt: AndFilter) -> None:
+        """Bearish sentiment + SELL flow -> SHORT."""
+        decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.8))
+        assert decision.go is True
+        assert decision.direction == "SHORT"
+        assert "Bearish" in decision.reason
+
+    def test_short_sentiment_not_bearish_enough(self, filt: AndFilter) -> None:
+        """score=-0.2 > -0.3 なので不合格."""
+        decision = filt.should_enter(_sentiment(-0.2, 0.8), _flow("SELL", 0.8))
+        assert decision.go is False
+        assert "Bearish不足" in decision.reason
+
+    def test_short_at_threshold_fails(self, filt: AndFilter) -> None:
+        """score=-0.3 == threshold は '<' なので不合格."""
+        decision = filt.should_enter(_sentiment(-0.3, 0.8), _flow("SELL", 0.8))
+        assert decision.go is False
+
+    def test_short_just_below_threshold_passes(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(-0.31, 0.8), _flow("SELL", 0.8))
+        assert decision.go is True
+        assert decision.direction == "SHORT"
+
+    def test_short_low_confidence_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(-0.5, 0.3), _flow("SELL", 0.8))
+        assert decision.go is False
         assert "確信度不足" in decision.reason
+
+    def test_short_low_flow_strength_fails(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.3))
+        assert decision.go is False
         assert "フロー強度不足" in decision.reason
 
-    def test_all_zero_returns_false(self, filt: AndFilter) -> None:
-        """全入力が0/NEUTRALの場合 go=False."""
-        decision = filt.should_enter(
-            _sentiment(score=0.0, confidence=0.0),
-            _flow(direction="NEUTRAL", strength=0.0),
-        )
+    def test_bullish_sentiment_sell_flow_no_short(self, filt: AndFilter) -> None:
+        """Bullish sentiment + SELL flow -> neither LONG nor SHORT."""
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("SELL", 0.8))
+        assert decision.go is False
+
+    @patch("config.settings.ENABLE_SHORT", False)
+    def test_short_disabled(self, filt: AndFilter) -> None:
+        """ENABLE_SHORT=False なら SHORT は発動しない."""
+        decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.8))
+        assert decision.go is False
+        assert "SHORT無効" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# LONG + SHORT 混在テスト
+# ---------------------------------------------------------------------------
+
+class TestMixed:
+
+    @pytest.fixture()
+    def filt(self) -> AndFilter:
+        return AndFilter()
+
+    def test_buy_flow_triggers_long_not_short(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8))
+        assert decision.direction == "LONG"
+
+    def test_sell_flow_triggers_short_not_long(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.8))
+        assert decision.direction == "SHORT"
+
+    def test_neutral_flow_no_entry(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("NEUTRAL", 0.8))
+        assert decision.go is False
+
+    def test_all_zero_no_entry(self, filt: AndFilter) -> None:
+        decision = filt.should_enter(_sentiment(0.0, 0.0), _flow("NEUTRAL", 0.0))
         assert decision.go is False

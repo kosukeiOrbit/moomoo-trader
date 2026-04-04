@@ -40,33 +40,41 @@ class StopLossManager:
         symbol: str,
         entry_price: float,
         price_history: pd.DataFrame | None = None,
+        direction: str = "LONG",
     ) -> Levels:
         """ATRに基づきSL/TP/トレーリングストップを計算する.
+
+        LONG: SL = entry - ATR×1.5,  TP = entry + ATR×2.5
+        SHORT: SL = entry + ATR×1.5, TP = entry - ATR×2.5
 
         Args:
             symbol: 銘柄シンボル
             entry_price: エントリー価格
             price_history: 価格履歴DataFrame（high, low, close 列が必要）
+            direction: "LONG" or "SHORT"
 
         Returns:
             損切り・利確水準
         """
         atr_value = self._calculate_atr(price_history)
         if atr_value is None or atr_value == 0:
-            # ATR計算不可の場合はエントリー価格の2%をフォールバック
             atr_value = entry_price * 0.02
             logger.warning(
                 "ATR計算不可: %s デフォルト値を使用 (%.4f)", symbol, atr_value,
             )
 
-        sl = entry_price - (atr_value * settings.ATR_SL_MULTIPLIER)
-        tp = entry_price + (atr_value * settings.ATR_TP_MULTIPLIER)
-        # トレーリングストップはSLよりやや浅い（SLの80%）
-        trailing = entry_price - (atr_value * settings.ATR_SL_MULTIPLIER * 0.8)
+        if direction == "SHORT":
+            sl = entry_price + (atr_value * settings.ATR_SL_MULTIPLIER)
+            tp = entry_price - (atr_value * settings.ATR_TP_MULTIPLIER)
+            trailing = entry_price + (atr_value * settings.ATR_SL_MULTIPLIER * 0.8)
+        else:
+            sl = entry_price - (atr_value * settings.ATR_SL_MULTIPLIER)
+            tp = entry_price + (atr_value * settings.ATR_TP_MULTIPLIER)
+            trailing = entry_price - (atr_value * settings.ATR_SL_MULTIPLIER * 0.8)
 
         logger.info(
-            "SL/TP計算: %s entry=%.2f SL=%.2f TP=%.2f trailing=%.2f ATR=%.4f",
-            symbol, entry_price, sl, tp, trailing, atr_value,
+            "SL/TP計算: %s %s entry=%.2f SL=%.2f TP=%.2f trailing=%.2f ATR=%.4f",
+            symbol, direction, entry_price, sl, tp, trailing, atr_value,
         )
         return Levels(stop_loss=sl, take_profit=tp, trailing_stop=trailing)
 

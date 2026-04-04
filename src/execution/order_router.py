@@ -454,27 +454,44 @@ class OrderRouter:
                         logger.debug("[%s] monitor: price=0 (%.2fs)", pos.symbol, api_time)
                         continue
 
-                    sl_dist = (price - pos.levels.stop_loss) / pos.entry_price * 100
-                    tp_dist = (pos.levels.take_profit - price) / pos.entry_price * 100
+                    # SL/TP の距離計算（LONG: SL<price<TP, SHORT: TP<price<SL）
+                    if pos.direction == "SHORT":
+                        sl_dist = (pos.levels.stop_loss - price) / pos.entry_price * 100
+                        tp_dist = (price - pos.levels.take_profit) / pos.entry_price * 100
+                    else:
+                        sl_dist = (price - pos.levels.stop_loss) / pos.entry_price * 100
+                        tp_dist = (pos.levels.take_profit - price) / pos.entry_price * 100
+
                     if loop_count % 100 == 1 or sl_dist < 0.5 or tp_dist < 0.5:
                         logger.info(
-                            "[%s] monitor: price=$%.2f SL=$%.2f(%.1f%%) TP=$%.2f(%.1f%%) (%.2fs)",
-                            pos.symbol, price,
+                            "[%s] monitor(%s): price=$%.2f SL=$%.2f(%.1f%%) TP=$%.2f(%.1f%%) (%.2fs)",
+                            pos.symbol, pos.direction, price,
                             pos.levels.stop_loss, sl_dist,
                             pos.levels.take_profit, tp_dist,
                             api_time,
                         )
 
-                    if price <= pos.levels.stop_loss:
+                    # LONG: price <= SL → SL, price >= TP → TP
+                    # SHORT: price >= SL → SL, price <= TP → TP
+                    sl_hit = (
+                        price >= pos.levels.stop_loss if pos.direction == "SHORT"
+                        else price <= pos.levels.stop_loss
+                    )
+                    tp_hit = (
+                        price <= pos.levels.take_profit if pos.direction == "SHORT"
+                        else price >= pos.levels.take_profit
+                    )
+
+                    if sl_hit:
                         logger.warning(
-                            "SL HIT: %s price=$%.2f <= SL=$%.2f (entry=$%.2f)",
-                            pos.symbol, price, pos.levels.stop_loss, pos.entry_price,
+                            "SL HIT: %s %s price=$%.2f SL=$%.2f (entry=$%.2f)",
+                            pos.symbol, pos.direction, price, pos.levels.stop_loss, pos.entry_price,
                         )
                         await self.exit(order_id, "SL")
-                    elif price >= pos.levels.take_profit:
+                    elif tp_hit:
                         logger.info(
-                            "TP HIT: %s price=$%.2f >= TP=$%.2f (entry=$%.2f)",
-                            pos.symbol, price, pos.levels.take_profit, pos.entry_price,
+                            "TP HIT: %s %s price=$%.2f TP=$%.2f (entry=$%.2f)",
+                            pos.symbol, pos.direction, price, pos.levels.take_profit, pos.entry_price,
                         )
                         await self.exit(order_id, "TP")
                 except Exception:

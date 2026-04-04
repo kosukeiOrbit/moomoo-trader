@@ -53,9 +53,11 @@ WATCHLIST = [
 ]
 
 # --- シグナル閾値 ---
-SENTIMENT_THRESHOLD: float = 0.3      # センチメントスコアの最低閾値
+SENTIMENT_THRESHOLD: float = 0.3      # LONGセンチメントスコアの最低閾値
+SHORT_SENTIMENT_THRESHOLD: float = -0.3  # SHORTセンチメントスコアの閾値（これ以下で弱気）
 CONFIDENCE_MIN: float = 0.6           # LLMの確信度最低値
-FLOW_BUY_THRESHOLD: float = 0.65      # 大口買い比率の最低閾値
+FLOW_BUY_THRESHOLD: float = 0.65      # 大口買い/売り比率の最低閾値
+ENABLE_SHORT: bool = os.getenv("ENABLE_SHORT", "true").lower() == "true"  # 空売り戦略の有効化
 
 # --- リスク管理 ---
 MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
@@ -63,7 +65,7 @@ MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
 POSITION_MAX_PCT: float = float(os.getenv("POSITION_MAX_PCT", "0.02"))
 KELLY_FRACTION: float = 0.5           # ハーフケリー
 MIN_POSITION_SHARES: int = 1          # 最低保証株数（Kelly=0でもデータ蓄積用に発注）
-MAX_POSITIONS: int = 5                # 同時保有ポジション上限
+MAX_POSITIONS: int = 10                # 同時保有ポジション上限
 CONSECUTIVE_LOSS_LIMIT: int = 3       # 連続敗北でサイズ縮小
 
 # --- ストップロス ---
