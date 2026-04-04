@@ -57,7 +57,7 @@ SENTIMENT_THRESHOLD: float = 0.3      # LONGセンチメントスコアの最低
 SHORT_SENTIMENT_THRESHOLD: float = -0.3  # SHORTセンチメントスコアの閾値（これ以下で弱気）
 CONFIDENCE_MIN: float = 0.6           # LLMの確信度最低値
 FLOW_BUY_THRESHOLD: float = 0.65      # 大口買い/売り比率の最低閾値
-ENABLE_SHORT: bool = os.getenv("ENABLE_SHORT", "true").lower() == "true"  # 空売り戦略の有効化
+ENABLE_SHORT: bool = os.getenv("ENABLE_SHORT", "false").lower() == "true"  # 空売り戦略（信用口座への振替が必要）
 
 # --- リスク管理 ---
 MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
