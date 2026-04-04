@@ -133,8 +133,19 @@ async def main_loop() -> None:
 
     # --- モジュール初期化 ---
     client = MoomooClient()
-    client.connect()
-    client.subscribe_realtime(settings.WATCHLIST)
+    try:
+        client.connect()
+        client.subscribe_realtime(settings.WATCHLIST)
+    except (ConnectionError, Exception) as e:
+        logger.critical("OpenD 接続失敗: %s", e)
+        # Discord に通知して終了
+        try:
+            notifier = Notifier()
+            notifier.notify_circuit_breaker(f"Bot 起動失敗: OpenD に接続できません — {e}")
+        except Exception:
+            pass
+        logger.critical("=== Bot 起動失敗 — 終了 ===")
+        return
 
     board_scraper = BoardScraper()
     news_feed = NewsFeed()

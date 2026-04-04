@@ -113,8 +113,34 @@ class MoomooClient:
     # 接続・切断
     # ------------------------------------------------------------------
 
-    def connect(self) -> None:
-        """moomoo OpenD に接続する."""
+    def connect(self, timeout: float = 10.0) -> None:
+        """moomoo OpenD に接続する.
+
+        Args:
+            timeout: 接続タイムアウト（秒）
+
+        Raises:
+            ConnectionError: OpenD が起動していないか接続できない場合
+        """
+        import socket
+
+        # OpenD のポートに接続できるか事前チェック
+        logger.info(
+            "OpenD 接続チェック: %s:%d",
+            settings.MOOMOO_HOST, settings.MOOMOO_PORT,
+        )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            result = sock.connect_ex((settings.MOOMOO_HOST, settings.MOOMOO_PORT))
+            if result != 0:
+                raise ConnectionError(
+                    f"OpenD に接続できません ({settings.MOOMOO_HOST}:{settings.MOOMOO_PORT})。"
+                    f" OpenD が起動しているか確認してください。"
+                )
+        finally:
+            sock.close()
+
         self._trd_env = TrdEnv.SIMULATE if settings.TRADE_ENV == "SIMULATE" else TrdEnv.REAL
 
         self._quote_ctx = OpenQuoteContext(
