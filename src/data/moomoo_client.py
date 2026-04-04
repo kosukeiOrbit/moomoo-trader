@@ -401,6 +401,61 @@ class MoomooClient:
         return str(data.iloc[0].get("order_status", "UNKNOWN"))
 
     # ------------------------------------------------------------------
+    # 信用取引（空売り）情報
+    # ------------------------------------------------------------------
+
+    def get_margin_balance(self) -> dict[str, float]:
+        """信用口座の残高・空売り余力を返す.
+
+        Returns:
+            {"power": float, "max_power_short": float, "cash": float, ...}
+        """
+        assert self._trade_ctx is not None
+        ret, data = self._trade_ctx.accinfo_query(
+            trd_env=self._trd_env, currency="USD",
+        )
+        if ret != RET_OK or data.empty:
+            logger.warning("信用口座残高取得失敗")
+            return {"power": 0.0, "max_power_short": 0.0, "cash": 0.0}
+        row = data.iloc[0]
+        return {
+            "power": float(row.get("power", 0) or 0),
+            "max_power_short": float(row.get("max_power_short", 0) or 0),
+            "cash": float(row.get("cash", 0) or 0),
+            "total_assets": float(row.get("total_assets", 0) or 0),
+            "market_val": float(row.get("market_val", 0) or 0),
+        }
+
+    def get_max_short_qty(self, symbol: str, price: float) -> int:
+        """銘柄ごとの空売り可能株数を返す.
+
+        Args:
+            symbol: 銘柄シンボル
+            price: 現在の株価
+
+        Returns:
+            空売り可能株数（取得失敗時は0）
+        """
+        assert self._trade_ctx is not None
+        code = f"US.{symbol}"
+        try:
+            ret, data = self._trade_ctx.acctradinginfo_query(
+                order_type=OrderType.MARKET,
+                code=code,
+                price=price,
+                trd_env=self._trd_env,
+            )
+            if ret != RET_OK or data.empty:
+                logger.debug("空売り可能株数取得失敗: %s", symbol)
+                return 0
+            max_sell_short = int(data.iloc[0].get("max_sell_short", 0) or 0)
+            logger.info("[%s] 空売り可能株数: %d", symbol, max_sell_short)
+            return max_sell_short
+        except Exception:
+            logger.exception("空売り可能株数取得エラー: %s", symbol)
+            return 0
+
+    # ------------------------------------------------------------------
     # 発注
     # ------------------------------------------------------------------
 

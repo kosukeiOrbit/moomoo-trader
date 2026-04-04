@@ -81,6 +81,7 @@ class TestLong:
 # SHORT テスト
 # ---------------------------------------------------------------------------
 
+@patch("config.settings.ENABLE_SHORT", True)
 class TestShort:
 
     @pytest.fixture()
@@ -125,18 +126,25 @@ class TestShort:
         decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("SELL", 0.8))
         assert decision.go is False
 
-    @patch("config.settings.ENABLE_SHORT", False)
-    def test_short_disabled(self, filt: AndFilter) -> None:
-        """ENABLE_SHORT=False なら SHORT は発動しない."""
-        decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.8))
-        assert decision.go is False
-        assert "SHORT無効" in decision.reason
+
+# ---------------------------------------------------------------------------
+# SHORT 無効テスト（クラス外）
+# ---------------------------------------------------------------------------
+
+@patch("config.settings.ENABLE_SHORT", False)
+def test_short_disabled() -> None:
+    """ENABLE_SHORT=False なら SHORT は発動しない."""
+    filt = AndFilter()
+    decision = filt.should_enter(_sentiment(-0.5, 0.8), _flow("SELL", 0.8))
+    assert decision.go is False
+    assert "SHORT無効" in decision.reason
 
 
 # ---------------------------------------------------------------------------
 # LONG + SHORT 混在テスト
 # ---------------------------------------------------------------------------
 
+@patch("config.settings.ENABLE_SHORT", True)
 class TestMixed:
 
     @pytest.fixture()
