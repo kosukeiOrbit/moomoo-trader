@@ -66,6 +66,7 @@ POSITION_MAX_PCT: float = float(os.getenv("POSITION_MAX_PCT", "0.02"))
 KELLY_FRACTION: float = 0.5           # ハーフケリー
 MIN_POSITION_SHARES: int = 1          # 最低保証株数（Kelly=0でもデータ蓄積用に発注）
 MAX_POSITIONS: int = 10                # 同時保有ポジション上限
+MIN_BUYING_POWER: float = float(os.getenv("MIN_BUYING_POWER", "150"))  # これ以下ならスキャンスキップ
 CONSECUTIVE_LOSS_LIMIT: int = 3       # 連続敗北でサイズ縮小
 
 # --- ストップロス ---

@@ -282,12 +282,15 @@ async def main_loop() -> None:
                 "--- scan start (positions=%d, assets=$%.0f, power=$%.0f, daily_pnl=$%.2f) ---",
                 order_router.position_count, total_assets, buying_power, pnl_tracker.daily_pnl,
             )
-            # MAX_POSITIONS に達していたらスキャン自体をスキップ
+            # MAX_POSITIONS or 買付余力不足ならスキャンをスキップ
+            skip_reason = None
             if order_router.position_count >= settings.MAX_POSITIONS:
-                logger.info(
-                    "MAX_POSITIONS(%d) reached — scan skipped (saving API cost)",
-                    settings.MAX_POSITIONS,
-                )
+                skip_reason = f"MAX_POSITIONS({settings.MAX_POSITIONS}) reached"
+            elif buying_power < settings.MIN_BUYING_POWER:
+                skip_reason = f"Insufficient buying power (${buying_power:.0f} < ${settings.MIN_BUYING_POWER})"
+
+            if skip_reason:
+                logger.info("%s — scan skipped (saving API cost)", skip_reason)
                 logger.info("--- scan end (0.0s) --- next in %ds", settings.LOOP_INTERVAL_SECONDS)
                 logger.info("=== loop #%d end === sleeping %ds", _loop_count, settings.LOOP_INTERVAL_SECONDS)
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
