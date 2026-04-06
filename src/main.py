@@ -183,8 +183,10 @@ async def main_loop() -> None:
         for order_id, pos in order_router.open_positions.items():
             if pos.levels is None:
                 try:
+                    kline = client.get_kline(pos.symbol)
                     levels = stop_loss_manager.calculate_levels(
-                        pos.symbol, pos.entry_price, direction=pos.direction,
+                        pos.symbol, pos.entry_price,
+                        price_history=kline, direction=pos.direction,
                     )
                     pos.levels = levels
                     logger.info(
@@ -243,14 +245,18 @@ async def main_loop() -> None:
                 continue
 
             # --- 口座状態を取得してサーキットブレーカーチェック ---
-            logger.debug("get_account_balance() 呼び出し")
             _t = _time.monotonic()
-            balance = client.get_account_balance() or 100_000.0
-            logger.info("get_account_balance(): $%.2f (%.2fs)", balance, _time.monotonic() - _t)
-            pnl_tracker.update_peak_balance(balance)
+            buying_power = client.get_account_balance() or 100_000.0
+            total_assets = client.get_total_assets() or buying_power
+            logger.info(
+                "Account: buying_power=$%.2f total_assets=$%.2f (%.2fs)",
+                buying_power, total_assets, _time.monotonic() - _t,
+            )
+            # ドローダウン計算には総資産、ポジションサイズには買付余力を使う
+            pnl_tracker.update_peak_balance(total_assets)
 
             account_state = AccountState(
-                balance=balance,
+                balance=total_assets,  # サーキットブレーカーは総資産で判定
                 daily_pnl=pnl_tracker.daily_pnl,
                 peak_balance=pnl_tracker.peak_balance,
                 consecutive_losses=position_sizer.consecutive_losses,
@@ -273,8 +279,8 @@ async def main_loop() -> None:
 
             # --- 銘柄ごとのスキャンループ ---
             logger.info(
-                "--- scan start (positions=%d, balance=$%.0f, daily_pnl=$%.2f) ---",
-                order_router.position_count, balance, pnl_tracker.daily_pnl,
+                "--- scan start (positions=%d, assets=$%.0f, power=$%.0f, daily_pnl=$%.2f) ---",
+                order_router.position_count, total_assets, buying_power, pnl_tracker.daily_pnl,
             )
             # MAX_POSITIONS に達していたらスキャン自体をスキップ
             if order_router.position_count >= settings.MAX_POSITIONS:
@@ -346,10 +352,12 @@ async def main_loop() -> None:
                             continue
 
                         size = position_sizer.calculate(
-                            symbol, current_price, account_state.balance,
+                            symbol, current_price, buying_power,
                         )
+                        kline = client.get_kline(symbol)
                         levels = stop_loss_manager.calculate_levels(
-                            symbol, current_price, direction=decision.direction,
+                            symbol, current_price,
+                            price_history=kline, direction=decision.direction,
                         )
                         result = await order_router.enter(
                             decision, symbol, size, current_price, levels,

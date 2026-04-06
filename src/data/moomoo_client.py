@@ -233,6 +233,39 @@ class MoomooClient:
         )
 
     # ------------------------------------------------------------------
+    # K線データ（ATR 計算用）
+    # ------------------------------------------------------------------
+
+    def get_kline(self, symbol: str, num: int = 30, ktype: str = "K_DAY") -> "pd.DataFrame | None":
+        """直近N本のK線データを取得する.
+
+        Args:
+            symbol: 銘柄シンボル
+            num: 取得本数（デフォルト30）
+            ktype: K線タイプ（"K_DAY", "K_60M" 等）
+
+        Returns:
+            high, low, close 列を含む DataFrame（取得失敗時は None）
+        """
+        import pandas as pd
+        assert self._quote_ctx is not None
+        code = f"US.{symbol}"
+        try:
+            ret, data = self._quote_ctx.get_cur_kline(code, num, ktype=ktype)
+            if ret != RET_OK or data.empty:
+                logger.debug("K線データ取得失敗: %s (ret=%s)", symbol, ret)
+                return None
+            # high, low, close 列があることを確認
+            required = {"high", "low", "close"}
+            if not required.issubset(data.columns):
+                logger.debug("K線データに必要な列がありません: %s", symbol)
+                return None
+            return data[["high", "low", "close"]].copy()
+        except Exception:
+            logger.exception("K線データ取得エラー: %s", symbol)
+            return None
+
+    # ------------------------------------------------------------------
     # 大口フロー (get_capital_flow — 分足時系列)
     # ------------------------------------------------------------------
 
@@ -340,7 +373,29 @@ class MoomooClient:
     # ------------------------------------------------------------------
 
     def get_account_balance(self) -> float:
-        """口座の現金余力（buying power）を取得する."""
+        """口座の現金余力（buying power）を取得する.
+
+        ポジションサイズ計算に使用。ポジション評価額を含まない。
+        """
+        info = self._query_account_info()
+        power = float(info.get("power", 0) or 0)
+        if power > 0:
+            return power
+        cash = float(info.get("cash", 0) or 0)
+        if cash > 0:
+            return cash
+        return float(info.get("total_assets", 0) or 0)
+
+    def get_total_assets(self) -> float:
+        """口座の総資産（現金 + ポジション評価額）を取得する.
+
+        ドローダウン計算に使用。
+        """
+        info = self._query_account_info()
+        return float(info.get("total_assets", 0) or 0)
+
+    def _query_account_info(self) -> dict:
+        """accinfo_query の結果を dict で返す."""
         assert self._trade_ctx is not None
         ret, data = self._trade_ctx.accinfo_query(
             trd_env=self._trd_env,
@@ -348,16 +403,8 @@ class MoomooClient:
         )
         if ret != RET_OK or data.empty:
             logger.warning("口座残高取得失敗")
-            return 0.0
-        # power (buying power) > cash > total_assets の優先順で取得
-        row = data.iloc[0]
-        power = float(row.get("power", 0) or 0)
-        if power > 0:
-            return power
-        cash = float(row.get("cash", 0) or 0)
-        if cash > 0:
-            return cash
-        return float(row.get("total_assets", 0) or 0)
+            return {}
+        return dict(data.iloc[0])
 
     # ------------------------------------------------------------------
     # ポジション照会
