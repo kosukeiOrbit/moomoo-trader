@@ -74,6 +74,9 @@ ATR_SL_MULTIPLIER: float = 1.5        # SL = ATR × 1.5
 ATR_TP_MULTIPLIER: float = 2.5        # TP = ATR × 2.5
 VWAP_DEVIATION_EXIT: float = 0.02     # VWAP乖離2%で撤退
 
+# --- 寄り付きスキップ ---
+MARKET_OPEN_SKIP_MINUTES: int = int(os.getenv("MARKET_OPEN_SKIP_MINUTES", "30"))  # 寄り付き後この分数はエントリーをスキップ（0で無効）
+
 # --- メインループ ---
 LOOP_INTERVAL_SECONDS: int = 30
 

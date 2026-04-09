@@ -14,7 +14,7 @@ import os
 import signal
 import sys
 import time as _time
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -94,6 +94,17 @@ def market_is_open() -> bool:
     if now.weekday() >= 5:
         return False
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
+
+
+def is_market_open_skip() -> bool:
+    """寄り付き後のスキップ期間中かどうか."""
+    skip_min = settings.MARKET_OPEN_SKIP_MINUTES
+    if skip_min <= 0:
+        return False
+    now_et = datetime.now(ET)
+    market_open_dt = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    skip_until = market_open_dt + timedelta(minutes=skip_min)
+    return market_open_dt <= now_et < skip_until
 
 
 def should_force_exit() -> bool:
@@ -282,9 +293,18 @@ async def main_loop() -> None:
                 "--- scan start (positions=%d, assets=$%.0f, power=$%.0f, daily_pnl=$%.2f) ---",
                 order_router.position_count, total_assets, buying_power, pnl_tracker.daily_pnl,
             )
-            # MAX_POSITIONS or 買付余力不足ならスキャンをスキップ
+            # スキャンスキップ判定
             skip_reason = None
-            if order_router.position_count >= settings.MAX_POSITIONS:
+            if is_market_open_skip():
+                now_et = datetime.now(ET)
+                skip_until = now_et.replace(hour=9, minute=30, second=0) + timedelta(
+                    minutes=settings.MARKET_OPEN_SKIP_MINUTES,
+                )
+                skip_reason = (
+                    f"Opening skip: {settings.MARKET_OPEN_SKIP_MINUTES}min "
+                    f"(until ET {skip_until.strftime('%H:%M')})"
+                )
+            elif order_router.position_count >= settings.MAX_POSITIONS:
                 skip_reason = f"MAX_POSITIONS({settings.MAX_POSITIONS}) reached"
             elif buying_power < settings.MIN_BUYING_POWER:
                 skip_reason = f"Insufficient buying power (${buying_power:.0f} < ${settings.MIN_BUYING_POWER})"
