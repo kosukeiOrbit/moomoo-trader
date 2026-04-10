@@ -82,8 +82,9 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
         from finviz.screener import Screener
 
         filters = [
-            "sh_relvol_o2",     # 相対出来高 2倍以上
-            "cap_largeover",    # 大型株（NASDAQ + NYSE）
+            "sh_avgvol_o500",   # 平均出来高50万株以上（流動性確保）
+            "cap_midover",      # 中型株以上（時価総額$2B以上）
+            "sh_price_o10",     # 株価$10以上（低価格株除外）
         ]
         stocks = Screener(
             filters=filters,
