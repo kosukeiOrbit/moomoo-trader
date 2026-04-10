@@ -47,6 +47,7 @@ class PnLTracker:
     def __init__(self, csv_dir: Path | str | None = None) -> None:
         self._open_trades: dict[str, TradeRecord] = {}
         self._closed_trades: list[TradeRecord] = []
+        self._closed_ids: set[str] = set()  # 決済済み order_id（重複決済防止）
         self._daily_pnl: float = 0.0
         self._peak_balance: float = 0.0
         self._csv_dir = Path(csv_dir) if csv_dir else DEFAULT_CSV_DIR
@@ -63,7 +64,13 @@ class PnLTracker:
         size: int,
         entry_price: float,
     ) -> None:
-        """新規トレードを記録する."""
+        """新規トレードを記録する（重複登録は無視）."""
+        if order_id in self._open_trades:
+            logger.debug("トレード登録スキップ（既にオープン中）: %s", order_id)
+            return
+        if order_id in self._closed_ids:
+            logger.debug("トレード登録スキップ（決済済み）: %s", order_id)
+            return
         self._open_trades[order_id] = TradeRecord(
             order_id=order_id,
             symbol=symbol,
@@ -92,6 +99,11 @@ class PnLTracker:
         Returns:
             損益
         """
+        # 重複決済防止
+        if order_id in self._closed_ids:
+            logger.warning("重複決済スキップ（既に決済済み）: %s", order_id)
+            return 0.0
+
         trade = self._open_trades.pop(order_id, None)
         if trade is None:
             logger.warning("オープントレードが見つかりません: %s", order_id)
@@ -107,6 +119,7 @@ class PnLTracker:
         trade.reason = reason
         trade.closed_at = datetime.now()
         self._closed_trades.append(trade)
+        self._closed_ids.add(order_id)
         self._daily_pnl += pnl
 
         logger.info(

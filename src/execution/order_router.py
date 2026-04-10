@@ -82,14 +82,19 @@ class OrderRouter:
         )
 
     def recover_positions(self) -> int:
-        """moomoo の既存ポジションを内部 dict に復元する."""
+        """moomoo の既存ポジションを内部 dict に復元する.
+
+        position_id を使って一意に識別し、再起動時の重複復元を防ぐ。
+        """
         positions = self._client.get_positions()
         count = 0
         for symbol, info in positions.items():
             qty = int(info["qty"])
             if qty <= 0:
                 continue
-            order_id = f"RECOVERED-{symbol}"
+            # position_id があればそれを使い、なければ symbol ベース
+            pos_id = info.get("position_id", "")
+            order_id = f"POS-{pos_id}" if pos_id else f"RECOVERED-{symbol}"
             if order_id in self._positions:
                 continue
             cost_price = info["cost_price"]

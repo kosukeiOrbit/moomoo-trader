@@ -429,6 +429,7 @@ class MoomooClient:
                 "cost_price": float(row["cost_price"]),
                 "market_val": float(row.get("market_val", 0)),
                 "pl_val": float(row.get("pl_val", 0)),
+                "position_id": str(row.get("position_id", "")),
             }
         return result
 
