@@ -354,6 +354,16 @@ async def main_loop() -> None:
                         )
                         continue
 
+                    # 買付余力で買えない銘柄はAPIスキップ
+                    snap = client.get_snapshot(symbol)
+                    if snap.last_price > 0 and snap.last_price > buying_power:
+                        logger.info(
+                            "[%s] flow=%s(%.2f) price=$%.0f > power=$%.0f -> SKIP(can't afford)",
+                            symbol, flow.direction, flow.strength,
+                            snap.last_price, buying_power,
+                        )
+                        continue
+
                     # 3) テキスト収集
                     posts = await board_scraper.fetch_posts(symbol)
                     news_articles = await news_feed.get_latest(symbol)
