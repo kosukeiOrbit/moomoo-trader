@@ -124,11 +124,12 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
             except Exception:
                 logger.warning("[Screener] Finviz %s 取得失敗", sector)
 
-        # 重複除去（出来高順を維持）
+        # 重複除去 + 固定WATCHLIST除外（出来高順を維持）
+        fixed = set(settings.WATCHLIST)
         seen: set[str] = set()
         candidates: list[str] = []
         for t in all_tickers:
-            if t not in seen:
+            if t not in seen and t not in fixed:
                 seen.add(t)
                 candidates.append(t)
 
