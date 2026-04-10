@@ -340,6 +340,14 @@ async def main_loop() -> None:
                         )
                         continue
 
+                    # flow.strength が閾値未満ならAPIスキップ
+                    if flow.strength <= settings.FLOW_BUY_THRESHOLD:
+                        logger.info(
+                            "[%s] flow=%s(%.2f) -> SKIP(strength too low, API skipped)",
+                            symbol, flow.direction, flow.strength,
+                        )
+                        continue
+
                     # 3) テキスト収集
                     posts = await board_scraper.fetch_posts(symbol)
                     news_articles = await news_feed.get_latest(symbol)

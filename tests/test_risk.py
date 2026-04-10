@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from config import settings
 from src.risk.position_sizer import PositionSizer, TradeResult
 from src.risk.stop_loss import StopLossManager, Levels
 from src.risk.circuit_breaker import (
@@ -201,8 +202,8 @@ class TestStopLossManagerLevels:
         mgr = StopLossManager()
         levels = mgr.calculate_levels("AAPL", 150.0)
         # ATR = 150 * 0.02 = 3.0
-        assert levels.stop_loss == pytest.approx(150.0 - 3.0 * 1.5)
-        assert levels.take_profit == pytest.approx(150.0 + 3.0 * 2.5)
+        assert levels.stop_loss == pytest.approx(150.0 - 3.0 * settings.ATR_SL_MULTIPLIER)
+        assert levels.take_profit == pytest.approx(150.0 + 3.0 * settings.ATR_TP_MULTIPLIER)
 
     def test_with_price_history(self) -> None:
         """実際の価格データからATRを計算する."""
@@ -232,20 +233,21 @@ class TestStopLossManagerLevels:
         assert levels.stop_loss < levels.trailing_stop < 200.0
 
     def test_risk_reward_ratio(self) -> None:
-        """リスクリワード比が約 1:1.67."""
+        """リスクリワード比が設定値通り."""
         mgr = StopLossManager()
         levels = mgr.calculate_levels("AAPL", 150.0)
         risk = 150.0 - levels.stop_loss
         reward = levels.take_profit - 150.0
         ratio = reward / risk
-        assert ratio == pytest.approx(2.5 / 1.5, abs=0.01)
+        expected = settings.ATR_TP_MULTIPLIER / settings.ATR_SL_MULTIPLIER
+        assert ratio == pytest.approx(expected, abs=0.01)
 
     def test_short_price_history_uses_default(self) -> None:
         """14本未満のデータではフォールバック."""
         mgr = StopLossManager()
         df = _make_price_history(n=5)
         levels = mgr.calculate_levels("AAPL", 150.0, df)
-        assert levels.stop_loss == pytest.approx(150.0 - 3.0 * 1.5)
+        assert levels.stop_loss == pytest.approx(150.0 - 3.0 * settings.ATR_SL_MULTIPLIER)
 
 
 class TestStopLossManagerATR:

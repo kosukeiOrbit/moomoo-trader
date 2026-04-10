@@ -26,7 +26,7 @@ YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
 # 記事の鮮度フィルター（直近N分）
-MAX_AGE_MINUTES = 30
+MAX_AGE_MINUTES = 15
 
 # Google News のフェッチ間隔（秒）— レート制限対策
 GOOGLE_FETCH_INTERVAL = 60.0
