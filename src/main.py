@@ -158,6 +158,25 @@ async def main_loop() -> None:
         logger.critical("=== Bot 起動失敗 — 終了 ===")
         return
 
+    # --- 動的スクリーニング ---
+    watchlist = list(settings.WATCHLIST)  # コピー
+    if settings.SCREENER_ENABLED:
+        try:
+            from src.data.screener import StockScreener
+            screener = StockScreener(client)
+            dynamic_symbols = screener.get_top_symbols()
+            new_symbols = [s for s in dynamic_symbols if s not in watchlist]
+            watchlist = list(dict.fromkeys(watchlist + dynamic_symbols))
+            # 動的追加分も購読
+            if new_symbols:
+                client.subscribe_realtime(new_symbols)
+            logger.info(
+                "WATCHLIST: %d symbols (fixed=%d + dynamic=%d)",
+                len(watchlist), len(settings.WATCHLIST), len(new_symbols),
+            )
+        except Exception:
+            logger.exception("[Screener] Failed — using fixed WATCHLIST only")
+
     board_scraper = BoardScraper()
     news_feed = NewsFeed()
     sentiment_analyzer = SentimentAnalyzer()
@@ -217,7 +236,7 @@ async def main_loop() -> None:
 
     logger.info(
         "=== moomoo AI Daytrade Bot 起動 (env=%s, symbols=%s, recovered=%d) ===",
-        settings.TRADE_ENV, settings.WATCHLIST, recovered,
+        settings.TRADE_ENV, watchlist, recovered,
     )
 
     try:
@@ -319,7 +338,7 @@ async def main_loop() -> None:
 
             existing_symbols = {p.symbol for p in order_router.open_positions.values()}
 
-            for symbol in settings.WATCHLIST:
+            for symbol in watchlist:
                 if _shutdown_requested:
                     break
                 try:

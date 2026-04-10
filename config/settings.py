@@ -74,6 +74,11 @@ ATR_SL_MULTIPLIER: float = 1.0        # SL = ATR × 1.0
 ATR_TP_MULTIPLIER: float = 1.5        # TP = ATR × 1.5（R:R = 1:1.5）
 VWAP_DEVIATION_EXIT: float = 0.02     # VWAP乖離2%で撤退
 
+# --- 動的スクリーニング ---
+SCREENER_ENABLED: bool = os.getenv("SCREENER_ENABLED", "true").lower() == "true"
+SCREENER_MAX_SYMBOLS: int = int(os.getenv("SCREENER_MAX_SYMBOLS", "10"))
+SCREENER_CANDIDATES: int = int(os.getenv("SCREENER_CANDIDATES", "50"))
+
 # --- 寄り付きスキップ ---
 MARKET_OPEN_SKIP_MINUTES: int = int(os.getenv("MARKET_OPEN_SKIP_MINUTES", "30"))  # 寄り付き後この分数はエントリーをスキップ（0で無効）
 
