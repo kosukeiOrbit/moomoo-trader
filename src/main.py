@@ -317,10 +317,16 @@ async def main_loop() -> None:
                 logger.info("=== loop #%d wake ===", _loop_count)
                 continue
 
+            existing_symbols = {p.symbol for p in order_router.open_positions.values()}
+
             for symbol in settings.WATCHLIST:
                 if _shutdown_requested:
                     break
                 try:
+                    # 0) 既存ポジションがある銘柄はスキップ
+                    if symbol in existing_symbols:
+                        continue
+
                     # 1) フロー先行取得（API不要・低コスト）
                     flow = flow_detector.get_flow_signal(symbol)
 
