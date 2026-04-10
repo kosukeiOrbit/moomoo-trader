@@ -54,3 +54,4 @@ moomoo_OpenD_*/
 
 # Trade data
 data/trades/
+data/watchlist_dynamic.json

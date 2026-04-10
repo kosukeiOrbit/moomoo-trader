@@ -219,6 +219,22 @@ Register-MoomooTask `
     -WorkingDirectory $ProjectRoot
 
 # ---------------------------------------------------------------------------
+# Task 4: Screener (Tue-Sat, after market close)
+# ---------------------------------------------------------------------------
+
+$ScreenerTime = "06:30"  # JST: after Stop (05:10) and before next Open (22:10)
+$ScreenerPy = Join-Path $ProjectRoot "scripts\screener.py"
+
+Register-MoomooTask `
+    -TaskName "MoomooTrader-Screener" `
+    -Description "Run daily stock screener (Tue-Sat $ScreenerTime JST)" `
+    -Time $ScreenerTime `
+    -DaysOfWeek @("Tuesday","Wednesday","Thursday","Friday","Saturday") `
+    -Execute $PythonExe `
+    -Arguments $ScreenerPy `
+    -WorkingDirectory $ProjectRoot
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -227,9 +243,10 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " Registration complete" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  $OpenDTime  MoomooTrader-OpenD   Start OpenD.exe      (Mon-Fri)"
-Write-Host "  $BotTime  MoomooTrader-Bot     Start python main.py (Mon-Fri)"
-Write-Host "  $StopTime  MoomooTrader-Stop    Stop Bot + OpenD     (Tue-Sat)"
+Write-Host "  $OpenDTime  MoomooTrader-OpenD     Start OpenD.exe        (Mon-Fri)"
+Write-Host "  $BotTime  MoomooTrader-Bot       Start python main.py  (Mon-Fri)"
+Write-Host "  $StopTime  MoomooTrader-Stop      Stop Bot + OpenD      (Tue-Sat)"
+Write-Host "  $ScreenerTime  MoomooTrader-Screener  Daily stock screener  (Tue-Sat)"
 Write-Host ""
 Write-Host "  Current: DST (summer time) schedule" -ForegroundColor Cyan
 Write-Host "  When EST resumes (Nov): change to 23:10 / 23:15 / 06:10"

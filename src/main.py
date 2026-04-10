@@ -162,12 +162,10 @@ async def main_loop() -> None:
     watchlist = list(settings.WATCHLIST)  # コピー
     if settings.SCREENER_ENABLED:
         try:
-            from src.data.screener import StockScreener
-            screener = StockScreener(client)
-            dynamic_symbols = screener.get_top_symbols()
+            from src.data.screener import get_dynamic_symbols
+            dynamic_symbols = get_dynamic_symbols()
             new_symbols = [s for s in dynamic_symbols if s not in watchlist]
             watchlist = list(dict.fromkeys(watchlist + dynamic_symbols))
-            # 動的追加分も購読
             if new_symbols:
                 client.subscribe_realtime(new_symbols)
             logger.info(
