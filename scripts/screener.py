@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(_project_root) / "data"
 OUTPUT_PATH = DATA_DIR / "watchlist_dynamic.json"
 
+# 除外リスト（投機的・問題のある銘柄）
+EXCLUDE_SYMBOLS = {"RGTI", "VALE"}
+
 
 def get_previous_trading_day() -> date:
     """前営業日を返す（NYSE休場日・土日を考慮）."""
@@ -85,14 +88,16 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
             "sh_avgvol_o500",   # 平均出来高50万株以上（流動性確保）
             "cap_midover",      # 中型株以上（時価総額$2B以上）
             "sh_price_o10",     # 株価$10以上（低価格株除外）
+            "geo_usa",          # 米国籍企業のみ（外国株ADR除外）
+            "idx_sp500",        # S&P500構成銘柄
         ]
         stocks = Screener(
             filters=filters,
             table="Overview",
             order="-volume",
         )
-        candidates = [s["Ticker"] for s in stocks[:n]]
-        logger.info("[Screener] Finviz: %d銘柄取得", len(candidates))
+        candidates = [s["Ticker"] for s in stocks[:n] if s["Ticker"] not in EXCLUDE_SYMBOLS]
+        logger.info("[Screener] Finviz: %d銘柄取得 (除外%d)", len(candidates), n - len(candidates))
         return candidates
 
     except ImportError:
