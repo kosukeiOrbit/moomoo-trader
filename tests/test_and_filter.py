@@ -19,7 +19,7 @@ from src.signals.flow_detector import FlowSignal
 # ヘルパー
 # ---------------------------------------------------------------------------
 
-def _sentiment(score: float = 0.5, confidence: float = 0.8) -> SentimentResult:
+def _sentiment(score: float = 0.75, confidence: float = 0.85) -> SentimentResult:
     return SentimentResult(score=score, confidence=confidence, reasoning="test")
 
 def _flow(direction: str = "BUY", strength: float = 0.8, short_squeeze: bool = False) -> FlowSignal:
@@ -37,7 +37,7 @@ class TestLong:
         return AndFilter()
 
     def test_all_conditions_met(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("BUY", 0.8))
         assert decision.go is True
         assert decision.direction == "LONG"
 
@@ -46,7 +46,7 @@ class TestLong:
         assert "Bullish" in decision.reason
 
     def test_short_squeeze_in_reason(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8, short_squeeze=True))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("BUY", 0.8, short_squeeze=True))
         assert "ショートスクイーズ" in decision.reason
 
     def test_sentiment_low_fails(self, filt: AndFilter) -> None:
@@ -54,25 +54,25 @@ class TestLong:
         assert decision.go is False
 
     def test_confidence_low_fails(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.3), _flow("BUY", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.3), _flow("BUY", 0.8))
         assert decision.go is False
         assert "確信度不足" in decision.reason
 
     def test_flow_strength_low_fails(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.3))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("BUY", 0.3))
         assert decision.go is False
         assert "フロー強度不足" in decision.reason
 
     def test_score_at_threshold_fails(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.3, 0.8), _flow("BUY", 0.8))
+        decision = filt.should_enter(_sentiment(0.6, 0.85), _flow("BUY", 0.8))
         assert decision.go is False
 
     def test_score_above_threshold_passes(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.31, 0.8), _flow("BUY", 0.8))
+        decision = filt.should_enter(_sentiment(0.61, 0.85), _flow("BUY", 0.8))
         assert decision.go is True
 
     def test_neutral_flow_fails(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("NEUTRAL", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("NEUTRAL", 0.8))
         assert decision.go is False
         assert "フロー方向不一致" in decision.reason
 
@@ -123,7 +123,7 @@ class TestShort:
 
     def test_bullish_sentiment_sell_flow_no_short(self, filt: AndFilter) -> None:
         """Bullish sentiment + SELL flow -> neither LONG nor SHORT."""
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("SELL", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("SELL", 0.8))
         assert decision.go is False
 
 
@@ -152,7 +152,7 @@ class TestMixed:
         return AndFilter()
 
     def test_buy_flow_triggers_long_not_short(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("BUY", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("BUY", 0.8))
         assert decision.direction == "LONG"
 
     def test_sell_flow_triggers_short_not_long(self, filt: AndFilter) -> None:
@@ -160,7 +160,7 @@ class TestMixed:
         assert decision.direction == "SHORT"
 
     def test_neutral_flow_no_entry(self, filt: AndFilter) -> None:
-        decision = filt.should_enter(_sentiment(0.5, 0.8), _flow("NEUTRAL", 0.8))
+        decision = filt.should_enter(_sentiment(0.75, 0.85), _flow("NEUTRAL", 0.8))
         assert decision.go is False
 
     def test_all_zero_no_entry(self, filt: AndFilter) -> None:
