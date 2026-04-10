@@ -83,8 +83,7 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
 
         filters = [
             "sh_relvol_o2",     # 相対出来高 2倍以上
-            "cap_largeover",    # 大型株
-            "exch_nasd",        # NASDAQ上場
+            "cap_largeover",    # 大型株（NASDAQ + NYSE）
         ]
         stocks = Screener(
             filters=filters,
