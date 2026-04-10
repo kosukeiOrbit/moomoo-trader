@@ -48,8 +48,22 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(_project_root) / "data"
 OUTPUT_PATH = DATA_DIR / "watchlist_dynamic.json"
 
-# 除外リスト（投機的・問題のある銘柄）
-EXCLUDE_SYMBOLS = {"RGTI", "VALE"}
+# 除外リスト（低ボラ・AI無関係・投機的銘柄）
+EXCLUDE_SYMBOLS = {
+    "RGTI", "VALE",
+    "T", "VZ",       # 低ボラ通信株
+    "WMT", "KO", "PG",  # 超低ボラ生活必需品
+    "JNJ",            # 低ボラヘルスケア
+    "SLB",            # エネルギーサービス
+}
+
+# スクリーニング対象セクター（Finviz フィルタキー）
+TARGET_SECTORS = [
+    "sec_technology",
+    "sec_communicationservices",
+    "sec_healthcare",
+    "sec_financial",
+]
 
 
 def get_previous_trading_day() -> date:
@@ -80,24 +94,46 @@ def get_previous_trading_day() -> date:
 
 
 def fetch_finviz_candidates(n: int = 50) -> list[str]:
-    """Finviz で出来高急増の大型株を取得する."""
+    """Finviz で S&P500 の対象セクターから出来高順に候補を取得する.
+
+    テクノロジー・通信・ヘルスケア・金融の4セクターを個別にフェッチし、
+    出来高順で統合して上位N件を返す。
+    """
     try:
         from finviz.screener import Screener
 
-        filters = [
-            "sh_avgvol_o500",   # 平均出来高50万株以上（流動性確保）
-            "cap_midover",      # 中型株以上（時価総額$2B以上）
-            "sh_price_o10",     # 株価$10以上（低価格株除外）
-            "geo_usa",          # 米国籍企業のみ（外国株ADR除外）
+        base_filters = [
+            "sh_avgvol_o500",   # 平均出来高50万株以上
+            "cap_midover",      # 中型株以上
+            "sh_price_o10",     # 株価$10以上
+            "geo_usa",          # 米国籍企業のみ
             "idx_sp500",        # S&P500構成銘柄
         ]
-        stocks = Screener(
-            filters=filters,
-            table="Overview",
-            order="-volume",
-        )
-        candidates = [s["Ticker"] for s in stocks[:n] if s["Ticker"] not in EXCLUDE_SYMBOLS]
-        logger.info("[Screener] Finviz: %d銘柄取得 (除外%d)", len(candidates), n - len(candidates))
+
+        all_tickers: list[str] = []
+        for sector in TARGET_SECTORS:
+            try:
+                stocks = Screener(
+                    filters=base_filters + [sector],
+                    table="Overview",
+                    order="-volume",
+                )
+                tickers = [s["Ticker"] for s in stocks if s["Ticker"] not in EXCLUDE_SYMBOLS]
+                logger.info("[Screener] Finviz %s: %d銘柄", sector, len(tickers))
+                all_tickers.extend(tickers)
+            except Exception:
+                logger.warning("[Screener] Finviz %s 取得失敗", sector)
+
+        # 重複除去（出来高順を維持）
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for t in all_tickers:
+            if t not in seen:
+                seen.add(t)
+                candidates.append(t)
+
+        candidates = candidates[:n]
+        logger.info("[Screener] Finviz 合計: %d銘柄 (4セクター)", len(candidates))
         return candidates
 
     except ImportError:
