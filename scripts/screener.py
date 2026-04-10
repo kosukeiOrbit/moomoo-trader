@@ -50,14 +50,30 @@ OUTPUT_PATH = DATA_DIR / "watchlist_dynamic.json"
 
 
 def get_previous_trading_day() -> date:
-    """前営業日を返す（土日を除く）."""
+    """前営業日を返す（NYSE休場日・土日を考慮）."""
+    try:
+        import pandas_market_calendars as mcal
+        nyse = mcal.get_calendar("NYSE")
+        today = date.today()
+        schedule = nyse.schedule(
+            start_date=(today - timedelta(days=30)).strftime("%Y-%m-%d"),
+            end_date=today.strftime("%Y-%m-%d"),
+        )
+        past_days = [d for d in schedule.index.date.tolist() if d < today]
+        if past_days:
+            return past_days[-1]
+    except ImportError:
+        logger.warning("[Screener] pandas-market-calendars 未インストール — 簡易計算にフォールバック")
+    except Exception:
+        logger.exception("[Screener] 前営業日計算エラー — 簡易計算にフォールバック")
+
+    # フォールバック: 土日のみ考慮
     today = date.today()
-    if today.weekday() == 0:  # 月曜 → 金曜
+    if today.weekday() == 0:
         return today - timedelta(days=3)
-    elif today.weekday() == 6:  # 日曜 → 金曜
+    elif today.weekday() == 6:
         return today - timedelta(days=2)
-    else:
-        return today - timedelta(days=1)
+    return today - timedelta(days=1)
 
 
 def fetch_finviz_candidates(n: int = 50) -> list[str]:

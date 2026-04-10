@@ -14,7 +14,7 @@ import os
 import signal
 import sys
 import time as _time
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -84,14 +84,36 @@ FORCE_EXIT_ET = time(15, 50)
 # 市場判定
 # ---------------------------------------------------------------------------
 
+def _is_nyse_trading_day(d: date = None) -> bool:
+    """NYSE の営業日かどうか（休場日を考慮）."""
+    try:
+        import pandas_market_calendars as mcal
+        nyse = mcal.get_calendar("NYSE")
+        if d is None:
+            d = datetime.now(ET).date()
+        schedule = nyse.schedule(
+            start_date=d.strftime("%Y-%m-%d"),
+            end_date=d.strftime("%Y-%m-%d"),
+        )
+        return not schedule.empty
+    except ImportError:
+        # フォールバック: 土日のみ判定
+        if d is None:
+            d = datetime.now(ET).date()
+        return d.weekday() < 5
+    except Exception:
+        if d is None:
+            d = datetime.now(ET).date()
+        return d.weekday() < 5
+
+
 def market_is_open() -> bool:
     """米国市場がオープンしているか判定する.
 
-    ZoneInfo("America/New_York") は DST/EST を自動判定するため
-    サマータイム切り替え時もコード変更は不要。
+    NYSE 休場日・土日・時間外はFalseを返す。
     """
     now = datetime.now(ET)
-    if now.weekday() >= 5:
+    if not _is_nyse_trading_day(now.date()):
         return False
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
