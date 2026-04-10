@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 WATCHLIST_PATH = _PROJECT_ROOT / "data" / "watchlist_dynamic.json"
 
-# 24時間以上古いファイルは無効
-MAX_AGE_HOURS = 24
+# 96時間（4日）以上古いファイルは無効（3連休対応）
+MAX_AGE_HOURS = 96
 
 
 def get_dynamic_symbols(n: int | None = None) -> list[str]:
