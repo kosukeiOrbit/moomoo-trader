@@ -180,6 +180,22 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
         for i, symbol in enumerate(candidates):
             try:
                 code = f"US.{symbol}"
+
+                # 前日騰落率チェック（急落銘柄を除外）
+                ret_kl, kline = ctx.get_cur_kline(code, 2, ktype="K_DAY")
+                if ret_kl == RET_OK and len(kline) >= 2:
+                    prev_close = float(kline["close"].iloc[-2])
+                    last_close = float(kline["close"].iloc[-1])
+                    if prev_close > 0:
+                        change_pct = (last_close - prev_close) / prev_close * 100
+                        if change_pct < settings.SCREENER_MAX_DROP_PCT:
+                            logger.info(
+                                "[Screener] %s 急落除外: %.1f%%", symbol, change_pct,
+                            )
+                            time.sleep(1.0)
+                            continue
+
+                # 大口フロー取得
                 ret, data = ctx.get_capital_flow(
                     code,
                     period_type=PeriodType.DAY,

@@ -78,6 +78,7 @@ VWAP_DEVIATION_EXIT: float = 0.02     # VWAP乖離2%で撤退
 SCREENER_ENABLED: bool = os.getenv("SCREENER_ENABLED", "true").lower() == "true"
 SCREENER_MAX_SYMBOLS: int = int(os.getenv("SCREENER_MAX_SYMBOLS", "10"))
 SCREENER_CANDIDATES: int = int(os.getenv("SCREENER_CANDIDATES", "50"))
+SCREENER_MAX_DROP_PCT: float = float(os.getenv("SCREENER_MAX_DROP_PCT", "-5.0"))  # これ以下の騰落率は除外
 
 # --- 寄り付きスキップ ---
 MARKET_OPEN_SKIP_MINUTES: int = int(os.getenv("MARKET_OPEN_SKIP_MINUTES", "30"))  # 寄り付き後この分数はエントリーをスキップ（0で無効）
