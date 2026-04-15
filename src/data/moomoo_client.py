@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from futu import (
+    AuType,
+    KLType,
     ModifyOrderOp,
     OpenQuoteContext,
     OpenSecTradeContext,
@@ -236,31 +238,41 @@ class MoomooClient:
     # K線データ（ATR 計算用）
     # ------------------------------------------------------------------
 
-    def get_kline(self, symbol: str, num: int = 30, ktype: str = "K_DAY") -> "pd.DataFrame | None":
-        """直近N本のK線データを取得する.
+    def get_kline(self, symbol: str, num: int = 30) -> "pd.DataFrame | None":
+        """過去の確定日足K線データを取得する.
+
+        request_history_kl() を使用するため、サブスクリプション不要で
+        市場オープン前でも確定済みのデータを取得できる。
 
         Args:
             symbol: 銘柄シンボル
             num: 取得本数（デフォルト30）
-            ktype: K線タイプ（"K_DAY", "K_60M" 等）
 
         Returns:
             high, low, close 列を含む DataFrame（取得失敗時は None）
         """
-        import pandas as pd
+        from datetime import date as _date, timedelta as _td
         assert self._quote_ctx is not None
         code = f"US.{symbol}"
+        end_date = _date.today().strftime("%Y-%m-%d")
+        start_date = (_date.today() - _td(days=num * 2)).strftime("%Y-%m-%d")
         try:
-            ret, data = self._quote_ctx.get_cur_kline(code, num, ktype=ktype)
-            if ret != RET_OK or data.empty:
+            ret, data, _ = self._quote_ctx.request_history_kline(
+                code,
+                ktype=KLType.K_DAY,
+                start=start_date,
+                end=end_date,
+                autype=AuType.QFQ,
+                max_count=num,
+            )
+            if ret != RET_OK or data is None or data.empty:
                 logger.debug("K線データ取得失敗: %s (ret=%s)", symbol, ret)
                 return None
-            # high, low, close 列があることを確認
             required = {"high", "low", "close"}
             if not required.issubset(data.columns):
                 logger.debug("K線データに必要な列がありません: %s", symbol)
                 return None
-            return data[["high", "low", "close"]].copy()
+            return data[["high", "low", "close"]].tail(num).copy()
         except Exception:
             logger.exception("K線データ取得エラー: %s", symbol)
             return None
