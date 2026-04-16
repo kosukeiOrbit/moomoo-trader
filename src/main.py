@@ -570,10 +570,22 @@ async def main_loop() -> None:
                     sentiment = sentiment_analyzer.analyze(texts, symbol)
                     decision = and_filter.should_enter(sentiment, flow)
 
+                    # VWAP近似計算（既存のsnapを再利用）
+                    vwap_str = "N/A"
+                    try:
+                        if snap.volume > 0 and snap.turnover > 0:
+                            vwap_approx = snap.turnover / snap.volume
+                            vwap_above = snap.last_price > vwap_approx
+                            vwap_str = f"{vwap_approx:.2f}({'上' if vwap_above else '下'})"
+                    except Exception:
+                        pass
+
                     logger.info(
-                        "[%s] texts=%d sentiment=%.2f conf=%.2f flow=%s(%.2f) -> %s",
+                        "[%s] texts=%d sentiment=%.2f conf=%.2f flow=%s(%.2f) "
+                        "vwap=%s -> %s",
                         symbol, len(texts), sentiment.score, sentiment.confidence,
                         flow.direction, flow.strength,
+                        vwap_str,
                         "ENTRY" if decision.go else f"SKIP({decision.reason[:50]})",
                     )
 
