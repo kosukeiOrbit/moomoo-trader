@@ -185,7 +185,7 @@ async def _short_dryrun(
             return
 
         sentiment = sentiment_analyzer.analyze(texts, symbol)
-        if not (sentiment.score < -settings.SENTIMENT_THRESHOLD
+        if not (sentiment.score < settings.SHORT_SENTIMENT_THRESHOLD
                 and sentiment.confidence > settings.CONFIDENCE_MIN):
             return
 
@@ -226,7 +226,7 @@ async def _short_dryrun(
         )
 
     except Exception:
-        logger.debug("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
+        logger.warning("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
 
 
 async def _short_dryrun_close(client) -> None:
@@ -280,7 +280,7 @@ async def _short_dryrun_close(client) -> None:
                     f.write(_json.dumps(rec) + "\n")
 
     except Exception:
-        logger.debug("[DRY-RUN SHORT CLOSE] エラー（無視）", exc_info=True)
+        logger.warning("[DRY-RUN SHORT CLOSE] エラー（無視）", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
