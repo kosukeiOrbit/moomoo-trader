@@ -55,3 +55,4 @@ moomoo_OpenD_*/
 # Trade data
 data/trades/
 data/watchlist_dynamic.json
+data/short_dryrun.jsonl

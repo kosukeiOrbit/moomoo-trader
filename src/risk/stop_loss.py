@@ -82,6 +82,22 @@ class StopLossManager:
     # ATR 計算
     # ------------------------------------------------------------------
 
+    def calc_atr_pct(
+        self,
+        price_history: pd.DataFrame | None,
+        entry_price: float,
+    ) -> float:
+        """ATR を entry_price に対するパーセント（0.0〜1.0）で返す.
+
+        ATR計算不可 or entry<=0 の場合は 0.02（2%）をフォールバック。
+        """
+        if entry_price <= 0:
+            return 0.02
+        atr = self._calculate_atr(price_history)
+        if atr is None or atr == 0:
+            return 0.02
+        return atr / entry_price
+
     def _calculate_atr(
         self,
         price_history: pd.DataFrame | None,

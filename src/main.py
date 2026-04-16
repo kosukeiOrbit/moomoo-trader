@@ -8,6 +8,7 @@ Ctrl+C で安全にシャットダウンできる。
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import logging.handlers
 import os
@@ -153,6 +154,136 @@ def _handle_shutdown(signum: int, frame: object) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SHORT ドライラン
+# ---------------------------------------------------------------------------
+
+_dryrun_entered: dict[str, str] = {}
+_DRYRUN_PATH = Path(_project_root) / "data" / "short_dryrun.jsonl"
+
+
+async def _short_dryrun(
+    symbol: str,
+    flow_strength: float,
+    board_scraper,
+    news_feed,
+    sentiment_analyzer,
+    client,
+    stop_loss,
+) -> None:
+    """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する."""
+    try:
+        today = date.today().isoformat()
+        if _dryrun_entered.get(symbol) == today:
+            return
+
+        posts = await board_scraper.fetch_posts(symbol)
+        news_articles = await news_feed.get_latest(symbol)
+        texts = [p.text for p in posts] + [
+            f"{a.title} {a.body}" for a in news_articles
+        ]
+        if len([t for t in texts if t.strip()]) < settings.MIN_TEXTS_FOR_ANALYSIS:
+            return
+
+        sentiment = sentiment_analyzer.analyze(texts, symbol)
+        if not (sentiment.score < -settings.SENTIMENT_THRESHOLD
+                and sentiment.confidence > settings.CONFIDENCE_MIN):
+            return
+
+        snap = client.get_snapshot(symbol)
+        if snap is None or snap.last_price <= 0:
+            return
+        entry_price = snap.last_price
+
+        kline = client.get_kline(symbol)
+        atr_pct = stop_loss.calc_atr_pct(kline, entry_price)
+        sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER)
+        tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER)
+
+        _dryrun_entered[symbol] = today
+        record = {
+            "date": today,
+            "symbol": symbol,
+            "entry_time": datetime.now().strftime("%H:%M:%S"),
+            "entry_price": round(entry_price, 4),
+            "sl_price": round(sl_price, 4),
+            "tp_price": round(tp_price, 4),
+            "score": round(sentiment.score, 3),
+            "confidence": round(sentiment.confidence, 3),
+            "flow_strength": round(flow_strength, 3),
+            "close_price": None,
+            "exit_reason": None,
+            "virtual_pnl": None,
+        }
+        _DRYRUN_PATH.parent.mkdir(exist_ok=True)
+        with open(_DRYRUN_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
+
+        logger.info(
+            "[DRY-RUN SHORT] %s entry=%.2f SL=%.2f TP=%.2f "
+            "score=%.3f conf=%.3f flow=%.3f",
+            symbol, entry_price, sl_price, tp_price,
+            sentiment.score, sentiment.confidence, flow_strength,
+        )
+
+    except Exception:
+        logger.debug("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
+
+
+async def _short_dryrun_close(client) -> None:
+    """SHORT ドライラン仮想決済: 当日エントリーを引け値でクローズ."""
+    try:
+        today = date.today().isoformat()
+        if not _DRYRUN_PATH.exists():
+            return
+
+        records: list[dict] = []
+        with open(_DRYRUN_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(_json.loads(line))
+
+        updated = False
+        for rec in records:
+            if rec["date"] != today or rec["close_price"] is not None:
+                continue
+            snap = client.get_snapshot(rec["symbol"])
+            if snap is None or snap.last_price <= 0:
+                continue
+            close_price = snap.last_price
+
+            if close_price >= rec["sl_price"]:
+                exit_reason = "SL"
+                pnl = rec["entry_price"] - rec["sl_price"]
+            elif close_price <= rec["tp_price"]:
+                exit_reason = "TP"
+                pnl = rec["entry_price"] - rec["tp_price"]
+            else:
+                exit_reason = "FORCE_CLOSE"
+                pnl = rec["entry_price"] - close_price
+
+            rec["close_price"] = round(close_price, 4)
+            rec["virtual_pnl"] = round(pnl, 4)
+            rec["exit_reason"] = exit_reason
+            updated = True
+
+            logger.info(
+                "[DRY-RUN SHORT CLOSE] %s entry=%.2f close=%.2f "
+                "pnl=%+.4f reason=%s",
+                rec["symbol"], rec["entry_price"],
+                close_price, pnl, exit_reason,
+            )
+
+        if updated:
+            with open(_DRYRUN_PATH, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(_json.dumps(rec) + "\n")
+
+    except Exception:
+        logger.debug("[DRY-RUN SHORT CLOSE] エラー（無視）", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # メインループ
 # ---------------------------------------------------------------------------
 
@@ -267,6 +398,11 @@ async def main_loop() -> None:
             logger.info("=== loop #%d start ===", _loop_count)
 
             # --- ET 15:50 強制決済 ---
+            if should_force_exit():
+                # SHORT ドライランの仮想決済を先に記録
+                if settings.SHORT_DRY_RUN:
+                    await _short_dryrun_close(client)
+
             if should_force_exit() and order_router.position_count > 0:
                 logger.warning("ET 15:50 — Force closing all positions")
 
@@ -377,8 +513,18 @@ async def main_loop() -> None:
                         )
                         continue
 
-                    # flow=SELL + SHORT無効 ならスキップ
+                    # flow=SELL + SHORT無効 ならスキップ（ドライランは記録のみ）
                     if flow.direction == "SELL" and not settings.ENABLE_SHORT:
+                        if settings.SHORT_DRY_RUN:
+                            await _short_dryrun(
+                                symbol=symbol,
+                                flow_strength=flow.strength,
+                                board_scraper=board_scraper,
+                                news_feed=news_feed,
+                                sentiment_analyzer=sentiment_analyzer,
+                                client=client,
+                                stop_loss=stop_loss_manager,
+                            )
                         logger.info(
                             "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
                             symbol, flow.strength,
