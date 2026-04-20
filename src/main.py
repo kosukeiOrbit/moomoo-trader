@@ -230,9 +230,8 @@ async def _short_dryrun(
 
 
 async def _short_dryrun_close(client) -> None:
-    """SHORT ドライラン仮想決済: 当日エントリーを引け値でクローズ."""
+    """SHORT ドライラン仮想決済: 未決済のエントリーを現在価格でクローズ."""
     try:
-        today = date.today().isoformat()
         if not _DRYRUN_PATH.exists():
             return
 
@@ -245,12 +244,14 @@ async def _short_dryrun_close(client) -> None:
 
         updated = False
         for rec in records:
-            if rec["date"] != today or rec["close_price"] is not None:
+            # 未決済レコードを全て処理（日付に関係なく）
+            if rec.get("close_price") is not None:
                 continue
             snap = client.get_snapshot(rec["symbol"])
             if snap is None or snap.last_price <= 0:
                 continue
             close_price = snap.last_price
+            close_time = datetime.now().strftime("%H:%M:%S")
 
             if close_price >= rec["sl_price"]:
                 exit_reason = "SL"
@@ -263,6 +264,7 @@ async def _short_dryrun_close(client) -> None:
                 pnl = rec["entry_price"] - close_price
 
             rec["close_price"] = round(close_price, 4)
+            rec["close_time"] = close_time
             rec["virtual_pnl"] = round(pnl, 4)
             rec["exit_reason"] = exit_reason
             updated = True
