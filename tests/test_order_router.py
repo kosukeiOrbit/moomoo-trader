@@ -144,7 +144,7 @@ class TestEntry:
         assert router.position_count == 0
 
     @pytest.mark.asyncio
-    @patch("config.settings.MAX_POSITIONS", 3)
+    @patch("config.settings.LONG_MAX_POSITIONS", 3)
     async def test_max_positions(self) -> None:
         router, _ = _make_router_with_fill()
         await router.enter(_go_long(), "AAPL", 10, 150.0)

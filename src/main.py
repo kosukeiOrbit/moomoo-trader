@@ -512,8 +512,10 @@ async def main_loop() -> None:
 
             # --- 銘柄ごとのスキャンループ ---
             logger.info(
-                "--- scan start (positions=%d, assets=$%.0f, power=$%.0f, daily_pnl=$%.2f) ---",
-                order_router.position_count, total_assets, buying_power, pnl_tracker.daily_pnl,
+                "--- scan start (L=%d/%d S=%d/%d assets=$%.0f power=$%.0f pnl=$%.2f) ---",
+                order_router.long_count, settings.LONG_MAX_POSITIONS,
+                order_router.short_count, settings.SHORT_MAX_POSITIONS,
+                total_assets, buying_power, pnl_tracker.daily_pnl,
             )
             # スキャンスキップ判定
             skip_reason = None
@@ -526,8 +528,8 @@ async def main_loop() -> None:
                     f"Opening skip: {settings.MARKET_OPEN_SKIP_MINUTES}min "
                     f"(until ET {skip_until.strftime('%H:%M')})"
                 )
-            elif order_router.position_count >= settings.MAX_POSITIONS:
-                skip_reason = f"MAX_POSITIONS({settings.MAX_POSITIONS}) reached"
+            elif order_router.long_count >= settings.LONG_MAX_POSITIONS:
+                skip_reason = f"LONG_MAX_POSITIONS({settings.LONG_MAX_POSITIONS}) reached"
             elif buying_power < settings.MIN_BUYING_POWER:
                 skip_reason = f"Insufficient buying power (${buying_power:.0f} < ${settings.MIN_BUYING_POWER})"
 

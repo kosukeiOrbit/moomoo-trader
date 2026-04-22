@@ -77,8 +77,8 @@ class OrderRouter:
         self._positions: dict[str, Position] = {}
         self._on_exit = on_exit
         logger.info(
-            "OrderRouter initialized (env=%s, max_positions=%d)",
-            settings.TRADE_ENV, settings.MAX_POSITIONS,
+            "OrderRouter initialized (env=%s, long_max=%d, short_max=%d)",
+            settings.TRADE_ENV, settings.LONG_MAX_POSITIONS, settings.SHORT_MAX_POSITIONS,
         )
 
     def recover_positions(self) -> int:
@@ -125,6 +125,14 @@ class OrderRouter:
     def position_count(self) -> int:
         return len(self._positions)
 
+    @property
+    def long_count(self) -> int:
+        return sum(1 for p in self._positions.values() if p.direction == "LONG")
+
+    @property
+    def short_count(self) -> int:
+        return sum(1 for p in self._positions.values() if p.direction == "SHORT")
+
     # ------------------------------------------------------------------
     # Entry (async — asyncio.sleep で待機、イベントループをブロックしない)
     # ------------------------------------------------------------------
@@ -141,9 +149,20 @@ class OrderRouter:
         if not signal.go or size <= 0:
             return None
 
-        if self.position_count >= settings.MAX_POSITIONS:
-            logger.info("[%s] MAX_POSITIONS(%d)に達しているためスキップ", symbol, settings.MAX_POSITIONS)
-            return None
+        if signal.direction == "LONG":
+            if self.long_count >= settings.LONG_MAX_POSITIONS:
+                logger.info(
+                    "[%s] LONG_MAX_POSITIONS(%d)に達しているためスキップ",
+                    symbol, settings.LONG_MAX_POSITIONS,
+                )
+                return None
+        else:
+            if self.short_count >= settings.SHORT_MAX_POSITIONS:
+                logger.info(
+                    "[%s] SHORT_MAX_POSITIONS(%d)に達しているためスキップ",
+                    symbol, settings.SHORT_MAX_POSITIONS,
+                )
+                return None
 
         for pos in self._positions.values():
             if pos.symbol == symbol:
