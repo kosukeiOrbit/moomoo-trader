@@ -562,23 +562,40 @@ async def main_loop() -> None:
                         )
                         continue
 
-                    # flow=SELL + SHORT無効 ならスキップ（ドライランは記録のみ）
-                    if flow.direction == "SELL" and not settings.ENABLE_SHORT:
-                        if settings.SHORT_DRY_RUN:
-                            await _short_dryrun(
-                                symbol=symbol,
-                                flow_strength=flow.strength,
-                                board_scraper=board_scraper,
-                                news_feed=news_feed,
-                                sentiment_analyzer=sentiment_analyzer,
-                                client=client,
-                                stop_loss=stop_loss_manager,
+                    # flow=SELL → SHORT処理（必ずcontinue、LONGには流れない）
+                    if flow.direction == "SELL":
+                        if settings.ENABLE_SHORT:
+                            # SHORT 実エントリー処理（将来実装）
+                            if settings.SHORT_DRY_RUN:
+                                await _short_dryrun(
+                                    symbol=symbol,
+                                    flow_strength=flow.strength,
+                                    board_scraper=board_scraper,
+                                    news_feed=news_feed,
+                                    sentiment_analyzer=sentiment_analyzer,
+                                    client=client,
+                                    stop_loss=stop_loss_manager,
+                                )
+                            logger.info(
+                                "[%s] flow=SELL(%.2f) -> SHORT candidate (not yet implemented)",
+                                symbol, flow.strength,
                             )
-                        logger.info(
-                            "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
-                            symbol, flow.strength,
-                        )
-                        continue
+                        else:
+                            if settings.SHORT_DRY_RUN:
+                                await _short_dryrun(
+                                    symbol=symbol,
+                                    flow_strength=flow.strength,
+                                    board_scraper=board_scraper,
+                                    news_feed=news_feed,
+                                    sentiment_analyzer=sentiment_analyzer,
+                                    client=client,
+                                    stop_loss=stop_loss_manager,
+                                )
+                            logger.info(
+                                "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
+                                symbol, flow.strength,
+                            )
+                        continue  # flow=SELL は必ず continue
 
                     # flow.strength が閾値未満ならAPIスキップ
                     if flow.strength <= settings.FLOW_BUY_THRESHOLD:
