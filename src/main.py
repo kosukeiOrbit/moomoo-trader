@@ -161,6 +161,22 @@ _dryrun_entered: dict[str, str] = {}
 _DRYRUN_PATH = Path(_project_root) / "data" / "short_dryrun.jsonl"
 
 
+_spy_change_cache: tuple[str, float | None] = ("", None)  # (date, change)
+
+
+def _get_spy_change_cached(client) -> float | None:
+    """SPY 前日比をキャッシュ付きで取得（1日1回のみ API 呼び出し）."""
+    global _spy_change_cache
+    today = date.today().isoformat()
+    if _spy_change_cache[0] == today:
+        return _spy_change_cache[1]
+    change = client.get_spy_change()
+    _spy_change_cache = (today, change)
+    if change is not None:
+        logger.info("[SPY] change=%.2f%%", change * 100)
+    return change
+
+
 async def _short_dryrun(
     symbol: str,
     flow_strength: float,
@@ -170,24 +186,50 @@ async def _short_dryrun(
     client,
     stop_loss,
 ) -> None:
-    """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する."""
+    """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する.
+
+    条件A（個別悪材料）: sentiment < -0.3 AND confidence > 0.7
+    条件B（マクロ連動）: SPY前日比 < -0.5% AND flow=SELL強
+    """
     try:
         today = date.today().isoformat()
         if _dryrun_entered.get(symbol) == today:
             return
 
+        # テキスト収集（条件A/B 共通で使用）
         posts = await board_scraper.fetch_posts(symbol)
         news_articles = await news_feed.get_latest(symbol)
         texts = [p.text for p in posts] + [
             f"{a.title} {a.body}" for a in news_articles
         ]
-        if len([t for t in texts if t.strip()]) < settings.MIN_TEXTS_FOR_ANALYSIS:
+
+        # sentiment 取得（テキストがあれば）
+        score = 0.0
+        confidence = 0.0
+        filtered_count = len([t for t in texts if t.strip()])
+        if filtered_count >= settings.MIN_TEXTS_FOR_ANALYSIS:
+            sentiment = sentiment_analyzer.analyze(texts, symbol)
+            score = sentiment.score
+            confidence = sentiment.confidence
+
+        # 条件A: 個別悪材料ショート
+        individual_short = (
+            score < settings.SHORT_SENTIMENT_THRESHOLD
+            and confidence > settings.CONFIDENCE_MIN
+        )
+
+        # 条件B: マクロ連動ショート
+        spy_change = _get_spy_change_cached(client)
+        macro_short = (
+            spy_change is not None
+            and spy_change < -0.005  # SPY 前日比 -0.5% 以下
+            and flow_strength > settings.FLOW_BUY_THRESHOLD
+        )
+
+        if not (individual_short or macro_short):
             return
 
-        sentiment = sentiment_analyzer.analyze(texts, symbol)
-        if not (sentiment.score < settings.SHORT_SENTIMENT_THRESHOLD
-                and sentiment.confidence > settings.CONFIDENCE_MIN):
-            return
+        pattern = "individual" if individual_short else "macro"
 
         snap = client.get_snapshot(symbol)
         if snap is None or snap.last_price <= 0:
@@ -203,13 +245,15 @@ async def _short_dryrun(
         record = {
             "date": today,
             "symbol": symbol,
+            "pattern": pattern,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
             "entry_price": round(entry_price, 4),
             "sl_price": round(sl_price, 4),
             "tp_price": round(tp_price, 4),
-            "score": round(sentiment.score, 3),
-            "confidence": round(sentiment.confidence, 3),
+            "score": round(score, 3),
+            "confidence": round(confidence, 3),
             "flow_strength": round(flow_strength, 3),
+            "spy_change": round(spy_change * 100, 2) if spy_change is not None else None,
             "close_price": None,
             "exit_reason": None,
             "virtual_pnl": None,
@@ -218,11 +262,12 @@ async def _short_dryrun(
         with open(_DRYRUN_PATH, "a", encoding="utf-8") as f:
             f.write(_json.dumps(record) + "\n")
 
+        spy_str = f" spy={spy_change*100:.2f}%" if spy_change is not None else ""
         logger.info(
-            "[DRY-RUN SHORT] %s entry=%.2f SL=%.2f TP=%.2f "
-            "score=%.3f conf=%.3f flow=%.3f",
-            symbol, entry_price, sl_price, tp_price,
-            sentiment.score, sentiment.confidence, flow_strength,
+            "[DRY-RUN SHORT/%s] %s entry=%.2f SL=%.2f TP=%.2f "
+            "score=%.3f conf=%.3f flow=%.3f%s",
+            pattern, symbol, entry_price, sl_price, tp_price,
+            score, confidence, flow_strength, spy_str,
         )
 
     except Exception:

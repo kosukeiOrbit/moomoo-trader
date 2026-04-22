@@ -277,6 +277,38 @@ class MoomooClient:
             logger.exception("K線データ取得エラー: %s", symbol)
             return None
 
+    def get_spy_change(self) -> float | None:
+        """SPY の前日比（騰落率）を返す.
+
+        Returns:
+            騰落率（例: -0.008 = -0.8%）。取得失敗時は None。
+        """
+        from datetime import date as _date, timedelta as _td
+        assert self._quote_ctx is not None
+        try:
+            end_date = _date.today().strftime("%Y-%m-%d")
+            start_date = (_date.today() - _td(days=5)).strftime("%Y-%m-%d")
+            ret, data, _ = self._quote_ctx.request_history_kline(
+                "US.SPY",
+                ktype=KLType.K_DAY,
+                start=start_date,
+                end=end_date,
+                autype=AuType.QFQ,
+                max_count=3,
+            )
+            if ret != RET_OK or data is None or len(data) < 2:
+                return None
+            prev_close = float(data["close"].iloc[-2])
+            last_close = float(data["close"].iloc[-1])
+            if prev_close <= 0:
+                return None
+            change = (last_close - prev_close) / prev_close
+            logger.debug("SPY change: %.2f%%", change * 100)
+            return change
+        except Exception:
+            logger.debug("SPY change 取得エラー", exc_info=True)
+            return None
+
     # ------------------------------------------------------------------
     # 大口フロー (get_capital_flow — 分足時系列)
     # ------------------------------------------------------------------
