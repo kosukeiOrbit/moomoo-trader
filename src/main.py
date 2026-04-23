@@ -251,7 +251,7 @@ async def _short_dryrun(
         with open(_DRYRUN_PATH, "a", encoding="utf-8") as f:
             f.write(_json.dumps(record) + "\n")
 
-        spy_str = f" spy={spy_change*100:.2f}%" if spy_change is not None else ""
+        spy_str = f" spy_rt={spy_rt*100:.2f}%" if spy_rt is not None else ""
         logger.info(
             "[DRY-RUN SHORT/%s] %s entry=%.2f SL=%.2f TP=%.2f "
             "score=%.3f conf=%.3f flow=%.3f%s",
