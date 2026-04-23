@@ -161,22 +161,6 @@ _dryrun_entered: dict[str, str] = {}
 _DRYRUN_PATH = Path(_project_root) / "data" / "short_dryrun.jsonl"
 
 
-_spy_change_cache: tuple[str, float | None] = ("", None)  # (date, change)
-
-
-def _get_spy_change_cached(client) -> float | None:
-    """SPY 前日比をキャッシュ付きで取得（1日1回のみ API 呼び出し）."""
-    global _spy_change_cache
-    today = date.today().isoformat()
-    if _spy_change_cache[0] == today:
-        return _spy_change_cache[1]
-    change = client.get_spy_change()
-    _spy_change_cache = (today, change)
-    if change is not None:
-        logger.info("[SPY] change=%.2f%%", change * 100)
-    return change
-
-
 async def _short_dryrun(
     symbol: str,
     flow_strength: float,
@@ -218,11 +202,11 @@ async def _short_dryrun(
             and confidence > settings.CONFIDENCE_MIN
         )
 
-        # 条件B: マクロ連動ショート
-        spy_change = _get_spy_change_cached(client)
+        # 条件B: マクロ連動ショート（当日始値からの SPY 変化率で判定）
+        spy_rt = client.get_spy_intraday_change()
         macro_short = (
-            spy_change is not None
-            and spy_change < -0.005  # SPY 前日比 -0.5% 以下
+            spy_rt is not None
+            and spy_rt < -0.003  # SPY 当日始値から -0.3% 以下
             and flow_strength > settings.FLOW_BUY_THRESHOLD
         )
 
@@ -230,9 +214,6 @@ async def _short_dryrun(
             return
 
         pattern = "individual" if individual_short else "macro"
-
-        # 検証用フィールド
-        spy_rt = client.get_spy_intraday_change()
         individual_would_trigger = (
             score < settings.SHORT_SENTIMENT_THRESHOLD
             and confidence > settings.CONFIDENCE_MIN
@@ -260,7 +241,6 @@ async def _short_dryrun(
             "score": round(score, 3),
             "confidence": round(confidence, 3),
             "flow_strength": round(flow_strength, 3),
-            "spy_change": round(spy_change * 100, 2) if spy_change is not None else None,
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
             "individual_would_trigger": individual_would_trigger,
             "close_price": None,
