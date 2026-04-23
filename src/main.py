@@ -224,6 +224,13 @@ async def _short_dryrun(
             return
         entry_price = snap.last_price
 
+        # VWAP 近似計算
+        vwap_approx = None
+        vwap_above = None
+        if snap.volume > 0 and snap.turnover > 0:
+            vwap_approx = snap.turnover / snap.volume
+            vwap_above = entry_price > vwap_approx
+
         kline = client.get_kline(symbol)
         atr_pct = stop_loss.calc_atr_pct(kline, entry_price)
         sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER)
@@ -236,6 +243,8 @@ async def _short_dryrun(
             "pattern": pattern,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
             "entry_price": round(entry_price, 4),
+            "vwap": round(vwap_approx, 4) if vwap_approx else None,
+            "vwap_above": vwap_above,
             "sl_price": round(sl_price, 4),
             "tp_price": round(tp_price, 4),
             "score": round(score, 3),
