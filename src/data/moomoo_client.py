@@ -309,6 +309,27 @@ class MoomooClient:
             logger.debug("SPY change 取得エラー", exc_info=True)
             return None
 
+    def get_spy_intraday_change(self) -> float | None:
+        """SPY の当日始値からの変化率を返す.
+
+        Returns:
+            変化率（例: -0.005 = -0.5%）。取得失敗時は None。
+        """
+        assert self._quote_ctx is not None
+        try:
+            ret, data = self._quote_ctx.get_cur_kline("US.SPY", 2, ktype="K_DAY")
+            if ret != RET_OK or data is None or data.empty:
+                return None
+            row = data.iloc[-1]
+            open_price = float(row.get("open", 0))
+            last_price = float(row.get("close", 0))
+            if open_price <= 0:
+                return None
+            return (last_price - open_price) / open_price
+        except Exception:
+            logger.debug("SPY intraday change 取得エラー", exc_info=True)
+            return None
+
     # ------------------------------------------------------------------
     # 大口フロー (get_capital_flow — 分足時系列)
     # ------------------------------------------------------------------

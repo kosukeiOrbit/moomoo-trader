@@ -231,6 +231,13 @@ async def _short_dryrun(
 
         pattern = "individual" if individual_short else "macro"
 
+        # 検証用フィールド
+        spy_rt = client.get_spy_intraday_change()
+        individual_would_trigger = (
+            score < settings.SHORT_SENTIMENT_THRESHOLD
+            and confidence > settings.CONFIDENCE_MIN
+        ) if pattern == "macro" else None
+
         snap = client.get_snapshot(symbol)
         if snap is None or snap.last_price <= 0:
             return
@@ -254,6 +261,8 @@ async def _short_dryrun(
             "confidence": round(confidence, 3),
             "flow_strength": round(flow_strength, 3),
             "spy_change": round(spy_change * 100, 2) if spy_change is not None else None,
+            "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
+            "individual_would_trigger": individual_would_trigger,
             "close_price": None,
             "exit_reason": None,
             "virtual_pnl": None,
