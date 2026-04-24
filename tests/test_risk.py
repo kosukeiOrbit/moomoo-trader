@@ -23,20 +23,11 @@ from src.risk.circuit_breaker import (
 
 
 class TestPositionSizerDefaults:
-    """初期状態（トレード履歴なし）のテスト."""
+    """初期状態のテスト."""
 
-    def test_default_win_rate_is_50pct(self) -> None:
-        """データなし時の勝率はデフォルト50%."""
+    def test_default_win_rate_is_zero(self) -> None:
         sizer = PositionSizer()
-        assert sizer.win_rate == 0.5
-
-    def test_default_avg_profit_is_1(self) -> None:
-        sizer = PositionSizer()
-        assert sizer.avg_profit == 1.0
-
-    def test_default_avg_loss_is_1(self) -> None:
-        sizer = PositionSizer()
-        assert sizer.avg_loss == 1.0
+        assert sizer.win_rate == 0.0
 
     def test_initial_trade_count_is_zero(self) -> None:
         sizer = PositionSizer()
@@ -50,21 +41,13 @@ class TestPositionSizerDefaults:
 class TestPositionSizerCalculate:
     """calculate() のテスト."""
 
-    def test_initial_state_returns_min_shares(self) -> None:
-        """初期状態（Kelly=0）でも MIN_POSITION_SHARES (1株) を返す."""
+    def test_fixed_pct_calculation(self) -> None:
+        """POSITION_MAX_PCT の固定割合で株数が計算される."""
         sizer = PositionSizer()
+        # balance=100000 * pct=0.10 / price=150 = 66株
         shares = sizer.calculate("AAPL", 150.0, 100_000.0)
-        assert shares >= 1
-
-    def test_capped_at_position_max_pct(self) -> None:
-        """株数が POSITION_MAX_PCT (2%) の上限を超えない."""
-        sizer = PositionSizer()
-        # 大量に勝ってKellyを上げる
-        for _ in range(10):
-            sizer.update_stats(TradeResult(symbol="X", pnl=500.0, is_win=True))
-        shares = sizer.calculate("AAPL", 150.0, 100_000.0)
-        max_shares = int(100_000 * 0.02 / 150.0)
-        assert shares <= max_shares
+        expected = int(100_000 * settings.POSITION_MAX_PCT / 150.0)
+        assert shares == expected
 
     def test_zero_price_returns_zero(self) -> None:
         sizer = PositionSizer()
@@ -82,11 +65,17 @@ class TestPositionSizerCalculate:
         sizer = PositionSizer()
         assert sizer.calculate("AAPL", 150.0, -5_000.0) == 0
 
-    def test_high_price_low_balance_capped_at_zero(self) -> None:
-        """2%上限が1株未満 → max_shares=0 で0株."""
+    def test_high_price_low_balance_returns_zero(self) -> None:
+        """1株も買えない場合は0."""
         sizer = PositionSizer()
-        # 1000 * 0.02 / 500000 = 0 → max=0
         assert sizer.calculate("BRK.A", 500_000.0, 1_000.0) == 0
+
+    def test_min_position_shares_guaranteed(self) -> None:
+        """計算結果が0でもMIN_POSITION_SHARES(1)を保証（買える場合）."""
+        sizer = PositionSizer()
+        # balance=200, pct=0.10, price=150 → int(20/150)=0 → min=1
+        shares = sizer.calculate("AAPL", 150.0, 200.0)
+        assert shares == 1
 
     def test_consecutive_losses_halve_size(self) -> None:
         """連続3敗でサイズが通常時の半分以下になる."""
@@ -98,38 +87,7 @@ class TestPositionSizerCalculate:
         reduced_shares = sizer.calculate("AAPL", 150.0, 100_000.0)
 
         assert reduced_shares <= normal_shares
-
-
-class TestPositionSizerKelly:
-    """Kelly計算ロジックのテスト."""
-
-    def test_kelly_with_good_track_record(self) -> None:
-        """勝率70%、平均利益200、平均損失100でKellyが正."""
-        sizer = PositionSizer()
-        for _ in range(7):
-            sizer.update_stats(TradeResult(symbol="X", pnl=200.0, is_win=True))
-        for _ in range(3):
-            sizer.update_stats(TradeResult(symbol="X", pnl=-100.0, is_win=False))
-
-        assert sizer.win_rate == pytest.approx(0.7)
-        assert sizer.avg_profit == pytest.approx(200.0)
-        assert sizer.avg_loss == pytest.approx(100.0)
-        # Kelly = (0.7*200 - 0.3*100)/100 = 1.1 → Half = 0.55
-        # 上限2%でキャップ
-        shares = sizer.calculate("AAPL", 150.0, 100_000.0)
-        assert shares > 0
-        assert shares <= int(100_000 * 0.02 / 150.0)
-
-    def test_kelly_negative_returns_min_shares(self) -> None:
-        """期待値マイナスでもMIN_POSITION_SHARES (1株) を返す."""
-        sizer = PositionSizer()
-        for _ in range(2):
-            sizer.update_stats(TradeResult(symbol="X", pnl=10.0, is_win=True))
-        for _ in range(8):
-            sizer.update_stats(TradeResult(symbol="X", pnl=-100.0, is_win=False))
-        # Kelly negative → kelly_shares=0, but min=1
-        shares = sizer.calculate("AAPL", 150.0, 100_000.0)
-        assert shares == 1
+        assert reduced_shares >= 1
 
 
 class TestPositionSizerUpdateStats:
