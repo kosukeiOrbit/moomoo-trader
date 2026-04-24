@@ -30,9 +30,14 @@ class TradeRecord:
     entry_price: float
     exit_price: float | None = None
     pnl: float = 0.0
-    reason: str = ""  # 決済理由 (SL / TP / センチメント反転 等)
+    reason: str = ""
     opened_at: datetime = field(default_factory=datetime.now)
     closed_at: datetime | None = None
+    atr_value: float | None = None
+    atr_pct: float | None = None
+    vwap_above: bool | None = None
+    vwap_price: float | None = None
+    spy_rt: float | None = None
 
 
 class PnLTracker:
@@ -41,7 +46,10 @@ class PnLTracker:
     CSV_HEADER = [
         "order_id", "symbol", "direction", "size",
         "entry_price", "exit_price", "pnl", "reason",
-        "opened_at", "closed_at",
+        "opened_at", "closed_at", "hold_minutes",
+        "atr_value", "atr_pct",
+        "vwap_above", "vwap_price",
+        "spy_rt",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -63,6 +71,11 @@ class PnLTracker:
         direction: str,
         size: int,
         entry_price: float,
+        atr_value: float | None = None,
+        atr_pct: float | None = None,
+        vwap_above: bool | None = None,
+        vwap_price: float | None = None,
+        spy_rt: float | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -77,6 +90,11 @@ class PnLTracker:
             direction=direction,
             size=size,
             entry_price=entry_price,
+            atr_value=atr_value,
+            atr_pct=atr_pct,
+            vwap_above=vwap_above,
+            vwap_price=vwap_price,
+            spy_rt=spy_rt,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -296,6 +314,11 @@ class PnLTracker:
             writer = csv.writer(f)
             writer.writerow(self.CSV_HEADER)
             for t in self._closed_trades:
+                hold_minutes = None
+                if t.opened_at and t.closed_at:
+                    hold_minutes = round(
+                        (t.closed_at - t.opened_at).total_seconds() / 60, 1,
+                    )
                 writer.writerow([
                     t.order_id,
                     t.symbol,
@@ -307,6 +330,12 @@ class PnLTracker:
                     t.reason,
                     t.opened_at.isoformat(),
                     t.closed_at.isoformat() if t.closed_at else "",
+                    hold_minutes,
+                    f"{t.atr_value:.4f}" if t.atr_value else "",
+                    f"{t.atr_pct:.4f}" if t.atr_pct else "",
+                    t.vwap_above if t.vwap_above is not None else "",
+                    f"{t.vwap_price:.4f}" if t.vwap_price else "",
+                    f"{t.spy_rt:.4f}" if t.spy_rt is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))

@@ -636,6 +636,8 @@ async def main_loop() -> None:
 
                     # VWAP近似計算（既存のsnapを再利用）
                     vwap_str = "N/A"
+                    vwap_approx = None
+                    vwap_above = None
                     try:
                         if snap.volume > 0 and snap.turnover > 0:
                             vwap_approx = snap.turnover / snap.volume
@@ -675,9 +677,18 @@ async def main_loop() -> None:
                                 "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
                                 symbol, decision.direction, size, current_price, result.order_id,
                             )
+                            # ATR/VWAP/SPY を記録用に取得（既存変数を流用）
+                            _atr_pct = stop_loss_manager.calc_atr_pct(kline, current_price)
+                            _atr_val = current_price * _atr_pct
+                            _spy_rt = client.get_spy_intraday_change()
                             pnl_tracker.register(
                                 result.order_id, symbol, decision.direction,
                                 size, current_price,
+                                atr_value=_atr_val,
+                                atr_pct=_atr_pct,
+                                vwap_above=vwap_above,
+                                vwap_price=vwap_approx,
+                                spy_rt=_spy_rt,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,
