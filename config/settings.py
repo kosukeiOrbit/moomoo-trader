@@ -63,7 +63,7 @@ SHORT_DRY_RUN: bool = os.getenv("SHORT_DRY_RUN", "true").lower() == "true"  # SH
 # --- リスク管理 ---
 MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
-POSITION_MAX_PCT: float = float(os.getenv("POSITION_MAX_PCT", "0.02"))
+POSITION_MAX_PCT: float = float(os.getenv("POSITION_MAX_PCT", "0.10"))
 KELLY_FRACTION: float = 0.5           # ハーフケリー
 MIN_POSITION_SHARES: int = 1          # 最低保証株数（Kelly=0でもデータ蓄積用に発注）
 # MAX_POSITIONS: int = 10             # (旧) 合計上限 → LONG/SHORT独立管理に変更
