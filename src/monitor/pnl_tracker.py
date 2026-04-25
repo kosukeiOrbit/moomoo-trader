@@ -40,6 +40,8 @@ class TradeRecord:
     spy_rt: float | None = None
     mfe: float = 0.0
     mae: float = 0.0
+    sentiment_score: float | None = None
+    sentiment_confidence: float | None = None
 
 
 class PnLTracker:
@@ -53,6 +55,7 @@ class PnLTracker:
         "vwap_above", "vwap_price",
         "spy_rt",
         "mfe", "mae",
+        "sentiment_score", "sentiment_confidence",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -79,6 +82,8 @@ class PnLTracker:
         vwap_above: bool | None = None,
         vwap_price: float | None = None,
         spy_rt: float | None = None,
+        sentiment_score: float | None = None,
+        sentiment_confidence: float | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -98,6 +103,8 @@ class PnLTracker:
             vwap_above=vwap_above,
             vwap_price=vwap_price,
             spy_rt=spy_rt,
+            sentiment_score=sentiment_score,
+            sentiment_confidence=sentiment_confidence,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -345,6 +352,8 @@ class PnLTracker:
                     f"{t.spy_rt:.4f}" if t.spy_rt is not None else "",
                     f"{t.mfe:.2f}" if t.mfe else "",
                     f"{t.mae:.2f}" if t.mae else "",
+                    f"{t.sentiment_score:.2f}" if t.sentiment_score is not None else "",
+                    f"{t.sentiment_confidence:.2f}" if t.sentiment_confidence is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))

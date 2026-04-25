@@ -690,6 +690,8 @@ async def main_loop() -> None:
                                 vwap_above=vwap_above,
                                 vwap_price=vwap_approx,
                                 spy_rt=_spy_rt,
+                                sentiment_score=sentiment.score,
+                                sentiment_confidence=sentiment.confidence,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,
