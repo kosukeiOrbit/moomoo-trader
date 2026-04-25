@@ -41,6 +41,8 @@ class Position:
     entry_price: float
     levels: Levels | None = None
     opened_at: datetime = field(default_factory=datetime.now)
+    mfe: float = 0.0  # Maximum Favorable Excursion（最大含み益・ドル）
+    mae: float = 0.0  # Maximum Adverse Excursion（最大含み損・ドル）
 
 
 @dataclass
@@ -477,6 +479,16 @@ class OrderRouter:
                     if price <= 0:
                         logger.debug("[%s] monitor: price=0 (%.2fs)", pos.symbol, api_time)
                         continue
+
+                    # MFE/MAE 更新
+                    if pos.direction == "LONG":
+                        unrealized = (price - pos.entry_price) * pos.size
+                    else:
+                        unrealized = (pos.entry_price - price) * pos.size
+                    if unrealized > 0:
+                        pos.mfe = max(pos.mfe, unrealized)
+                    else:
+                        pos.mae = max(pos.mae, abs(unrealized))
 
                     # SL/TP の距離計算（LONG: SL<price<TP, SHORT: TP<price<SL）
                     if pos.direction == "SHORT":

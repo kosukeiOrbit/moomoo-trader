@@ -388,6 +388,7 @@ async def main_loop() -> None:
     def _on_exit(result: ExitResult) -> None:
         pnl = pnl_tracker.close_trade(
             result.position.order_id, result.exit_price, result.reason,
+            mfe=result.position.mfe, mae=result.position.mae,
         )
         is_win = pnl > 0
         position_sizer.update_stats(TradeResult(

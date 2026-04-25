@@ -38,6 +38,8 @@ class TradeRecord:
     vwap_above: bool | None = None
     vwap_price: float | None = None
     spy_rt: float | None = None
+    mfe: float = 0.0
+    mae: float = 0.0
 
 
 class PnLTracker:
@@ -50,6 +52,7 @@ class PnLTracker:
         "atr_value", "atr_pct",
         "vwap_above", "vwap_price",
         "spy_rt",
+        "mfe", "mae",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -106,6 +109,8 @@ class PnLTracker:
         order_id: str,
         exit_price: float,
         reason: str = "",
+        mfe: float = 0.0,
+        mae: float = 0.0,
     ) -> float:
         """トレードを決済記録する.
 
@@ -136,6 +141,8 @@ class PnLTracker:
         trade.pnl = pnl
         trade.reason = reason
         trade.closed_at = datetime.now()
+        trade.mfe = mfe
+        trade.mae = mae
         self._closed_trades.append(trade)
         self._closed_ids.add(order_id)
         self._daily_pnl += pnl
@@ -336,6 +343,8 @@ class PnLTracker:
                     t.vwap_above if t.vwap_above is not None else "",
                     f"{t.vwap_price:.4f}" if t.vwap_price else "",
                     f"{t.spy_rt:.4f}" if t.spy_rt is not None else "",
+                    f"{t.mfe:.2f}" if t.mfe else "",
+                    f"{t.mae:.2f}" if t.mae else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
