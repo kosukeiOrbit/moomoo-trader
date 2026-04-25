@@ -500,11 +500,12 @@ class OrderRouter:
 
                     if loop_count % 100 == 1 or sl_dist < 0.5 or tp_dist < 0.5:
                         logger.info(
-                            "[%s] monitor(%s): price=$%.2f SL=$%.2f(%.1f%%) TP=$%.2f(%.1f%%) (%.2fs)",
+                            "[%s] monitor(%s): price=$%.2f pnl=$%+.2f mfe=$%.2f mae=$%.2f "
+                            "SL=$%.2f(%.1f%%) TP=$%.2f(%.1f%%)",
                             pos.symbol, pos.direction, price,
+                            unrealized, pos.mfe, pos.mae,
                             pos.levels.stop_loss, sl_dist,
                             pos.levels.take_profit, tp_dist,
-                            api_time,
                         )
 
                     # LONG: price <= SL → SL, price >= TP → TP
