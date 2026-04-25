@@ -1,6 +1,6 @@
-"""固定割合によるポジションサイズ計算モジュール.
+"""固定額によるポジションサイズ計算モジュール.
 
-POSITION_MAX_PCT の割合で口座残高から株数を計算する。
+POSITION_SIZE_USD の固定額で株数を計算する。
 連続敗北時はサイズを50%に縮小するリスク管理を維持。
 """
 
@@ -24,9 +24,9 @@ class TradeResult:
 
 
 class PositionSizer:
-    """固定割合によるポジションサイズ計算エンジン.
+    """固定額によるポジションサイズ計算エンジン.
 
-    shares = int(account_balance * POSITION_MAX_PCT / price)
+    shares = int(POSITION_SIZE_USD / price)
     連続3敗でサイズ50%縮小。
     """
 
@@ -64,10 +64,8 @@ class PositionSizer:
         if price <= 0 or account_balance <= 0:
             return 0
 
-        max_pct = settings.POSITION_MAX_PCT
-
-        # 固定割合で株数を計算
-        position_value = account_balance * max_pct
+        # 固定額で株数を計算
+        position_value = settings.POSITION_SIZE_USD
         shares = int(position_value / price)
 
         # MIN_POSITION_SHARES の保証
@@ -91,10 +89,10 @@ class PositionSizer:
             shares = 0
 
         logger.info(
-            "[%s] PositionSize: price=%.2f balance=%.0f "
-            "pct=%.0f%% shares=%d (value=$%.0f)",
-            symbol, price, account_balance,
-            max_pct * 100, shares, shares * price,
+            "[%s] PositionSize: price=$%.2f budget=$%.0f "
+            "shares=%d (value=$%.0f, balance=$%.0f)",
+            symbol, price, position_value,
+            shares, shares * price, account_balance,
         )
         return shares
 

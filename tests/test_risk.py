@@ -41,12 +41,12 @@ class TestPositionSizerDefaults:
 class TestPositionSizerCalculate:
     """calculate() のテスト."""
 
-    def test_fixed_pct_calculation(self) -> None:
-        """POSITION_MAX_PCT の固定割合で株数が計算される."""
+    def test_fixed_usd_calculation(self) -> None:
+        """POSITION_SIZE_USD の固定額で株数が計算される."""
         sizer = PositionSizer()
-        # balance=100000 * pct=0.10 / price=150 = 66株
+        # budget=$600 / price=$150 = 4株
         shares = sizer.calculate("AAPL", 150.0, 100_000.0)
-        expected = int(100_000 * settings.POSITION_MAX_PCT / 150.0)
+        expected = int(settings.POSITION_SIZE_USD / 150.0)
         assert shares == expected
 
     def test_zero_price_returns_zero(self) -> None:
@@ -71,10 +71,10 @@ class TestPositionSizerCalculate:
         assert sizer.calculate("BRK.A", 500_000.0, 1_000.0) == 0
 
     def test_min_position_shares_guaranteed(self) -> None:
-        """計算結果が0でもMIN_POSITION_SHARES(1)を保証（買える場合）."""
+        """budget < price でもMIN_POSITION_SHARES(1)を保証（買える場合）."""
         sizer = PositionSizer()
-        # balance=200, pct=0.10, price=150 → int(20/150)=0 → min=1
-        shares = sizer.calculate("AAPL", 150.0, 200.0)
+        # budget=$600 / price=$700 = 0 → min=1, balance=$1000で買える
+        shares = sizer.calculate("META", 700.0, 1_000.0)
         assert shares == 1
 
     def test_consecutive_losses_halve_size(self) -> None:
