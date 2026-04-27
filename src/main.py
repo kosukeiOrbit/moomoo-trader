@@ -213,11 +213,14 @@ async def _short_dryrun(
         if not (individual_short or macro_short):
             return
 
-        pattern = "individual" if individual_short else "macro"
-        individual_would_trigger = (
-            score < settings.SHORT_SENTIMENT_THRESHOLD
-            and confidence > settings.CONFIDENCE_MIN
-        ) if pattern == "macro" else None
+        if individual_short and macro_short:
+            pattern = "both"
+        elif individual_short:
+            pattern = "individual"
+        else:
+            pattern = "macro"
+
+        individual_would_trigger = individual_short if pattern == "macro" else None
 
         snap = client.get_snapshot(symbol)
         if snap is None or snap.last_price <= 0:
