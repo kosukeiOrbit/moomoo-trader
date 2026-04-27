@@ -239,6 +239,13 @@ async def _short_dryrun(
         sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER)
         tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER)
 
+        # 銘柄の当日騰落率（前日終値 vs 現在価格）
+        symbol_change_pct = None
+        if kline is not None and len(kline) >= 1:
+            prev_close = float(kline["close"].iloc[-1])
+            if prev_close > 0:
+                symbol_change_pct = (entry_price - prev_close) / prev_close
+
         _dryrun_entered[symbol] = today
         record = {
             "date": today,
@@ -254,6 +261,7 @@ async def _short_dryrun(
             "confidence": round(confidence, 3),
             "flow_strength": round(flow_strength, 3),
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
+            "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "individual_would_trigger": individual_would_trigger,
             "close_price": None,
             "exit_reason": None,
