@@ -692,6 +692,8 @@ async def main_loop() -> None:
                                 spy_rt=_spy_rt,
                                 sentiment_score=sentiment.score,
                                 sentiment_confidence=sentiment.confidence,
+                                flow_strength=flow.strength,
+                                is_dynamic=symbol not in settings.WATCHLIST,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,

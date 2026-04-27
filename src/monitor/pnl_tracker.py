@@ -42,6 +42,9 @@ class TradeRecord:
     mae: float = 0.0
     sentiment_score: float | None = None
     sentiment_confidence: float | None = None
+    flow_strength: float | None = None
+    commission: float = 0.0         # 往復手数料（ドル）
+    is_dynamic: bool | None = None  # True=スクリーナー由来, False=固定WATCHLIST
 
 
 class PnLTracker:
@@ -56,6 +59,7 @@ class PnLTracker:
         "spy_rt",
         "mfe", "mae",
         "sentiment_score", "sentiment_confidence",
+        "flow_strength", "commission", "net_pnl", "is_dynamic",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -84,6 +88,8 @@ class PnLTracker:
         spy_rt: float | None = None,
         sentiment_score: float | None = None,
         sentiment_confidence: float | None = None,
+        flow_strength: float | None = None,
+        is_dynamic: bool | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -105,6 +111,8 @@ class PnLTracker:
             spy_rt=spy_rt,
             sentiment_score=sentiment_score,
             sentiment_confidence=sentiment_confidence,
+            flow_strength=flow_strength,
+            is_dynamic=is_dynamic,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -149,6 +157,11 @@ class PnLTracker:
         trade.reason = reason
         trade.closed_at = datetime.now()
         trade.mfe = mfe
+
+        # 手数料計算（moomoo日本: 約定代金の0.088%, 最低$0.88, 往復）
+        entry_comm = max(trade.entry_price * trade.size * 0.00088, 0.88)
+        exit_comm = max(exit_price * trade.size * 0.00088, 0.88)
+        trade.commission = round(entry_comm + exit_comm, 2)
         trade.mae = mae
         self._closed_trades.append(trade)
         self._closed_ids.add(order_id)
@@ -354,6 +367,10 @@ class PnLTracker:
                     f"{t.mae:.2f}" if t.mae else "",
                     f"{t.sentiment_score:.2f}" if t.sentiment_score is not None else "",
                     f"{t.sentiment_confidence:.2f}" if t.sentiment_confidence is not None else "",
+                    f"{t.flow_strength:.2f}" if t.flow_strength is not None else "",
+                    f"{t.commission:.2f}" if t.commission else "",
+                    f"{t.pnl - t.commission:.2f}" if t.commission else "",
+                    t.is_dynamic if t.is_dynamic is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
