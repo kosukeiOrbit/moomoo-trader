@@ -158,9 +158,11 @@ class PnLTracker:
         trade.closed_at = datetime.now()
         trade.mfe = mfe
 
-        # 手数料計算（moomoo日本: 約定代金の0.088%, 最低$0.88, 往復）
-        entry_comm = max(trade.entry_price * trade.size * 0.00088, 0.88)
-        exit_comm = max(exit_price * trade.size * 0.00088, 0.88)
+        # 手数料計算（moomoo日本: 約定代金の0.132%(税込), 上限$22, 最低$0.01, 往復）
+        entry_comm = min(trade.entry_price * trade.size * 0.00132, 22.0)
+        exit_comm = min(exit_price * trade.size * 0.00132, 22.0)
+        entry_comm = max(entry_comm, 0.01)
+        exit_comm = max(exit_comm, 0.01)
         trade.commission = round(entry_comm + exit_comm, 2)
         trade.mae = mae
         self._closed_trades.append(trade)
