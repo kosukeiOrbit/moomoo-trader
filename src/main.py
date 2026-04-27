@@ -693,6 +693,19 @@ async def main_loop() -> None:
                             _atr_pct = stop_loss_manager.calc_atr_pct(kline, current_price)
                             _atr_val = current_price * _atr_pct
                             _spy_rt = client.get_spy_intraday_change()
+
+                            # 銘柄の当日騰落率（前日終値 vs 現在価格）
+                            _sym_change = None
+                            if kline is not None and len(kline) >= 1:
+                                _prev_close = float(kline["close"].iloc[-1])
+                                if _prev_close > 0:
+                                    _sym_change = (current_price - _prev_close) / _prev_close
+
+                            # VWAP 乖離率
+                            _vwap_dev = None
+                            if vwap_approx and vwap_approx > 0:
+                                _vwap_dev = (current_price - vwap_approx) / vwap_approx
+
                             pnl_tracker.register(
                                 result.order_id, symbol, decision.direction,
                                 size, current_price,
@@ -705,6 +718,11 @@ async def main_loop() -> None:
                                 sentiment_confidence=sentiment.confidence,
                                 flow_strength=flow.strength,
                                 is_dynamic=symbol not in settings.WATCHLIST,
+                                symbol_change_pct=_sym_change,
+                                vwap_deviation_pct=_vwap_dev,
+                                texts_count=len(texts),
+                                sl_price=levels.stop_loss if levels else None,
+                                tp_price=levels.take_profit if levels else None,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,

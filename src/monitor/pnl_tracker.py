@@ -45,6 +45,11 @@ class TradeRecord:
     flow_strength: float | None = None
     commission: float = 0.0         # 往復手数料（ドル）
     is_dynamic: bool | None = None  # True=スクリーナー由来, False=固定WATCHLIST
+    symbol_change_pct: float | None = None  # 銘柄の当日騰落率
+    vwap_deviation_pct: float | None = None  # VWAPからの乖離率
+    texts_count: int | None = None  # エントリー時のニュース件数
+    sl_price: float | None = None   # SL価格
+    tp_price: float | None = None   # TP価格
 
 
 class PnLTracker:
@@ -60,6 +65,8 @@ class PnLTracker:
         "mfe", "mae",
         "sentiment_score", "sentiment_confidence",
         "flow_strength", "commission", "net_pnl", "is_dynamic",
+        "symbol_change_pct", "vwap_deviation_pct", "texts_count",
+        "sl_price", "tp_price",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -90,6 +97,11 @@ class PnLTracker:
         sentiment_confidence: float | None = None,
         flow_strength: float | None = None,
         is_dynamic: bool | None = None,
+        symbol_change_pct: float | None = None,
+        vwap_deviation_pct: float | None = None,
+        texts_count: int | None = None,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -113,6 +125,11 @@ class PnLTracker:
             sentiment_confidence=sentiment_confidence,
             flow_strength=flow_strength,
             is_dynamic=is_dynamic,
+            symbol_change_pct=symbol_change_pct,
+            vwap_deviation_pct=vwap_deviation_pct,
+            texts_count=texts_count,
+            sl_price=sl_price,
+            tp_price=tp_price,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -373,6 +390,11 @@ class PnLTracker:
                     f"{t.commission:.2f}" if t.commission else "",
                     f"{t.pnl - t.commission:.2f}" if t.commission else "",
                     t.is_dynamic if t.is_dynamic is not None else "",
+                    f"{t.symbol_change_pct:.2f}" if t.symbol_change_pct is not None else "",
+                    f"{t.vwap_deviation_pct:.2f}" if t.vwap_deviation_pct is not None else "",
+                    t.texts_count if t.texts_count is not None else "",
+                    f"{t.sl_price:.2f}" if t.sl_price is not None else "",
+                    f"{t.tp_price:.2f}" if t.tp_price is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
