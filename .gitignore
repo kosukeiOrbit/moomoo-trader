@@ -56,3 +56,8 @@ moomoo_OpenD_*/
 data/trades/
 data/watchlist_dynamic.json
 data/short_dryrun.jsonl
+data/long_skip_dryrun.jsonl
+data/long_full_dryrun.jsonl
+
+# Old log archives
+logs/old/
