@@ -113,6 +113,50 @@ class AndFilter:
             )
         return EntryDecision(go=False)
 
+    def tight_filter_long(
+        self,
+        snap,
+        vwap_price: float | None,
+        atr_pct: float | None = None,
+        is_dynamic: bool = False,
+    ) -> tuple[bool, str]:
+        """LONG エントリーの tight filter (高値掴み・動的中ボラ罠 排除).
+
+        条件:
+          - A2 (R2): vwap_deviation_pct > 1.0% で除外 (強トレンド例外なし)
+          - D  (R1): is_dynamic AND atr_pct ∈ [0.04, 0.05) で除外 (動的小型中ボラ罠)
+
+        Returns:
+            (passed: bool, reason: str)
+            passed=True ならエントリー可、False ならエントリー禁止
+        """
+        if not settings.TIGHT_FILTER_ENABLED:
+            return True, "tight_filter_disabled"
+
+        # Filter D (R1): dynamic + 中ボラ罠 (SNDK, MU, NOW, TER, WDC 等)
+        if (
+            is_dynamic
+            and atr_pct is not None
+            and settings.TIGHT_DYN_MID_ATR_LOW <= atr_pct < settings.TIGHT_DYN_MID_ATR_HIGH
+        ):
+            return False, (
+                f"Filter D: dynamic mid-vol trap "
+                f"(atr_pct={atr_pct:.4f} in [{settings.TIGHT_DYN_MID_ATR_LOW}, "
+                f"{settings.TIGHT_DYN_MID_ATR_HIGH}))"
+            )
+
+        # Filter A2 (R2): VWAP乖離率 (% 表記) で除外 (強トレンド例外を削除)
+        vwap_dev_pct = None
+        if vwap_price and vwap_price > 0 and snap.last_price > 0:
+            vwap_dev_pct = (snap.last_price - vwap_price) / vwap_price * 100
+
+        if vwap_dev_pct is not None and vwap_dev_pct > settings.TIGHT_VWAP_DEV_PCT:
+            return False, (
+                f"Filter A2: vwap_dev={vwap_dev_pct:.2f}% > {settings.TIGHT_VWAP_DEV_PCT}%"
+            )
+
+        return True, "passed"
+
     def _collect_failures(self, sentiment: SentimentResult, flow: FlowSignal) -> list[str]:
         """LONG/SHORT 両方の未達理由を収集する."""
         failures: list[str] = []
