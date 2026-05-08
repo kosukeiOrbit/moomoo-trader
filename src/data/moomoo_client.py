@@ -67,6 +67,50 @@ class QuoteSnapshot:
     last_price: float
     volume: float
     turnover: float
+    # 拡張: 高値掴み判別用の追加フィールド
+    open_price: float = 0.0          # 当日始値 (ET 9:30)
+    high_price: float = 0.0          # 当日高値
+    low_price: float = 0.0           # 当日安値
+    prev_close: float = 0.0          # 前日終値
+    avg_price: float = 0.0           # moomoo 算出の本物のVWAP
+    amplitude: float = 0.0           # 当日値幅率 (%)
+    pre_change_rate: float = 0.0     # プレマーケット変化率 (%)
+    volume_ratio: float = 0.0        # 普段との出来高比
+
+    # ----- 派生指標（snapshot から計算可能） -----
+
+    @property
+    def change_from_open_pct(self) -> float | None:
+        """寄りからの変化率 (%). 高値掴み判別の核心指標."""
+        if self.open_price <= 0:
+            return None
+        return (self.last_price - self.open_price) / self.open_price * 100
+
+    @property
+    def gap_pct(self) -> float | None:
+        """前日終値→当日始値のギャップ率 (%)."""
+        if self.prev_close <= 0 or self.open_price <= 0:
+            return None
+        return (self.open_price - self.prev_close) / self.prev_close * 100
+
+    @property
+    def price_position_in_range(self) -> float | None:
+        """当日レンジ内位置 (0=安値、1=高値). 高値掴みの直接指標."""
+        if self.high_price <= 0 or self.low_price <= 0:
+            return None
+        rng = self.high_price - self.low_price
+        if rng <= 0:
+            return None
+        return (self.last_price - self.low_price) / rng
+
+    @property
+    def best_vwap(self) -> float:
+        """利用可能な最良のVWAP値. avg_price (公式) → turnover/volume (近似) の順."""
+        if self.avg_price > 0:
+            return self.avg_price
+        if self.volume > 0 and self.turnover > 0:
+            return self.turnover / self.volume
+        return 0.0
 
 
 @dataclass
@@ -227,11 +271,30 @@ class MoomooClient:
             return QuoteSnapshot(symbol=symbol, last_price=0.0, volume=0.0, turnover=0.0)
 
         row = data.iloc[0]
+
+        def _safe_float(key: str, default: float = 0.0) -> float:
+            try:
+                v = float(row.get(key, default))
+                # NaN ガード
+                if v != v:
+                    return default
+                return v
+            except (TypeError, ValueError):
+                return default
+
         return QuoteSnapshot(
             symbol=symbol,
-            last_price=float(row.get("last_price", 0)),
-            volume=float(row.get("volume", 0)),
-            turnover=float(row.get("turnover", 0)),
+            last_price=_safe_float("last_price"),
+            volume=_safe_float("volume"),
+            turnover=_safe_float("turnover"),
+            open_price=_safe_float("open_price"),
+            high_price=_safe_float("high_price"),
+            low_price=_safe_float("low_price"),
+            prev_close=_safe_float("prev_close_price"),
+            avg_price=_safe_float("avg_price"),
+            amplitude=_safe_float("amplitude"),
+            pre_change_rate=_safe_float("pre_change_rate"),
+            volume_ratio=_safe_float("volume_ratio"),
         )
 
     # ------------------------------------------------------------------

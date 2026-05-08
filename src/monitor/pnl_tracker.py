@@ -50,6 +50,17 @@ class TradeRecord:
     texts_count: int | None = None  # エントリー時のニュース件数
     sl_price: float | None = None   # SL価格
     tp_price: float | None = None   # TP価格
+    # 高値掴み判別用の追加フィールド
+    open_price: float | None = None             # 当日始値
+    high_price: float | None = None             # 当日高値
+    low_price: float | None = None              # 当日安値
+    prev_close: float | None = None             # 前日終値
+    change_from_open_pct: float | None = None   # 寄りからの変化率 (%)
+    gap_pct: float | None = None                # ギャップ率 (%)
+    price_position_in_range: float | None = None  # レンジ内位置 (0=安値, 1=高値)
+    amplitude: float | None = None              # 当日値幅率 (%)
+    pre_change_rate: float | None = None        # プレマーケット変化率 (%)
+    volume_ratio: float | None = None           # 普段との出来高比
 
 
 class PnLTracker:
@@ -67,6 +78,9 @@ class PnLTracker:
         "flow_strength", "commission", "net_pnl", "is_dynamic",
         "symbol_change_pct", "vwap_deviation_pct", "texts_count",
         "sl_price", "tp_price",
+        "open_price", "high_price", "low_price", "prev_close",
+        "change_from_open_pct", "gap_pct", "price_position_in_range",
+        "amplitude", "pre_change_rate", "volume_ratio",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -102,6 +116,16 @@ class PnLTracker:
         texts_count: int | None = None,
         sl_price: float | None = None,
         tp_price: float | None = None,
+        open_price: float | None = None,
+        high_price: float | None = None,
+        low_price: float | None = None,
+        prev_close: float | None = None,
+        change_from_open_pct: float | None = None,
+        gap_pct: float | None = None,
+        price_position_in_range: float | None = None,
+        amplitude: float | None = None,
+        pre_change_rate: float | None = None,
+        volume_ratio: float | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -130,6 +154,16 @@ class PnLTracker:
             texts_count=texts_count,
             sl_price=sl_price,
             tp_price=tp_price,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            prev_close=prev_close,
+            change_from_open_pct=change_from_open_pct,
+            gap_pct=gap_pct,
+            price_position_in_range=price_position_in_range,
+            amplitude=amplitude,
+            pre_change_rate=pre_change_rate,
+            volume_ratio=volume_ratio,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -377,24 +411,34 @@ class PnLTracker:
                     t.opened_at.isoformat(),
                     t.closed_at.isoformat() if t.closed_at else "",
                     hold_minutes,
-                    f"{t.atr_value:.4f}" if t.atr_value else "",
-                    f"{t.atr_pct:.4f}" if t.atr_pct else "",
+                    f"{t.atr_value:.4f}" if t.atr_value is not None else "",
+                    f"{t.atr_pct:.4f}" if t.atr_pct is not None else "",
                     t.vwap_above if t.vwap_above is not None else "",
-                    f"{t.vwap_price:.4f}" if t.vwap_price else "",
+                    f"{t.vwap_price:.4f}" if t.vwap_price is not None else "",
                     f"{t.spy_rt:.4f}" if t.spy_rt is not None else "",
-                    f"{t.mfe:.2f}" if t.mfe else "",
-                    f"{t.mae:.2f}" if t.mae else "",
+                    f"{t.mfe:.2f}",
+                    f"{t.mae:.2f}",
                     f"{t.sentiment_score:.2f}" if t.sentiment_score is not None else "",
                     f"{t.sentiment_confidence:.2f}" if t.sentiment_confidence is not None else "",
                     f"{t.flow_strength:.2f}" if t.flow_strength is not None else "",
-                    f"{t.commission:.2f}" if t.commission else "",
-                    f"{t.pnl - t.commission:.2f}" if t.commission else "",
+                    f"{t.commission:.2f}",
+                    f"{t.pnl - t.commission:.2f}",
                     t.is_dynamic if t.is_dynamic is not None else "",
                     f"{t.symbol_change_pct:.2f}" if t.symbol_change_pct is not None else "",
                     f"{t.vwap_deviation_pct:.2f}" if t.vwap_deviation_pct is not None else "",
                     t.texts_count if t.texts_count is not None else "",
                     f"{t.sl_price:.2f}" if t.sl_price is not None else "",
                     f"{t.tp_price:.2f}" if t.tp_price is not None else "",
+                    f"{t.open_price:.4f}" if t.open_price is not None else "",
+                    f"{t.high_price:.4f}" if t.high_price is not None else "",
+                    f"{t.low_price:.4f}" if t.low_price is not None else "",
+                    f"{t.prev_close:.4f}" if t.prev_close is not None else "",
+                    f"{t.change_from_open_pct:.3f}" if t.change_from_open_pct is not None else "",
+                    f"{t.gap_pct:.3f}" if t.gap_pct is not None else "",
+                    f"{t.price_position_in_range:.3f}" if t.price_position_in_range is not None else "",
+                    f"{t.amplitude:.3f}" if t.amplitude is not None else "",
+                    f"{t.pre_change_rate:.3f}" if t.pre_change_rate is not None else "",
+                    f"{t.volume_ratio:.3f}" if t.volume_ratio is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
