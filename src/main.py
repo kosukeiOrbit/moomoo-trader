@@ -169,6 +169,7 @@ async def _short_dryrun(
     sentiment_analyzer,
     client,
     stop_loss,
+    order_router=None,
 ) -> None:
     """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する.
 
@@ -227,24 +228,41 @@ async def _short_dryrun(
             return
         entry_price = snap.last_price
 
-        # VWAP 近似計算
-        vwap_approx = None
-        vwap_above = None
-        if snap.volume > 0 and snap.turnover > 0:
-            vwap_approx = snap.turnover / snap.volume
-            vwap_above = entry_price > vwap_approx
+        # VWAP は snapshot の avg_price を優先 (フォールバックで turnover/volume)
+        vwap_value = snap.best_vwap or None
+        vwap_above = entry_price > vwap_value if vwap_value else None
 
         kline = client.get_kline(symbol)
         atr_pct = stop_loss.calc_atr_pct(kline, entry_price)
         sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER)
         tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER)
 
-        # 銘柄の当日騰落率（前日終値 vs 現在価格）
+        # 銘柄の当日騰落率: snapshot の prev_close 優先、フォールバックで kline
+        prev_close_for_calc = snap.prev_close
+        if prev_close_for_calc <= 0 and kline is not None and len(kline) >= 1:
+            prev_close_for_calc = float(kline["close"].iloc[-1])
         symbol_change_pct = None
-        if kline is not None and len(kline) >= 1:
-            prev_close = float(kline["close"].iloc[-1])
-            if prev_close > 0:
-                symbol_change_pct = (entry_price - prev_close) / prev_close
+        if prev_close_for_calc > 0:
+            symbol_change_pct = (entry_price - prev_close_for_calc) / prev_close_for_calc
+
+        # IF分析用: would_pass_short_filter_v1
+        # F1+F2: VWAP上 AND (symChg<0 OR symChg>5%)
+        sym_chg_pct = (symbol_change_pct * 100) if symbol_change_pct is not None else None
+        f1_pass = (vwap_above is True)  # VWAP上のみ
+        f2_pass = (sym_chg_pct is not None and (sym_chg_pct < 0 or sym_chg_pct > 5))
+        would_pass = f1_pass and f2_pass
+
+        # スロット負荷: 信号発生時の LONG ポジション数
+        slot_load = order_router.long_count if order_router is not None else None
+
+        # ET 市場開始からの経過秒数 (9:30 ET = 22:30 JST DST)
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            now_et = datetime.now(_ZI("America/New_York"))
+            mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            sec_since_open = int((now_et - mkt_open).total_seconds())
+        except Exception:
+            sec_since_open = None
 
         _dryrun_entered[symbol] = today
         record = {
@@ -253,7 +271,7 @@ async def _short_dryrun(
             "pattern": pattern,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
             "entry_price": round(entry_price, 4),
-            "vwap": round(vwap_approx, 4) if vwap_approx else None,
+            "vwap": round(vwap_value, 4) if vwap_value else None,
             "vwap_above": vwap_above,
             "sl_price": round(sl_price, 4),
             "tp_price": round(tp_price, 4),
@@ -263,6 +281,28 @@ async def _short_dryrun(
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
             "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "individual_would_trigger": individual_would_trigger,
+            # 高値掴み判別用フィールド
+            "open_price": round(snap.open_price, 4) if snap.open_price > 0 else None,
+            "high_price": round(snap.high_price, 4) if snap.high_price > 0 else None,
+            "low_price": round(snap.low_price, 4) if snap.low_price > 0 else None,
+            "prev_close": round(snap.prev_close, 4) if snap.prev_close > 0 else None,
+            "change_from_open_pct": round(snap.change_from_open_pct, 3) if snap.change_from_open_pct is not None else None,
+            "gap_pct": round(snap.gap_pct, 3) if snap.gap_pct is not None else None,
+            "price_position_in_range": round(snap.price_position_in_range, 3) if snap.price_position_in_range is not None else None,
+            "amplitude": round(snap.amplitude, 3) if snap.amplitude > 0 else None,
+            "pre_change_rate": round(snap.pre_change_rate, 3),
+            "volume_ratio": round(snap.volume_ratio, 3) if snap.volume_ratio > 0 else None,
+            # IF分析用フィールド
+            "would_pass_short_filter_v1": would_pass,
+            "filter_v1_reason": (
+                "passed" if would_pass
+                else (
+                    "F1_fail_vwap_below" if not f1_pass
+                    else "F2_fail_symchg_0to5"
+                )
+            ),
+            "slot_load_at_signal": slot_load,
+            "seconds_since_market_open": sec_since_open,
             "close_price": None,
             "exit_reason": None,
             "virtual_pnl": None,
@@ -337,6 +377,233 @@ async def _short_dryrun_close(client) -> None:
 
     except Exception:
         logger.warning("[DRY-RUN SHORT CLOSE] エラー（無視）", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# LONG スキップ期間 ドライラン (IF分析用)
+# ---------------------------------------------------------------------------
+
+_long_skip_dryrun_recorded: dict[str, str] = {}
+_LONG_SKIP_DRYRUN_PATH = Path(_project_root) / "data" / "long_skip_dryrun.jsonl"
+
+_long_full_dryrun_recorded: dict[str, str] = {}
+_LONG_FULL_DRYRUN_PATH = Path(_project_root) / "data" / "long_full_dryrun.jsonl"
+
+
+async def _long_dryrun_record(
+    symbol: str,
+    sentiment,
+    flow,
+    snap,
+    vwap_approx: float | None,
+    vwap_above: bool | None,
+    levels,
+    kline,
+    stop_loss,
+    client,
+    texts_count: int,
+    tight_pass: bool = True,
+    tight_reason: str = "",
+    dryrun_type: str = "skip",  # "skip" or "full"
+    slot_count_at_signal: int | None = None,
+) -> None:
+    """LONG エントリー条件成立を JSONL に記録する (実発注なし).
+
+    dryrun_type:
+      - "skip": スキップ期間中 (22:30-23:30) のシグナル → long_skip_dryrun.jsonl
+      - "full": 5枠フル時のシグナル → long_full_dryrun.jsonl
+
+    同一銘柄は1セッション1回のみ記録（最初に条件成立した時点）。
+    """
+    try:
+        today = date.today().isoformat()
+        if dryrun_type == "skip":
+            recorded_dict = _long_skip_dryrun_recorded
+            output_path = _LONG_SKIP_DRYRUN_PATH
+        else:  # "full"
+            recorded_dict = _long_full_dryrun_recorded
+            output_path = _LONG_FULL_DRYRUN_PATH
+
+        if recorded_dict.get(symbol) == today:
+            return
+
+        entry_price = snap.last_price
+        if entry_price <= 0:
+            return
+
+        atr_pct = stop_loss.calc_atr_pct(kline, entry_price)
+        sl_price = levels.stop_loss if levels else entry_price * (1 - atr_pct * settings.ATR_SL_MULTIPLIER)
+        tp_price = levels.take_profit if levels else entry_price * (1 + atr_pct * settings.ATR_TP_MULTIPLIER)
+
+        # 銘柄の当日騰落率: snapshot の prev_close 優先、フォールバックで kline
+        prev_close_for_calc = snap.prev_close
+        if prev_close_for_calc <= 0 and kline is not None and len(kline) >= 1:
+            prev_close_for_calc = float(kline["close"].iloc[-1])
+        symbol_change_pct = None
+        if prev_close_for_calc > 0:
+            symbol_change_pct = (entry_price - prev_close_for_calc) / prev_close_for_calc
+
+        vwap_dev = None
+        if vwap_approx and vwap_approx > 0:
+            vwap_dev = (entry_price - vwap_approx) / vwap_approx
+
+        spy_rt = client.get_spy_intraday_change()
+
+        recorded_dict[symbol] = today
+        record = {
+            "date": today,
+            "symbol": symbol,
+            "dryrun_type": dryrun_type,
+            "slot_count_at_signal": slot_count_at_signal,
+            "first_signal_time": datetime.now().strftime("%H:%M:%S"),
+            "first_signal_price": round(entry_price, 4),
+            "vwap": round(vwap_approx, 4) if vwap_approx else None,
+            "vwap_above": vwap_above,
+            "vwap_deviation_pct": round(vwap_dev * 100, 2) if vwap_dev is not None else None,
+            "atr_value": round(atr_pct * entry_price, 4),
+            "atr_pct": round(atr_pct, 4),
+            "sl_price": round(sl_price, 4),
+            "tp_price": round(tp_price, 4),
+            "score": round(sentiment.score, 3),
+            "confidence": round(sentiment.confidence, 3),
+            "flow_strength": round(flow.strength, 3),
+            "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
+            "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
+            "texts_count": texts_count,
+            "is_dynamic": symbol not in settings.WATCHLIST,
+            # 高値掴み判別用フィールド
+            "open_price": round(snap.open_price, 4) if snap.open_price > 0 else None,
+            "high_price": round(snap.high_price, 4) if snap.high_price > 0 else None,
+            "low_price": round(snap.low_price, 4) if snap.low_price > 0 else None,
+            "prev_close": round(snap.prev_close, 4) if snap.prev_close > 0 else None,
+            "change_from_open_pct": round(snap.change_from_open_pct, 3) if snap.change_from_open_pct is not None else None,
+            "gap_pct": round(snap.gap_pct, 3) if snap.gap_pct is not None else None,
+            "price_position_in_range": round(snap.price_position_in_range, 3) if snap.price_position_in_range is not None else None,
+            "amplitude": round(snap.amplitude, 3) if snap.amplitude > 0 else None,
+            "pre_change_rate": round(snap.pre_change_rate, 3),
+            "volume_ratio": round(snap.volume_ratio, 3) if snap.volume_ratio > 0 else None,
+            # tight filter 評価結果 (IF分析用)
+            "tight_filter_pass": tight_pass,
+            "tight_filter_reason": tight_reason,
+            # 後で埋める
+            "actual_entry_at": None,
+            "actual_entry_price": None,
+            "actual_pnl": None,
+            "close_price": None,
+            "close_time": None,
+            "exit_reason": None,
+            "virtual_pnl": None,
+        }
+        output_path.parent.mkdir(exist_ok=True)
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
+
+        logger.info(
+            "[DRY-RUN LONG-%s] %s entry=%.2f SL=%.2f TP=%.2f "
+            "score=%.3f conf=%.3f flow=%.3f vwap_dev=%s%% slots=%s tight=%s",
+            dryrun_type.upper(), symbol, entry_price, sl_price, tp_price,
+            sentiment.score, sentiment.confidence, flow.strength,
+            f"{vwap_dev*100:+.2f}" if vwap_dev is not None else "NA",
+            slot_count_at_signal if slot_count_at_signal is not None else "?",
+            "PASS" if tight_pass else "REJECT",
+        )
+    except Exception:
+        logger.warning("[DRY-RUN LONG-%s] %s エラー（無視）", dryrun_type.upper(), symbol, exc_info=True)
+
+
+async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> None:
+    """LONG ドライランの仮想決済 + 実エントリー紐付け.
+
+    各レコードについて:
+    - close_price: 現在のスナップショット価格
+    - virtual_pnl: 仮想エントリー価格→close_price で SL/TP/EOD を判定
+    - actual_entry_at/price/pnl: 同じセッションで同銘柄を実エントリーしていれば紐付け
+    """
+    try:
+        output_path = _LONG_SKIP_DRYRUN_PATH if dryrun_type == "skip" else _LONG_FULL_DRYRUN_PATH
+        if not output_path.exists():
+            return
+
+        records: list[dict] = []
+        with open(output_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(_json.loads(line))
+
+        # pnl_tracker から実トレードを引く (open + closed)
+        all_trades = list(pnl_tracker._open_trades.values()) + pnl_tracker._closed_trades
+
+        updated = False
+        for rec in records:
+            if rec.get("close_price") is not None:
+                continue  # 処理済み
+
+            # 1) 仮想決済
+            try:
+                snap = client.get_snapshot(rec["symbol"])
+                if snap is None or snap.last_price <= 0:
+                    continue
+                close_price = snap.last_price
+            except Exception:
+                continue
+
+            entry_price = rec["first_signal_price"]
+            sl_price = rec["sl_price"]
+            tp_price = rec["tp_price"]
+
+            if close_price <= sl_price:
+                exit_reason = "SL"
+                v_pnl = sl_price - entry_price
+            elif close_price >= tp_price:
+                exit_reason = "TP"
+                v_pnl = tp_price - entry_price
+            else:
+                exit_reason = "FORCE_CLOSE"
+                v_pnl = close_price - entry_price
+
+            rec["close_price"] = round(close_price, 4)
+            rec["close_time"] = datetime.now().strftime("%H:%M:%S")
+            rec["virtual_pnl"] = round(v_pnl, 4)
+            rec["exit_reason"] = exit_reason
+
+            # 2) 実エントリー紐付け（同銘柄・direction=LONG・first_signal_time 以降）
+            try:
+                first_sig_str = f"{rec['date']} {rec['first_signal_time']}"
+                first_sig_dt = datetime.fromisoformat(first_sig_str.replace(" ", "T"))
+            except Exception:
+                first_sig_dt = None
+
+            for t in all_trades:
+                if t.symbol != rec["symbol"] or t.direction != "LONG":
+                    continue
+                if first_sig_dt and t.opened_at < first_sig_dt:
+                    continue
+                rec["actual_entry_at"] = t.opened_at.strftime("%H:%M:%S")
+                rec["actual_entry_price"] = round(t.entry_price, 4)
+                # 決済済みなら確定 PnL、未決済なら現在価格ベース
+                if t.exit_price is not None:
+                    actual_pnl = (t.exit_price - t.entry_price) * t.size
+                else:
+                    actual_pnl = (close_price - t.entry_price) * t.size
+                rec["actual_pnl"] = round(actual_pnl, 4)
+                break  # 最初のマッチのみ
+
+            updated = True
+            logger.info(
+                "[DRY-RUN LONG-%s CLOSE] %s entry=%.2f close=%.2f v_pnl=%+.2f actual=%s",
+                dryrun_type.upper(),
+                rec["symbol"], entry_price, close_price, v_pnl,
+                f"{rec['actual_entry_at']}@{rec['actual_entry_price']}" if rec["actual_entry_at"] else "なし",
+            )
+
+        if updated:
+            with open(output_path, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(_json.dumps(rec) + "\n")
+
+    except Exception:
+        logger.warning("[DRY-RUN LONG-%s CLOSE] エラー（無視）", dryrun_type.upper(), exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +741,21 @@ async def main_loop() -> None:
                 # 2) 全ポジションを同期で決済（確実に全注文を送る）
                 order_router.exit_all_sync("ET 15:50 force close")
 
+                # 3) LONG skip/full dryrun の仮想決済 + 実エントリー紐付け
+                if settings.LONG_SKIP_DRY_RUN:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
+                if settings.LONG_FULL_DRY_RUN:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+
                 notifier.notify_circuit_breaker("ET 15:50 all positions force-closed")
+                break
+
+            # ポジション無しでも force_exit 時刻なら LONG dryrun を閉じて終了
+            if should_force_exit():
+                if settings.LONG_SKIP_DRY_RUN:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
+                if settings.LONG_FULL_DRY_RUN:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
                 break
 
             # --- 市場クローズ中は待機 ---
@@ -528,8 +809,14 @@ async def main_loop() -> None:
                 total_assets, buying_power, pnl_tracker.daily_pnl,
             )
             # スキャンスキップ判定
+            # - LONG_SKIP_DRY_RUN=true なら寄り付き期間もスキャン (実発注なし、JSONL記録のみ)
+            # - LONG_FULL_DRY_RUN=true なら枠フル時もスキャン (実発注なし、JSONL記録のみ)
+            in_open_skip = is_market_open_skip()
+            slots_full = order_router.long_count >= settings.LONG_MAX_POSITIONS
+            scan_skip_for_open = in_open_skip and not settings.LONG_SKIP_DRY_RUN
+            scan_skip_for_full = slots_full and not settings.LONG_FULL_DRY_RUN
             skip_reason = None
-            if is_market_open_skip():
+            if scan_skip_for_open:
                 now_et = datetime.now(ET)
                 skip_until = now_et.replace(hour=9, minute=30, second=0) + timedelta(
                     minutes=settings.MARKET_OPEN_SKIP_MINUTES,
@@ -538,7 +825,7 @@ async def main_loop() -> None:
                     f"Opening skip: {settings.MARKET_OPEN_SKIP_MINUTES}min "
                     f"(until ET {skip_until.strftime('%H:%M')})"
                 )
-            elif order_router.long_count >= settings.LONG_MAX_POSITIONS:
+            elif scan_skip_for_full:
                 skip_reason = f"LONG_MAX_POSITIONS({settings.LONG_MAX_POSITIONS}) reached"
             elif buying_power < settings.MIN_BUYING_POWER:
                 skip_reason = f"Insufficient buying power (${buying_power:.0f} < ${settings.MIN_BUYING_POWER})"
@@ -550,6 +837,21 @@ async def main_loop() -> None:
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 logger.info("=== loop #%d wake ===", _loop_count)
                 continue
+
+            if in_open_skip:
+                _skip_total = 30 + settings.MARKET_OPEN_SKIP_MINUTES  # 9:30 + skip分
+                _skip_h = 9 + _skip_total // 60
+                _skip_m = _skip_total % 60
+                logger.info(
+                    "Opening skip period: scanning for IF analysis (no real LONG entries until ET %d:%02d)",
+                    _skip_h, _skip_m,
+                )
+
+            if slots_full:
+                logger.info(
+                    "LONG slots full (%d/%d): scanning for IF analysis (no real LONG entries)",
+                    order_router.long_count, settings.LONG_MAX_POSITIONS,
+                )
 
             existing_symbols = {p.symbol for p in order_router.open_positions.values()}
 
@@ -585,6 +887,7 @@ async def main_loop() -> None:
                                     sentiment_analyzer=sentiment_analyzer,
                                     client=client,
                                     stop_loss=stop_loss_manager,
+                                    order_router=order_router,
                                 )
                             logger.info(
                                 "[%s] flow=SELL(%.2f) -> SHORT candidate (not yet implemented)",
@@ -600,6 +903,7 @@ async def main_loop() -> None:
                                     sentiment_analyzer=sentiment_analyzer,
                                     client=client,
                                     stop_loss=stop_loss_manager,
+                                    order_router=order_router,
                                 )
                             logger.info(
                                 "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
@@ -646,17 +950,12 @@ async def main_loop() -> None:
                     sentiment = sentiment_analyzer.analyze(texts, symbol)
                     decision = and_filter.should_enter(sentiment, flow)
 
-                    # VWAP近似計算（既存のsnapを再利用）
+                    # VWAP は snapshot の avg_price を優先 (フォールバックで turnover/volume)
                     vwap_str = "N/A"
-                    vwap_approx = None
-                    vwap_above = None
-                    try:
-                        if snap.volume > 0 and snap.turnover > 0:
-                            vwap_approx = snap.turnover / snap.volume
-                            vwap_above = snap.last_price > vwap_approx
-                            vwap_str = f"{vwap_approx:.2f}({'上' if vwap_above else '下'})"
-                    except Exception:
-                        pass
+                    vwap_approx = snap.best_vwap or None
+                    vwap_above = snap.last_price > vwap_approx if vwap_approx else None
+                    if vwap_approx:
+                        vwap_str = f"{vwap_approx:.2f}({'上' if vwap_above else '下'})"
 
                     logger.info(
                         "[%s] texts=%d sentiment=%.2f conf=%.2f flow=%s(%.2f) "
@@ -673,13 +972,76 @@ async def main_loop() -> None:
                         if current_price <= 0:
                             continue
 
-                        size = position_sizer.calculate(
-                            symbol, current_price, buying_power,
-                        )
                         kline = client.get_kline(symbol)
                         levels = stop_loss_manager.calculate_levels(
                             symbol, current_price,
                             price_history=kline, direction=decision.direction,
+                        )
+
+                        # tight filter 評価 (LONG のみ。実エントリーをゲート、dryrun は記録継続)
+                        tight_pass = True
+                        tight_reason = "n/a"
+                        if decision.direction == "LONG":
+                            _atr_pct_for_filter = stop_loss_manager.calc_atr_pct(kline, current_price)
+                            _is_dynamic_for_filter = symbol not in settings.WATCHLIST
+                            tight_pass, tight_reason = and_filter.tight_filter_long(
+                                snapshot, vwap_approx,
+                                atr_pct=_atr_pct_for_filter,
+                                is_dynamic=_is_dynamic_for_filter,
+                            )
+
+                        # スキップ期間中の LONG は実発注せず JSONL に記録（IF分析用）
+                        if in_open_skip and decision.direction == "LONG" and settings.LONG_SKIP_DRY_RUN:
+                            await _long_dryrun_record(
+                                symbol=symbol,
+                                sentiment=sentiment,
+                                flow=flow,
+                                snap=snapshot,
+                                vwap_approx=vwap_approx,
+                                vwap_above=vwap_above,
+                                levels=levels,
+                                kline=kline,
+                                stop_loss=stop_loss_manager,
+                                client=client,
+                                texts_count=len(texts),
+                                tight_pass=tight_pass,
+                                tight_reason=tight_reason,
+                                dryrun_type="skip",
+                                slot_count_at_signal=order_router.long_count,
+                            )
+                            continue
+
+                        # 枠フル時の LONG は実発注せず JSONL に記録（IF分析用）
+                        if slots_full and decision.direction == "LONG" and settings.LONG_FULL_DRY_RUN:
+                            await _long_dryrun_record(
+                                symbol=symbol,
+                                sentiment=sentiment,
+                                flow=flow,
+                                snap=snapshot,
+                                vwap_approx=vwap_approx,
+                                vwap_above=vwap_above,
+                                levels=levels,
+                                kline=kline,
+                                stop_loss=stop_loss_manager,
+                                client=client,
+                                texts_count=len(texts),
+                                tight_pass=tight_pass,
+                                tight_reason=tight_reason,
+                                dryrun_type="full",
+                                slot_count_at_signal=order_router.long_count,
+                            )
+                            continue
+
+                        # tight filter 不合格なら実発注せず ログのみ
+                        if decision.direction == "LONG" and not tight_pass:
+                            logger.info(
+                                "[%s] AND pass but TIGHT FILTER REJECTED: %s",
+                                symbol, tight_reason,
+                            )
+                            continue
+
+                        size = position_sizer.calculate(
+                            symbol, current_price, buying_power,
                         )
                         result = await order_router.enter(
                             decision, symbol, size, current_price, levels,
@@ -689,17 +1051,18 @@ async def main_loop() -> None:
                                 "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
                                 symbol, decision.direction, size, current_price, result.order_id,
                             )
-                            # ATR/VWAP/SPY を記録用に取得（既存変数を流用）
+                            # ATR/SPY を記録用に取得
                             _atr_pct = stop_loss_manager.calc_atr_pct(kline, current_price)
                             _atr_val = current_price * _atr_pct
                             _spy_rt = client.get_spy_intraday_change()
 
-                            # 銘柄の当日騰落率（前日終値 vs 現在価格）
+                            # 銘柄の当日騰落率: snapshot の prev_close 優先、フォールバック kline
+                            _prev_close_calc = snapshot.prev_close
+                            if _prev_close_calc <= 0 and kline is not None and len(kline) >= 1:
+                                _prev_close_calc = float(kline["close"].iloc[-1])
                             _sym_change = None
-                            if kline is not None and len(kline) >= 1:
-                                _prev_close = float(kline["close"].iloc[-1])
-                                if _prev_close > 0:
-                                    _sym_change = (current_price - _prev_close) / _prev_close
+                            if _prev_close_calc > 0:
+                                _sym_change = (current_price - _prev_close_calc) / _prev_close_calc
 
                             # VWAP 乖離率
                             _vwap_dev = None
@@ -723,6 +1086,17 @@ async def main_loop() -> None:
                                 texts_count=len(texts),
                                 sl_price=levels.stop_loss if levels else None,
                                 tp_price=levels.take_profit if levels else None,
+                                # 高値掴み判別用フィールド (snapshot から)
+                                open_price=snapshot.open_price if snapshot.open_price > 0 else None,
+                                high_price=snapshot.high_price if snapshot.high_price > 0 else None,
+                                low_price=snapshot.low_price if snapshot.low_price > 0 else None,
+                                prev_close=snapshot.prev_close if snapshot.prev_close > 0 else None,
+                                change_from_open_pct=snapshot.change_from_open_pct,
+                                gap_pct=snapshot.gap_pct,
+                                price_position_in_range=snapshot.price_position_in_range,
+                                amplitude=snapshot.amplitude if snapshot.amplitude > 0 else None,
+                                pre_change_rate=snapshot.pre_change_rate,
+                                volume_ratio=snapshot.volume_ratio if snapshot.volume_ratio > 0 else None,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,
