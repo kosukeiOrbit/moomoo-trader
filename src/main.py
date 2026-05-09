@@ -389,6 +389,99 @@ _LONG_SKIP_DRYRUN_PATH = Path(_project_root) / "data" / "long_skip_dryrun.jsonl"
 _long_full_dryrun_recorded: dict[str, str] = {}
 _LONG_FULL_DRYRUN_PATH = Path(_project_root) / "data" / "long_full_dryrun.jsonl"
 
+# 押し目待ちキュー: vwap_dev > PULLBACK_VWAP_ENTRY_PCT で発火した銘柄を保持
+# {symbol: {fired_at, decision, sentiment, vwap_price, kline, texts_count, entry_price_at_signal}}
+# 注: flow/levels/atr_pct/snapshot は queue 処理時に再取得 (古い値で発注しないため)
+_pullback_queue: dict[str, dict] = {}
+
+# 押し目待ちイベント記録 (IF分析用)
+_PULLBACK_LOG_PATH = Path(_project_root) / "data" / "pullback_log.jsonl"
+
+
+def _log_pullback_event(event: dict) -> None:
+    """押し目待ちイベントを JSONL に記録. エラーは握りつぶして本処理に影響させない."""
+    try:
+        event = {"date": date.today().isoformat(), **event}
+        _PULLBACK_LOG_PATH.parent.mkdir(exist_ok=True)
+        with open(_PULLBACK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(event) + "\n")
+    except Exception:
+        logger.warning("[pullback_log] 記録エラー（無視）", exc_info=True)
+
+
+# Filter D 候補記録 (log-only 期間中のデータ蓄積用)
+_filter_d_recorded: dict[str, str] = {}
+_FILTER_D_LOG_PATH = Path(_project_root) / "data" / "filter_d_log.jsonl"
+
+# モメンタム検知 (1セッション1回 / Bot再起動でリセット)
+_momentum_scan_done: bool = False
+_momentum_added_symbols: set[str] = set()
+_MOMENTUM_CANDIDATES_PATH = Path(_project_root) / "data" / "momentum_candidates.json"
+
+
+def _log_filter_d_event(event: dict) -> None:
+    """Filter D 候補をJSONLに記録. エラーは握りつぶす."""
+    try:
+        event = {"date": date.today().isoformat(), **event}
+        _FILTER_D_LOG_PATH.parent.mkdir(exist_ok=True)
+        with open(_FILTER_D_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(event) + "\n")
+    except Exception:
+        logger.warning("[filter_d_log] 記録エラー（無視）", exc_info=True)
+
+
+async def _filter_d_log_close(client) -> None:
+    """Filter D log の close_price/virtual_pnl を更新 (ET 15:50 強制決済時に呼ぶ)."""
+    try:
+        if not _FILTER_D_LOG_PATH.exists():
+            return
+        records: list[dict] = []
+        with open(_FILTER_D_LOG_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(_json.loads(line))
+        updated = False
+        for rec in records:
+            if rec.get("close_price") is not None:
+                continue  # 処理済み
+            try:
+                snap = client.get_snapshot(rec["symbol"])
+            except Exception:
+                continue
+            if snap is None or snap.last_price <= 0:
+                continue
+            close_price = snap.last_price
+            entry_price = rec["entry_price"]
+            sl_price = rec.get("sl_price")
+            tp_price = rec.get("tp_price")
+
+            if sl_price is not None and close_price <= sl_price:
+                exit_reason = "SL"
+                v_pnl = sl_price - entry_price
+            elif tp_price is not None and close_price >= tp_price:
+                exit_reason = "TP"
+                v_pnl = tp_price - entry_price
+            else:
+                exit_reason = "FORCE_CLOSE"
+                v_pnl = close_price - entry_price
+
+            rec["close_price"] = round(close_price, 4)
+            rec["close_time"] = datetime.now().strftime("%H:%M:%S")
+            rec["exit_reason"] = exit_reason
+            rec["virtual_pnl"] = round(v_pnl, 4)
+            updated = True
+            logger.info(
+                "[FILTER-D CLOSE] %s entry=%.2f close=%.2f v_pnl=%+.2f reason=%s",
+                rec["symbol"], entry_price, close_price, v_pnl, exit_reason,
+            )
+        if updated:
+            with open(_FILTER_D_LOG_PATH, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        logger.warning("[filter_d_log] close エラー（無視）", exc_info=True)
+
 
 async def _long_dryrun_record(
     symbol: str,
@@ -607,12 +700,114 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
 
 
 # ---------------------------------------------------------------------------
+# モメンタム検知 (寄付き直前の急騰銘柄を当日 watchlist に追加)
+# ---------------------------------------------------------------------------
+
+async def _scan_momentum_symbols(client, watchlist: list[str]) -> None:
+    """待機期間中(22:30-22:45)に pre/after_change_rate が高い銘柄を検知し
+    momentum フラグを立てる. 候補プールに無い銘柄は当日 watchlist に追加.
+
+    対象:
+      - momentum_candidates.json (Finviz top N、固定WL除外で生成)
+      - 既存 watchlist 全銘柄 (固定WL + 動的WL)
+      → ユニオンを scan、急騰銘柄全件に momentum フラグを立てる
+
+    エラーは握りつぶして本処理に影響させない。
+    """
+    try:
+        # 1) 候補銘柄リスト (Finviz top 100、固定WL除外) を読み込み
+        candidate_pool: list[str] = []
+        if _MOMENTUM_CANDIDATES_PATH.exists():
+            data = _json.loads(_MOMENTUM_CANDIDATES_PATH.read_text(encoding="utf-8"))
+            try:
+                generated_at = datetime.fromisoformat(data.get("generated_at", ""))
+                age_hours = (datetime.now() - generated_at).total_seconds() / 3600
+                if age_hours > 24:
+                    logger.info("[Momentum] momentum_candidates.json が古い(%.0fh) → 既存watchlistのみscan", age_hours)
+                else:
+                    candidate_pool = data.get("symbols", [])
+            except (ValueError, TypeError):
+                logger.warning("[Momentum] generated_at パース失敗")
+        else:
+            logger.info("[Momentum] momentum_candidates.json なし → 既存watchlistのみscan")
+
+        # 2) scan対象 = 既存watchlist ∪ 候補プール
+        scan_set: list[str] = list(dict.fromkeys(list(watchlist) + candidate_pool))
+        if not scan_set:
+            logger.info("[Momentum] scan対象なし → スキップ")
+            return
+
+        logger.info(
+            "[Momentum] %d銘柄の pre/after_change_rate を確認中 (既存%d + 候補%d)...",
+            len(scan_set), len(watchlist), len(candidate_pool),
+        )
+
+        # 3) バッチ取得
+        codes = [f"US.{s}" for s in scan_set]
+        snapshots = client.get_snapshots(codes)
+
+        # 4) 閾値超え銘柄を全件抽出
+        momentum_hits: list[tuple[str, float]] = []
+        for symbol, snap in snapshots.items():
+            if snap is None:
+                continue
+            pre_change = snap.pre_change_rate or 0.0
+            after_change = snap.after_change_rate or 0.0
+            max_change = max(pre_change, after_change)
+            if max_change >= settings.MOMENTUM_THRESHOLD_PCT:
+                momentum_hits.append((symbol, max_change))
+                logger.info(
+                    "[Momentum] %s pre=%.2f%% after=%.2f%% → momentum認定%s",
+                    symbol, pre_change, after_change,
+                    "" if symbol not in watchlist else " (既存WL内)",
+                )
+
+        if not momentum_hits:
+            logger.info(
+                "[Momentum] 閾値超え銘柄なし (threshold=%.1f%%)",
+                settings.MOMENTUM_THRESHOLD_PCT,
+            )
+            return
+
+        # 5) 全件に momentum フラグを立てる (既存 / 新規 問わず)
+        momentum_hits.sort(key=lambda x: x[1], reverse=True)
+        for symbol, _change in momentum_hits:
+            _momentum_added_symbols.add(symbol)
+
+        # 6) watchlist になかった銘柄のみ、上位 MOMENTUM_MAX_SYMBOLS 個まで watchlist 追加
+        new_to_watchlist: list[str] = []
+        for symbol, _change in momentum_hits:
+            if symbol not in watchlist:
+                if len(new_to_watchlist) < settings.MOMENTUM_MAX_SYMBOLS:
+                    watchlist.append(symbol)
+                    new_to_watchlist.append(symbol)
+
+        # 7) リアルタイム購読 (新規追加分のみ)
+        if new_to_watchlist:
+            try:
+                client.subscribe_realtime(new_to_watchlist)
+            except Exception:
+                logger.warning("[Momentum] subscribe_realtime 失敗（無視）", exc_info=True)
+
+        existing_flagged = [s for s, _ in momentum_hits if s not in new_to_watchlist]
+        logger.info(
+            "[Momentum] 完了: %d銘柄 momentum認定 (既存WL内%d件にflag, 新規追加%d件: %s)",
+            len(momentum_hits),
+            len(existing_flagged),
+            len(new_to_watchlist),
+            " ".join(new_to_watchlist) if new_to_watchlist else "なし",
+        )
+    except Exception:
+        logger.warning("[Momentum] モメンタム検知エラー（無視）", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # メインループ
 # ---------------------------------------------------------------------------
 
 async def main_loop() -> None:
     """メインループ: データ収集 → シグナル生成 → リスク計算 → 発注."""
-    global _shutdown_requested
+    global _shutdown_requested, _momentum_scan_done
 
     # シグナルハンドラ登録
     signal.signal(signal.SIGINT, _handle_shutdown)
@@ -746,6 +941,8 @@ async def main_loop() -> None:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
                 if settings.LONG_FULL_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+                # Filter D log の close_price/virtual_pnl 更新
+                await _filter_d_log_close(client)
 
                 notifier.notify_circuit_breaker("ET 15:50 all positions force-closed")
                 break
@@ -756,6 +953,7 @@ async def main_loop() -> None:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
                 if settings.LONG_FULL_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+                await _filter_d_log_close(client)
                 break
 
             # --- 市場クローズ中は待機 ---
@@ -847,11 +1045,182 @@ async def main_loop() -> None:
                     _skip_h, _skip_m,
                 )
 
+                # モメンタム検知 (1セッション1回のみ)
+                if not _momentum_scan_done:
+                    await _scan_momentum_symbols(client=client, watchlist=watchlist)
+                    _momentum_scan_done = True
+
             if slots_full:
                 logger.info(
                     "LONG slots full (%d/%d): scanning for IF analysis (no real LONG entries)",
                     order_router.long_count, settings.LONG_MAX_POSITIONS,
                 )
+
+            # --- 押し目待ちキュー処理 ---
+            # 各銘柄: タイムアウト/重複/枠フル を確認 → 押し目到来なら実エントリー
+            # 寄り付きスキップ中はキュー処理もスキップ (ノイズ期間に入らない)
+            if settings.PULLBACK_ENABLED and _pullback_queue and not in_open_skip:
+                for _pb_symbol in list(_pullback_queue.keys()):
+                    _pb = _pullback_queue[_pb_symbol]
+
+                    # タイムアウトチェック
+                    _elapsed_min = (datetime.now() - _pb['fired_at']).total_seconds() / 60
+                    if _elapsed_min > settings.PULLBACK_TIMEOUT_MINUTES:
+                        # 最終価格 + 価格変化率を記録
+                        _t_final_price = None
+                        try:
+                            _t_snap = client.get_snapshot(_pb_symbol)
+                            if _t_snap and _t_snap.last_price > 0:
+                                _t_final_price = _t_snap.last_price
+                        except Exception:
+                            pass
+                        _t_signal_price = _pb.get('entry_price_at_signal', 0) or 0
+                        _t_chg_pct = None
+                        if _t_final_price and _t_signal_price > 0:
+                            _t_chg_pct = (_t_final_price - _t_signal_price) / _t_signal_price * 100
+                        _log_pullback_event({
+                            "event": "timeout",
+                            "symbol": _pb_symbol,
+                            "timeout_at": datetime.now().strftime("%H:%M:%S"),
+                            "wait_minutes": round(_elapsed_min, 1),
+                            "final_price": round(_t_final_price, 4) if _t_final_price else None,
+                            "price_change_pct": round(_t_chg_pct, 3) if _t_chg_pct is not None else None,
+                        })
+                        logger.info(
+                            "[%s] 押し目待ちタイムアウト(%.0f分) → キャンセル",
+                            _pb_symbol, _elapsed_min,
+                        )
+                        del _pullback_queue[_pb_symbol]
+                        continue
+
+                    # 既存ポジションチェック
+                    if _pb_symbol in {p.symbol for p in order_router.open_positions.values()}:
+                        logger.info("[%s] 押し目待ち: 既存ポジションあり → キャンセル", _pb_symbol)
+                        del _pullback_queue[_pb_symbol]
+                        continue
+
+                    # LONG枠チェック
+                    if order_router.long_count >= settings.LONG_MAX_POSITIONS:
+                        logger.info("[%s] 押し目待ち: LONG枠フル → スキップ（キューは保持）", _pb_symbol)
+                        continue
+
+                    # 現在のVWAP乖離を確認
+                    try:
+                        _pb_snap = client.get_snapshot(_pb_symbol)
+                    except Exception:
+                        logger.warning("[%s] 押し目待ち: snapshot取得失敗 → スキップ", _pb_symbol)
+                        continue
+                    if _pb_snap is None or _pb_snap.last_price <= 0:
+                        continue
+                    _pb_vwap = _pb_snap.best_vwap or _pb['vwap_price']
+                    _pb_vwap_dev = (
+                        (_pb_snap.last_price - _pb_vwap) / _pb_vwap * 100
+                        if _pb_vwap and _pb_vwap > 0 else 999.0
+                    )
+
+                    # モメンタム銘柄は緩和閾値で判定
+                    _pb_is_momentum_q = _pb_symbol in _momentum_added_symbols
+                    _pb_entry_threshold = (
+                        settings.MOMENTUM_VWAP_ENTRY_PCT if _pb_is_momentum_q
+                        else settings.PULLBACK_VWAP_ENTRY_PCT
+                    )
+                    if _pb_vwap_dev <= _pb_entry_threshold:
+                        # 押し目到来 → フローを再チェック
+                        _pb_flow = flow_detector.get_flow_signal(_pb_symbol)
+                        if (
+                            _pb_flow.direction != "BUY"
+                            or _pb_flow.strength <= settings.FLOW_BUY_THRESHOLD
+                        ):
+                            _log_pullback_event({
+                                "event": "cancelled_flow_changed",
+                                "symbol": _pb_symbol,
+                                "cancelled_at": datetime.now().strftime("%H:%M:%S"),
+                                "wait_minutes": round(_elapsed_min, 1),
+                            })
+                            logger.info(
+                                "[%s] 押し目到来したがフロー変化(direction=%s strength=%.2f) → キャンセル",
+                                _pb_symbol, _pb_flow.direction, _pb_flow.strength,
+                            )
+                            del _pullback_queue[_pb_symbol]
+                            continue
+
+                        # エントリー実行
+                        logger.info(
+                            "[%s] 押し目到来(vwap_dev=%.2f%% %.0f分後) → エントリー",
+                            _pb_symbol, _pb_vwap_dev, _elapsed_min,
+                        )
+                        _pb_levels = stop_loss_manager.calculate_levels(
+                            _pb_symbol, _pb_snap.last_price,
+                            price_history=_pb['kline'],
+                            direction="LONG",
+                        )
+                        _pb_size = position_sizer.calculate(
+                            _pb_symbol, _pb_snap.last_price, buying_power,
+                        )
+                        _pb_result = await order_router.enter(
+                            _pb['decision'], _pb_symbol, _pb_size,
+                            _pb_snap.last_price, _pb_levels,
+                        )
+                        if _pb_result and _pb_result.status not in ("FAILED", "CANCELLED"):
+                            # エントリー実行ログ
+                            _e_signal_price = _pb.get('entry_price_at_signal', 0) or 0
+                            _e_chg_pct = None
+                            if _e_signal_price > 0:
+                                _e_chg_pct = (_pb_snap.last_price - _e_signal_price) / _e_signal_price * 100
+                            _log_pullback_event({
+                                "event": "executed",
+                                "symbol": _pb_symbol,
+                                "executed_at": datetime.now().strftime("%H:%M:%S"),
+                                "wait_minutes": round(_elapsed_min, 1),
+                                "entry_price": round(_pb_snap.last_price, 4),
+                                "vwap_dev_at_entry": round(_pb_vwap_dev, 3),
+                                "price_change_pct": round(_e_chg_pct, 3) if _e_chg_pct is not None else None,
+                            })
+
+                            _pb_atr_pct = stop_loss_manager.calc_atr_pct(_pb['kline'], _pb_snap.last_price)
+                            _pb_atr_val = _pb_snap.last_price * _pb_atr_pct
+                            _pb_vwap_above = _pb_snap.last_price > _pb_vwap if _pb_vwap > 0 else None
+                            _pb_vwap_dev_ratio = (_pb_snap.last_price - _pb_vwap) / _pb_vwap if _pb_vwap > 0 else None
+                            _pb_prev_close = _pb_snap.prev_close
+                            if _pb_prev_close <= 0 and _pb['kline'] is not None and len(_pb['kline']) >= 1:
+                                _pb_prev_close = float(_pb['kline']["close"].iloc[-1])
+                            _pb_sym_change = (
+                                (_pb_snap.last_price - _pb_prev_close) / _pb_prev_close
+                                if _pb_prev_close > 0 else None
+                            )
+                            pnl_tracker.register(
+                                _pb_result.order_id, _pb_symbol, "LONG",
+                                _pb_size, _pb_snap.last_price,
+                                atr_value=_pb_atr_val,
+                                atr_pct=_pb_atr_pct,
+                                vwap_above=_pb_vwap_above,
+                                vwap_price=_pb_vwap,
+                                spy_rt=client.get_spy_intraday_change(),
+                                sentiment_score=_pb['sentiment'].score,
+                                sentiment_confidence=_pb['sentiment'].confidence,
+                                flow_strength=_pb_flow.strength,
+                                is_dynamic=_pb_symbol not in settings.WATCHLIST,
+                                symbol_change_pct=_pb_sym_change,
+                                vwap_deviation_pct=_pb_vwap_dev_ratio,
+                                texts_count=_pb.get('texts_count'),
+                                sl_price=_pb_levels.stop_loss if _pb_levels else None,
+                                tp_price=_pb_levels.take_profit if _pb_levels else None,
+                                open_price=_pb_snap.open_price if _pb_snap.open_price > 0 else None,
+                                high_price=_pb_snap.high_price if _pb_snap.high_price > 0 else None,
+                                low_price=_pb_snap.low_price if _pb_snap.low_price > 0 else None,
+                                prev_close=_pb_snap.prev_close if _pb_snap.prev_close > 0 else None,
+                                change_from_open_pct=_pb_snap.change_from_open_pct,
+                                gap_pct=_pb_snap.gap_pct,
+                                price_position_in_range=_pb_snap.price_position_in_range,
+                                amplitude=_pb_snap.amplitude if _pb_snap.amplitude > 0 else None,
+                                pre_change_rate=_pb_snap.pre_change_rate,
+                                volume_ratio=_pb_snap.volume_ratio if _pb_snap.volume_ratio > 0 else None,
+                                is_momentum=_pb_symbol in _momentum_added_symbols,
+                            )
+                            notifier.notify_entry(
+                                _pb_symbol, "LONG", _pb_size, _pb_snap.last_price,
+                            )
+                        del _pullback_queue[_pb_symbol]
 
             existing_symbols = {p.symbol for p in order_router.open_positions.values()}
 
@@ -929,6 +1298,46 @@ async def main_loop() -> None:
                         )
                         continue
 
+                    # vwap事前フィルター (Claude API 呼び出し前にコスト削減)
+                    # tight filter A2 と同じ閾値で、API コスト確定で無駄になる銘柄を弾く
+                    # モメンタム銘柄は閾値を 2倍 に緩和 (tight_filter と整合)
+                    _pre_vwap = snap.best_vwap or (
+                        snap.turnover / snap.volume
+                        if snap.volume > 0 and snap.turnover > 0 else None
+                    )
+                    if (
+                        settings.TIGHT_FILTER_ENABLED
+                        and _pre_vwap
+                        and _pre_vwap > 0
+                    ):
+                        _pre_vwap_dev = (snap.last_price - _pre_vwap) / _pre_vwap * 100
+                        _is_momentum_pre = symbol in _momentum_added_symbols
+                        _pre_threshold = (
+                            settings.TIGHT_VWAP_DEV_PCT * 2 if _is_momentum_pre
+                            else settings.TIGHT_VWAP_DEV_PCT
+                        )
+                        if _pre_vwap_dev > _pre_threshold:
+                            logger.info(
+                                "[%s] pre-filter: vwap_dev=%.2f%% > %.1f%% → API skip%s",
+                                symbol, _pre_vwap_dev, _pre_threshold,
+                                " (momentum 緩和)" if _is_momentum_pre else "",
+                            )
+                            continue
+
+                    # Filter E: amplitude (当日値幅率) が小さい日は SL whipsaw リスク高 → スキップ
+                    if (
+                        settings.TIGHT_FILTER_ENABLED
+                        and hasattr(snap, 'amplitude')
+                        and snap.amplitude is not None
+                        and snap.amplitude > 0
+                        and snap.amplitude < settings.TIGHT_AMPLITUDE_MIN
+                    ):
+                        logger.info(
+                            "[%s] Filter E: amplitude=%.2f%% < %.1f%% → SKIP",
+                            symbol, snap.amplitude, settings.TIGHT_AMPLITUDE_MIN,
+                        )
+                        continue
+
                     # 3) テキスト収集
                     posts = await board_scraper.fetch_posts(symbol)
                     news_articles = await news_feed.get_latest(symbol)
@@ -984,11 +1393,44 @@ async def main_loop() -> None:
                         if decision.direction == "LONG":
                             _atr_pct_for_filter = stop_loss_manager.calc_atr_pct(kline, current_price)
                             _is_dynamic_for_filter = symbol not in settings.WATCHLIST
+                            _is_momentum_for_filter = symbol in _momentum_added_symbols
                             tight_pass, tight_reason = and_filter.tight_filter_long(
                                 snapshot, vwap_approx,
                                 atr_pct=_atr_pct_for_filter,
                                 is_dynamic=_is_dynamic_for_filter,
+                                is_momentum=_is_momentum_for_filter,
                             )
+
+                            # Filter D 候補記録 (log-only 期間中のデータ蓄積)
+                            # 注: Filter D は実エントリーを阻止しない。記録のみ。
+                            today_iso = date.today().isoformat()
+                            if (
+                                settings.TIGHT_FILTER_ENABLED
+                                and _is_dynamic_for_filter
+                                and _atr_pct_for_filter is not None
+                                and settings.TIGHT_DYN_MID_ATR_LOW <= _atr_pct_for_filter < settings.TIGHT_DYN_MID_ATR_HIGH
+                                and _filter_d_recorded.get(symbol) != today_iso
+                            ):
+                                _filter_d_recorded[symbol] = today_iso
+                                _vwap_dev_d = (
+                                    (snapshot.last_price - vwap_approx) / vwap_approx
+                                    if vwap_approx and vwap_approx > 0 else None
+                                )
+                                _log_filter_d_event({
+                                    "symbol": symbol,
+                                    "entry_time": datetime.now().strftime("%H:%M:%S"),
+                                    "entry_price": round(snapshot.last_price, 4),
+                                    "atr_pct": round(_atr_pct_for_filter, 4),
+                                    "vwap_dev": round(_vwap_dev_d, 4) if _vwap_dev_d is not None else None,
+                                    "sentiment_score": round(sentiment.score, 3),
+                                    "flow_strength": round(flow.strength, 3),
+                                    "sl_price": round(levels.stop_loss, 4) if levels else None,
+                                    "tp_price": round(levels.take_profit, 4) if levels else None,
+                                    "close_price": None,
+                                    "close_time": None,
+                                    "exit_reason": None,
+                                    "virtual_pnl": None,
+                                })
 
                         # スキップ期間中の LONG は実発注せず JSONL に記録（IF分析用）
                         if in_open_skip and decision.direction == "LONG" and settings.LONG_SKIP_DRY_RUN:
@@ -1039,6 +1481,56 @@ async def main_loop() -> None:
                                 symbol, tight_reason,
                             )
                             continue
+
+                        # --- 押し目待ち判定 ---
+                        # vwap_dev > entry_threshold なら待機キューへ
+                        # 通常: 0.5% / モメンタム銘柄: 1.0% (閾値緩和)
+                        if (
+                            settings.PULLBACK_ENABLED
+                            and decision.direction == "LONG"
+                            and not in_open_skip
+                        ):
+                            vwap_dev_pct_entry = (
+                                (snapshot.last_price - vwap_approx) / vwap_approx * 100
+                                if vwap_approx and vwap_approx > 0 else 0.0
+                            )
+                            _pb_is_momentum = symbol in _momentum_added_symbols
+                            entry_threshold = (
+                                settings.MOMENTUM_VWAP_ENTRY_PCT if _pb_is_momentum
+                                else settings.PULLBACK_VWAP_ENTRY_PCT
+                            )
+                            if vwap_dev_pct_entry > entry_threshold:
+                                if symbol not in _pullback_queue:
+                                    # 注: levels/atr_pct/flow/snapshot は queue 処理時に
+                                    # 再取得するため格納しない (古い値で発注しない安全策)
+                                    _pullback_queue[symbol] = {
+                                        'fired_at': datetime.now(),
+                                        'decision': decision,
+                                        'sentiment': sentiment,
+                                        'vwap_price': vwap_approx,
+                                        'kline': kline,
+                                        'texts_count': len(texts),
+                                        'entry_price_at_signal': snapshot.last_price,
+                                    }
+                                    logger.info(
+                                        "[%s] 押し目待ちキュー追加: vwap_dev=%.2f%% > %.1f%% → %d分以内に押し目待ち%s",
+                                        symbol, vwap_dev_pct_entry, entry_threshold,
+                                        settings.PULLBACK_TIMEOUT_MINUTES,
+                                        " (momentum 緩和)" if _pb_is_momentum else "",
+                                    )
+                                    _log_pullback_event({
+                                        "event": "queued",
+                                        "symbol": symbol,
+                                        "queued_at": datetime.now().strftime("%H:%M:%S"),
+                                        "entry_price_at_signal": round(snapshot.last_price, 4),
+                                        "vwap_dev_at_signal": round(vwap_dev_pct_entry, 3),
+                                        "sentiment_score": round(sentiment.score, 3),
+                                        "confidence": round(sentiment.confidence, 3),
+                                        "flow_strength": round(flow.strength, 3),
+                                        "is_momentum": _pb_is_momentum,
+                                        "entry_threshold": entry_threshold,
+                                    })
+                                continue  # 今は発注しない
 
                         size = position_sizer.calculate(
                             symbol, current_price, buying_power,
@@ -1097,6 +1589,7 @@ async def main_loop() -> None:
                                 amplitude=snapshot.amplitude if snapshot.amplitude > 0 else None,
                                 pre_change_rate=snapshot.pre_change_rate,
                                 volume_ratio=snapshot.volume_ratio if snapshot.volume_ratio > 0 else None,
+                                is_momentum=symbol in _momentum_added_symbols,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,

@@ -53,12 +53,29 @@ WATCHLIST = [
 ]
 
 # --- シグナル閾値 ---
-# --- Tight Filter (高値掴み・動的小型中ボラ除外) ---
+# --- Tight Filter (高値掴み・動的小型中ボラ・低値幅除外) ---
 TIGHT_FILTER_ENABLED: bool = os.getenv("TIGHT_FILTER_ENABLED", "true").lower() == "true"
 TIGHT_VWAP_DEV_PCT: float = float(os.getenv("TIGHT_VWAP_DEV_PCT", "1.0"))    # VWAPからの乖離率 (%) これ超えで除外 (R2: 強トレンド例外なし)
 # Filter D (R1): dynamic 銘柄かつ atr_pct がこの範囲内なら除外（中ボラ罠）
+# n=10 で統計不十分のためログのみ・通過に格下げ (データ蓄積中)。設定は維持。
 TIGHT_DYN_MID_ATR_LOW: float = float(os.getenv("TIGHT_DYN_MID_ATR_LOW", "0.04"))
 TIGHT_DYN_MID_ATR_HIGH: float = float(os.getenv("TIGHT_DYN_MID_ATR_HIGH", "0.05"))
+# Filter E: 当日値幅率 (amplitude%) これ未満ならスキップ (低値幅日 SL whipsaw 防止)
+# 0 で実質無効 (推奨: .env 経由で 0 に設定)
+# 理由: 寄付き直後 (ET 10:00) は全銘柄が低 amplitude のため誤射する。
+# 「動かない日」リスクは押し目待ち + Filter A2 (vwap_dev>1%) で代替できているため
+# 現在は無効化中。データ蓄積後に再評価。
+TIGHT_AMPLITUDE_MIN: float = float(os.getenv("TIGHT_AMPLITUDE_MIN", "3.0"))
+
+# --- 押し目待ち (Pullback Wait) ---
+PULLBACK_ENABLED: bool = os.getenv("PULLBACK_ENABLED", "true").lower() == "true"
+PULLBACK_VWAP_ENTRY_PCT: float = float(os.getenv("PULLBACK_VWAP_ENTRY_PCT", "0.5"))  # vwap_dev <= この値で即エントリー / 超えたら待機キュー
+PULLBACK_TIMEOUT_MINUTES: int = int(os.getenv("PULLBACK_TIMEOUT_MINUTES", "30"))    # 待機タイムアウト
+
+# --- モメンタム検知 (寄付き直前の急騰銘柄を当日WATCHLISTに追加) ---
+MOMENTUM_THRESHOLD_PCT: float = float(os.getenv("MOMENTUM_THRESHOLD_PCT", "5.0"))  # pre/after変化率がこれ以上の銘柄を検知
+MOMENTUM_MAX_SYMBOLS: int = int(os.getenv("MOMENTUM_MAX_SYMBOLS", "5"))            # 最大追加銘柄数
+MOMENTUM_VWAP_ENTRY_PCT: float = float(os.getenv("MOMENTUM_VWAP_ENTRY_PCT", "1.0"))  # モメンタム銘柄の即エントリー閾値 (通常 PULLBACK_VWAP_ENTRY_PCT=0.5%)
 
 SENTIMENT_THRESHOLD: float = 0.6      # LONGセンチメントスコアの最低閾値
 SHORT_SENTIMENT_THRESHOLD: float = -0.3  # SHORTセンチメントスコアの閾値（これ以下で弱気）
@@ -86,11 +103,13 @@ VWAP_DEVIATION_EXIT: float = 0.02     # VWAP乖離2%で撤退
 # --- 動的スクリーニング ---
 SCREENER_ENABLED: bool = os.getenv("SCREENER_ENABLED", "true").lower() == "true"
 SCREENER_MAX_SYMBOLS: int = int(os.getenv("SCREENER_MAX_SYMBOLS", "10"))
-SCREENER_CANDIDATES: int = int(os.getenv("SCREENER_CANDIDATES", "50"))
+SCREENER_CANDIDATES: int = int(os.getenv("SCREENER_CANDIDATES", "100"))  # モメンタム検知用候補プールも兼ねるので拡大
 SCREENER_MAX_DROP_PCT: float = float(os.getenv("SCREENER_MAX_DROP_PCT", "-5.0"))  # これ以下の騰落率は除外
 
 # --- 寄り付きスキップ ---
-MARKET_OPEN_SKIP_MINUTES: int = int(os.getenv("MARKET_OPEN_SKIP_MINUTES", "30"))  # 寄り付き後この分数はエントリーをスキップ（0で無効）
+# 押し目待ちが VWAP 付近のみエントリーするため、寄り付き直後のノイズは自然弾き
+# される。15分に短縮 (旧30分)。
+MARKET_OPEN_SKIP_MINUTES: int = int(os.getenv("MARKET_OPEN_SKIP_MINUTES", "15"))
 LONG_SKIP_DRY_RUN: bool = os.getenv("LONG_SKIP_DRY_RUN", "true").lower() == "true"  # スキップ期間中の LONG シグナルをJSONLに記録（IF分析用）
 LONG_FULL_DRY_RUN: bool = os.getenv("LONG_FULL_DRY_RUN", "true").lower() == "true"  # 5枠フル時もスキャン継続して LONG シグナルをJSONLに記録（IF分析用）
 

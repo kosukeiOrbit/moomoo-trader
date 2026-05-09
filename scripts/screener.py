@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # 出力先
 DATA_DIR = Path(_project_root) / "data"
 OUTPUT_PATH = DATA_DIR / "watchlist_dynamic.json"
+CANDIDATES_PATH = DATA_DIR / "momentum_candidates.json"
 
 # 除外リスト（低ボラ・AI無関係・投機的銘柄）
 EXCLUDE_SYMBOLS = {
@@ -273,6 +274,14 @@ def main() -> None:
 
     # 3) 保存
     save_results(top_symbols)
+
+    # 候補銘柄リスト (絞り込み前の全件) をモメンタム検知用に保存
+    candidates_output = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "symbols": candidates,
+    }
+    CANDIDATES_PATH.write_text(json.dumps(candidates_output, indent=2), encoding="utf-8")
+    logger.info("[Screener] 候補保存: %s (%d銘柄)", CANDIDATES_PATH, len(candidates))
 
     logger.info("[Screener] 結果: %s", " ".join(top_symbols))
     logger.info("[Screener] 完了")

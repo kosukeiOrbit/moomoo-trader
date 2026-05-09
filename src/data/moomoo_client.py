@@ -75,6 +75,7 @@ class QuoteSnapshot:
     avg_price: float = 0.0           # moomoo 算出の本物のVWAP
     amplitude: float = 0.0           # 当日値幅率 (%)
     pre_change_rate: float = 0.0     # プレマーケット変化率 (%)
+    after_change_rate: float = 0.0   # アフターマーケット変化率 (%)
     volume_ratio: float = 0.0        # 普段との出来高比
 
     # ----- 派生指標（snapshot から計算可能） -----
@@ -294,8 +295,62 @@ class MoomooClient:
             avg_price=_safe_float("avg_price"),
             amplitude=_safe_float("amplitude"),
             pre_change_rate=_safe_float("pre_change_rate"),
+            after_change_rate=_safe_float("after_change_rate"),
             volume_ratio=_safe_float("volume_ratio"),
         )
+
+    def get_snapshots(self, codes: list[str]) -> dict[str, "QuoteSnapshot | None"]:
+        """複数銘柄のスナップショットを一括取得する.
+
+        Args:
+            codes: ['US.AAPL', 'US.NVDA', ...] 形式のコードリスト
+
+        Returns:
+            {symbol: QuoteSnapshot or None} の辞書 (取得失敗銘柄は None)
+        """
+        assert self._quote_ctx is not None
+        if not codes:
+            return {}
+        ret, data = self._quote_ctx.get_market_snapshot(codes)
+        if ret != RET_OK or data is None or data.empty:
+            logger.debug("Batch snapshot unavailable: ret=%s codes=%d", ret, len(codes))
+            return {}
+
+        def _safe_float(row, key: str, default: float = 0.0) -> float:
+            try:
+                v = float(row.get(key, default))
+                if v != v:  # NaN
+                    return default
+                return v
+            except (TypeError, ValueError):
+                return default
+
+        result: dict[str, QuoteSnapshot | None] = {}
+        for _, row in data.iterrows():
+            code = row.get("code", "")
+            symbol = code.replace("US.", "") if code else ""
+            if not symbol:
+                continue
+            try:
+                result[symbol] = QuoteSnapshot(
+                    symbol=symbol,
+                    last_price=_safe_float(row, "last_price"),
+                    volume=_safe_float(row, "volume"),
+                    turnover=_safe_float(row, "turnover"),
+                    open_price=_safe_float(row, "open_price"),
+                    high_price=_safe_float(row, "high_price"),
+                    low_price=_safe_float(row, "low_price"),
+                    prev_close=_safe_float(row, "prev_close_price"),
+                    avg_price=_safe_float(row, "avg_price"),
+                    amplitude=_safe_float(row, "amplitude"),
+                    pre_change_rate=_safe_float(row, "pre_change_rate"),
+                    after_change_rate=_safe_float(row, "after_change_rate"),
+                    volume_ratio=_safe_float(row, "volume_ratio"),
+                )
+            except Exception:
+                logger.exception("get_snapshots: parse error for %s", symbol)
+                result[symbol] = None
+        return result
 
     # ------------------------------------------------------------------
     # K線データ（ATR 計算用）

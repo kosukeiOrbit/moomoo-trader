@@ -45,6 +45,7 @@ class TradeRecord:
     flow_strength: float | None = None
     commission: float = 0.0         # 往復手数料（ドル）
     is_dynamic: bool | None = None  # True=スクリーナー由来, False=固定WATCHLIST
+    is_momentum: bool | None = None  # True=モメンタム検知で当日追加された銘柄
     symbol_change_pct: float | None = None  # 銘柄の当日騰落率
     vwap_deviation_pct: float | None = None  # VWAPからの乖離率
     texts_count: int | None = None  # エントリー時のニュース件数
@@ -81,6 +82,7 @@ class PnLTracker:
         "open_price", "high_price", "low_price", "prev_close",
         "change_from_open_pct", "gap_pct", "price_position_in_range",
         "amplitude", "pre_change_rate", "volume_ratio",
+        "is_momentum",
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -126,6 +128,7 @@ class PnLTracker:
         amplitude: float | None = None,
         pre_change_rate: float | None = None,
         volume_ratio: float | None = None,
+        is_momentum: bool | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -164,6 +167,7 @@ class PnLTracker:
             amplitude=amplitude,
             pre_change_rate=pre_change_rate,
             volume_ratio=volume_ratio,
+            is_momentum=is_momentum,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -439,6 +443,7 @@ class PnLTracker:
                     f"{t.amplitude:.3f}" if t.amplitude is not None else "",
                     f"{t.pre_change_rate:.3f}" if t.pre_change_rate is not None else "",
                     f"{t.volume_ratio:.3f}" if t.volume_ratio is not None else "",
+                    t.is_momentum if t.is_momentum is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))
