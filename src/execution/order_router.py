@@ -43,6 +43,9 @@ class Position:
     opened_at: datetime = field(default_factory=datetime.now)
     mfe: float = 0.0  # Maximum Favorable Excursion（最大含み益・ドル）
     mae: float = 0.0  # Maximum Adverse Excursion（最大含み損・ドル）
+    # 直近観測価格 (monitor_positions で更新)。強制決済時に snapshot が
+    # 一時的に 0 を返した場合のフォールバック値として使う。
+    last_known_price: float = 0.0
 
 
 @dataclass
@@ -87,7 +90,11 @@ class OrderRouter:
         """moomoo の既存ポジションを内部 dict に復元する.
 
         position_id を使って一意に識別し、再起動時の重複復元を防ぐ。
+        DRYRUN モードでは復元しない (仮想ポジションのみで運用)。
         """
+        if not settings.ENABLE_REAL_TRADING:
+            logger.info("DRYRUN モード: ポジション復元をスキップ (仮想ポジションのみ)")
+            return 0
         positions = self._client.get_positions()
         count = 0
         for symbol, info in positions.items():
@@ -171,6 +178,25 @@ class OrderRouter:
                 logger.info("[%s] Duplicate entry blocked (internal dict)", symbol)
                 return None
 
+        # --- DRYRUN モード: 実発注せず仮想ポジション登録 ---
+        if not settings.ENABLE_REAL_TRADING:
+            order_id = f"DRYRUN-{symbol}-{int(time.time() * 1000)}"
+            self._positions[order_id] = Position(
+                order_id=order_id, symbol=symbol,
+                direction=signal.direction, size=size,
+                entry_price=price, levels=levels,
+            )
+            logger.info(
+                "[%s] DRYRUN ENTRY: %s %d shares @ $%.2f id=%s (SL=$%.2f TP=$%.2f)",
+                symbol, signal.direction, size, price, order_id,
+                levels.stop_loss if levels else 0,
+                levels.take_profit if levels else 0,
+            )
+            return OrderResult(
+                order_id=order_id, status="FILLED",
+                filled_price=price, filled_quantity=size,
+            )
+
         logger.debug("[%s] has_position() チェック開始", symbol)
         t0 = time.monotonic()
         try:
@@ -181,13 +207,30 @@ class OrderRouter:
             logger.exception("[%s] has_position() で例外", symbol)
         logger.debug("[%s] has_position() チェック完了 (%.2fs)", symbol, time.monotonic() - t0)
 
-        logger.info(
-            "[%s] place_order() 呼び出し: side=%s qty=%d price=$%.2f",
-            symbol, "BUY" if signal.direction == "LONG" else "SELL", size, price,
-        )
-        t0 = time.monotonic()
         side = "BUY" if signal.direction == "LONG" else "SELL"
-        result = self._client.place_order(Order(symbol=symbol, side=side, quantity=size))
+        # 保護指値: BUY なら last × (1 + pct)、 SELL なら × (1 - pct)
+        # pct=0 で従来の成行、 pct=0.05 で +5%/-5% 指値 (実質成行 + 上限/下限保護)
+        protective_pct = settings.ORDER_PROTECTIVE_LIMIT_PCT
+        if protective_pct > 0 and price > 0:
+            limit_price = (
+                round(price * (1 + protective_pct), 2)
+                if side == "BUY"
+                else round(price * (1 - protective_pct), 2)
+            )
+            logger.info(
+                "[%s] place_order() 呼び出し: side=%s qty=%d limit=$%.2f (last=$%.2f, +%.0f%% 保護)",
+                symbol, side, size, limit_price, price, protective_pct * 100,
+            )
+            order_obj = Order(symbol=symbol, side=side, quantity=size, price=limit_price)
+        else:
+            logger.info(
+                "[%s] place_order() 呼び出し: side=%s qty=%d 成行 (last=$%.2f)",
+                symbol, side, size, price,
+            )
+            order_obj = Order(symbol=symbol, side=side, quantity=size)
+
+        t0 = time.monotonic()
+        result = self._client.place_order(order_obj)
         elapsed = time.monotonic() - t0
         logger.info(
             "[%s] place_order() 応答: order_id=%s status=%s (%.2fs)",
@@ -277,7 +320,38 @@ class OrderRouter:
         )
 
         exit_price = self._get_exit_price(position.symbol)
+        # 全フォールバック失敗時は entry_price で代用 (PnL=0 として記録)
+        if exit_price <= 0:
+            logger.error(
+                "[%s] EXIT 価格取得 全失敗 → entry_price=$%.2f で代用 (PnL=0 記録)",
+                position.symbol, position.entry_price,
+            )
+            exit_price = position.entry_price
         logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
+
+        # --- DRYRUN モード: 実決済せず仮想クローズ ---
+        if not settings.ENABLE_REAL_TRADING:
+            if position.direction == "LONG":
+                pnl = (exit_price - position.entry_price) * position.size
+            else:
+                pnl = (position.entry_price - exit_price) * position.size
+            logger.info(
+                "[%s] DRYRUN EXIT: entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+                position.symbol, position.entry_price, exit_price, pnl, reason,
+            )
+            del self._positions[order_id]
+            exit_result = ExitResult(
+                order_result=OrderResult(order_id=order_id, status="FILLED",
+                                         filled_price=exit_price, filled_quantity=position.size),
+                position=position,
+                exit_price=exit_price, pnl=pnl, reason=reason,
+            )
+            if self._on_exit:
+                try:
+                    self._on_exit(exit_result)
+                except Exception:
+                    logger.exception("on_exit callback error")
+            return exit_result
 
         side = "SELL" if position.direction == "LONG" else "BUY"
         logger.info("[%s] place_order() 呼び出し: side=%s qty=%d", position.symbol, side, position.size)
@@ -384,7 +458,38 @@ class OrderRouter:
         )
 
         exit_price = self._get_exit_price(position.symbol)
+        # 全フォールバック失敗時は entry_price で代用 (PnL=0 として記録)
+        if exit_price <= 0:
+            logger.error(
+                "[%s] EXIT_SYNC 価格取得 全失敗 → entry_price=$%.2f で代用 (PnL=0 記録)",
+                position.symbol, position.entry_price,
+            )
+            exit_price = position.entry_price
         logger.info("[%s] 現在価格: $%.2f", position.symbol, exit_price)
+
+        # --- DRYRUN モード: 実決済せず仮想クローズ ---
+        if not settings.ENABLE_REAL_TRADING:
+            if position.direction == "LONG":
+                pnl = (exit_price - position.entry_price) * position.size
+            else:
+                pnl = (position.entry_price - exit_price) * position.size
+            logger.info(
+                "[%s] DRYRUN EXIT_SYNC: entry=$%.2f exit=$%.2f pnl=$%.2f reason=%s",
+                position.symbol, position.entry_price, exit_price, pnl, reason,
+            )
+            del self._positions[order_id]
+            exit_result = ExitResult(
+                order_result=OrderResult(order_id=order_id, status="FILLED",
+                                         filled_price=exit_price, filled_quantity=position.size),
+                position=position,
+                exit_price=exit_price, pnl=pnl, reason=reason,
+            )
+            if self._on_exit:
+                try:
+                    self._on_exit(exit_result)
+                except Exception:
+                    logger.exception("on_exit callback error")
+            return exit_result
 
         side = "SELL" if position.direction == "LONG" else "BUY"
         t0 = time.monotonic()
@@ -442,12 +547,36 @@ class OrderRouter:
     # ------------------------------------------------------------------
 
     def _get_exit_price(self, symbol: str) -> float:
-        try:
-            snap = self._client.get_snapshot(symbol)
-            if snap.last_price > 0:
-                return snap.last_price
-        except Exception:
-            logger.exception("Failed to get exit price: %s", symbol)
+        """決済価格を snapshot から取得する.
+
+        市場クローズ直後など snapshot が一時的に 0 を返すことがあるため、
+        最大 2 回リトライする。それでも 0 ならポジションの last_known_price
+        を返す (monitor_positions で逐次更新されている)。
+        最終フォールバックも 0 なら 0 を返し、呼び出し側で処理する。
+        """
+        for attempt in range(2):
+            try:
+                snap = self._client.get_snapshot(symbol)
+                if snap.last_price > 0:
+                    return snap.last_price
+                logger.warning(
+                    "[%s] 決済価格 snapshot last_price=0 (試行%d/2)",
+                    symbol, attempt + 1,
+                )
+            except Exception:
+                logger.exception("[%s] Failed to get exit price (試行%d/2)", symbol, attempt + 1)
+            if attempt == 0:
+                time.sleep(0.3)
+
+        # snapshot が 2 回連続で失敗 → monitor_positions が保持している
+        # 直近観測価格をフォールバックとして使う
+        for pos in self._positions.values():
+            if pos.symbol == symbol and pos.last_known_price > 0:
+                logger.warning(
+                    "[%s] snapshot 取得失敗 → last_known_price=$%.2f を使用",
+                    symbol, pos.last_known_price,
+                )
+                return pos.last_known_price
         return 0.0
 
     # ------------------------------------------------------------------
@@ -479,6 +608,9 @@ class OrderRouter:
                     if price <= 0:
                         logger.debug("[%s] monitor: price=0 (%.2fs)", pos.symbol, api_time)
                         continue
+
+                    # 直近観測価格を更新 (強制決済時のフォールバック用)
+                    pos.last_known_price = price
 
                     # MFE/MAE 更新
                     if pos.direction == "LONG":

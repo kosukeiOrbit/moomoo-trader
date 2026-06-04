@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from config import settings
 from src.signals.sentiment_analyzer import SentimentResult
 from src.signals.flow_detector import FlowSignal
+
+_ET = ZoneInfo("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +153,62 @@ class AndFilter:
                 atr_pct * 100,
             )
             # 通過させる（return しない）
+
+        # Filter F (R1): 当日 amplitude が小さい銘柄を除外 (低値幅日 SL whipsaw 防止)
+        # データ分析: amplitude<3% で勝率20-29%、 amplitude>=3% で勝率67-75%
+        # n=29 で R1 単独適用すると net -$11.17 → +$60.25 (+$71改善)
+        if (
+            settings.TIGHT_AMPLITUDE_MIN > 0
+            and hasattr(snap, 'amplitude')
+            and snap.amplitude is not None
+            and snap.amplitude > 0
+            and snap.amplitude < settings.TIGHT_AMPLITUDE_MIN
+        ):
+            return False, (
+                f"Filter F: amplitude={snap.amplitude:.2f}% < {settings.TIGHT_AMPLITUDE_MIN}%"
+            )
+
+        # Filter G: ATR% (推定ボラ) が低い銘柄を除外
+        # 5/12-5/18 ドライラン IF 分析: amp>=3% AND atr_pct>=2.5% で n=20 WR=90%
+        # 単独でも atr_pct>=3% で WR 55%→81%、 atr_pct<2.5% で WR 54% / avg=-$0.70
+        if (
+            settings.TIGHT_ATR_PCT_MIN > 0
+            and atr_pct is not None
+            and atr_pct < settings.TIGHT_ATR_PCT_MIN
+        ):
+            return False, (
+                f"Filter G: atr_pct={atr_pct*100:.2f}% < {settings.TIGHT_ATR_PCT_MIN*100:.2f}%"
+            )
+
+        # Filter H: 過熱ガード (午前序盤の gap/pre 過熱銘柄をブロック)
+        # n=72 分析: gap/pre >= +5% かつ ET 9:30-10:30 = n=13 WR 46% net -$199
+        #          同じ過熱でも ET 10:30 以降は n=6 WR 83% net +$57 → 午前のみ阻止
+        # 5/19 NOW(-$74), 5/22 WDAY(-$53), 5/26 APP(-$44), 5/29 DELL×2(-$57) 対策
+        if settings.TIGHT_OVERHEAT_GUARD_MINUTES > 0:
+            try:
+                now_et = datetime.now(_ET)
+                mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                mins_since_open = (now_et - mkt_open).total_seconds() / 60
+                # ET 9:30 〜 (9:30 + N分) の間のみガード適用
+                if 0 <= mins_since_open < settings.TIGHT_OVERHEAT_GUARD_MINUTES:
+                    if (settings.TIGHT_GAP_MAX_PCT > 0
+                        and hasattr(snap, 'gap_pct')
+                        and snap.gap_pct is not None
+                        and snap.gap_pct > settings.TIGHT_GAP_MAX_PCT):
+                        return False, (
+                            f"Filter H: 朝の gap={snap.gap_pct:.2f}% > "
+                            f"{settings.TIGHT_GAP_MAX_PCT}% (寄付+{mins_since_open:.0f}分)"
+                        )
+                    if (settings.TIGHT_PRE_MAX_PCT > 0
+                        and hasattr(snap, 'pre_change_rate')
+                        and snap.pre_change_rate is not None
+                        and snap.pre_change_rate > settings.TIGHT_PRE_MAX_PCT):
+                        return False, (
+                            f"Filter H: 朝の pre={snap.pre_change_rate:.2f}% > "
+                            f"{settings.TIGHT_PRE_MAX_PCT}% (寄付+{mins_since_open:.0f}分)"
+                        )
+            except Exception:
+                logger.debug("Filter H 時刻判定で例外 (ガードしない)", exc_info=True)
 
         # Filter A2 (R2): VWAP乖離率 (% 表記) で除外 (強トレンド例外を削除)
         vwap_dev_pct = None

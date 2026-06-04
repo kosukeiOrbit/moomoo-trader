@@ -59,8 +59,12 @@ data/momentum_candidates.json
 data/short_dryrun.jsonl
 data/long_skip_dryrun.jsonl
 data/long_full_dryrun.jsonl
+data/long_rejected_dryrun.jsonl
 data/pullback_log.jsonl
 data/filter_d_log.jsonl
+data/in_position_signal.jsonl
+data/scan_price_log.jsonl
+data/a1a3_block_log.jsonl
 
 # Old log archives
 logs/old/

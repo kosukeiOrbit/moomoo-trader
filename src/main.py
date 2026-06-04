@@ -15,6 +15,7 @@ import os
 import signal
 import sys
 import time as _time
+from collections import defaultdict, deque
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -170,6 +171,8 @@ async def _short_dryrun(
     client,
     stop_loss,
     order_router=None,
+    spy_change: float | None = None,
+    qqq_change: float | None = None,
 ) -> None:
     """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する.
 
@@ -204,7 +207,8 @@ async def _short_dryrun(
         )
 
         # 条件B: マクロ連動ショート（当日始値からの SPY 変化率で判定）
-        spy_rt = client.get_spy_intraday_change()
+        # 呼び出し元のループ先頭キャッシュを優先（毎回 API を叩かない）
+        spy_rt = spy_change if spy_change is not None else client.get_spy_intraday_change()
         macro_short = (
             spy_rt is not None
             and spy_rt < -0.003  # SPY 当日始値から -0.3% 以下
@@ -279,6 +283,7 @@ async def _short_dryrun(
             "confidence": round(confidence, 3),
             "flow_strength": round(flow_strength, 3),
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
+            "qqq_change_realtime": round(qqq_change * 100, 2) if qqq_change is not None else None,
             "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "individual_would_trigger": individual_would_trigger,
             # 高値掴み判別用フィールド
@@ -389,10 +394,105 @@ _LONG_SKIP_DRYRUN_PATH = Path(_project_root) / "data" / "long_skip_dryrun.jsonl"
 _long_full_dryrun_recorded: dict[str, str] = {}
 _LONG_FULL_DRYRUN_PATH = Path(_project_root) / "data" / "long_full_dryrun.jsonl"
 
+# tight_filter で REJECT されたシグナル (枠空き・通常時間帯) を IF 分析用に記録。
+# 本番稼働 (ENABLE_REAL_TRADING=true) でフィルタが効いた後も、もしフィルタ
+# 無しなら実エントリーされていた銘柄を仮想 PnL で追跡できるようにする。
+_long_rejected_dryrun_recorded: dict[str, str] = {}
+_LONG_REJECTED_DRYRUN_PATH = Path(_project_root) / "data" / "long_rejected_dryrun.jsonl"
+
 # 押し目待ちキュー: vwap_dev > PULLBACK_VWAP_ENTRY_PCT で発火した銘柄を保持
-# {symbol: {fired_at, decision, sentiment, vwap_price, kline, texts_count, entry_price_at_signal}}
+# {symbol: {fired_at, decision, sentiment, vwap_price, kline, texts_count,
+#           entry_price_at_signal, min_vwap_dev}}
+# min_vwap_dev: vwap_dev の最小値を追跡し、反転確認 (現在 > min) を取ってからエントリー
 # 注: flow/levels/atr_pct/snapshot は queue 処理時に再取得 (古い値で発注しないため)
 _pullback_queue: dict[str, dict] = {}
+
+# 直近スキャン時の銘柄価格 (エントリー直前下落チェック用)
+# 銘柄ごとに main scan の "AND filter 通過時点での price" を記録
+# 次のスキャン時に比較して直近30秒で大きく下落していたら entry skip
+_last_scan_prices: dict[str, float] = {}
+
+# 価格履歴 (A1/A3 ルール用) — 銘柄ごとに直近 N 観測の (timestamp, price) を保持。
+# maxlen=ENTRY_PRICE_HISTORY_DEPTH (デフォルト 6 = 3 分分)
+_price_history: dict[str, deque] = defaultdict(
+    lambda: deque(maxlen=settings.ENTRY_PRICE_HISTORY_DEPTH)
+)
+# スキャン価格を時系列で保存 (A1/A3 ルールの後付け検証用)
+_SCAN_PRICE_LOG_PATH = Path(_project_root) / "data" / "scan_price_log.jsonl"
+# A1/A3 ブロックイベントを記録 (クールダウン案の事後検証用)
+# 後で trades CSV と突合して「エントリー直前 N 分の BLOCK 数 vs MAE」 を分析できる
+_A1A3_BLOCK_LOG_PATH = Path(_project_root) / "data" / "a1a3_block_log.jsonl"
+
+
+def _log_a1a3_block(symbol: str, rule: str, prev: float, cur: float, extra: str = "") -> None:
+    """A1/A3 BLOCK イベントを JSONL に記録. 失敗してもサイレント."""
+    if not settings.A1A3_BLOCK_LOG_ENABLED:
+        return
+    try:
+        _A1A3_BLOCK_LOG_PATH.parent.mkdir(exist_ok=True)
+        with open(_A1A3_BLOCK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "rule": rule,
+                "prev_price": round(prev, 4),
+                "cur_price": round(cur, 4),
+                "extra": extra,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _record_scan_price(symbol: str, price: float, timestamp: datetime | None = None) -> None:
+    """スキャン時の snapshot 価格を履歴に記録 + JSONL 出力.
+
+    A1/A3 ルールがエントリー直前に参照する。
+    """
+    if price <= 0:
+        return
+    ts = timestamp or datetime.now()
+    _price_history[symbol].append((ts, price))
+    if settings.SCAN_PRICE_LOG_ENABLED:
+        try:
+            _SCAN_PRICE_LOG_PATH.parent.mkdir(exist_ok=True)
+            with open(_SCAN_PRICE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(_json.dumps({
+                    "ts": ts.isoformat(timespec="seconds"),
+                    "symbol": symbol,
+                    "price": round(price, 4),
+                }) + "\n")
+        except Exception:
+            pass  # ロガー失敗はサイレント (エントリー判定をブロックしない)
+
+
+def _check_price_trend_rules(symbol: str) -> tuple[bool, str]:
+    """A1 (直近スキャン下落) / A3 (直近 3 観測の local low) チェック.
+
+    Returns:
+        (ok_to_enter, reason): ok_to_enter=False ならエントリー禁止。
+        履歴不足や両ルール OFF なら True を返す。
+    """
+    if not (settings.ENTRY_BLOCK_ON_DECLINE or settings.ENTRY_BLOCK_BELOW_LOCAL_LOW):
+        return True, "rules_disabled"
+    hist = list(_price_history.get(symbol, []))
+    if len(hist) < 2:
+        return True, "insufficient_history"
+    current = hist[-1][1]
+    prev = hist[-2][1]
+    # A1: 直近スキャンより下げ
+    if settings.ENTRY_BLOCK_ON_DECLINE and current < prev:
+        reason = f"A1: {prev:.2f}->{current:.2f}"
+        _log_a1a3_block(symbol, "A1", prev, current, reason)
+        return False, reason
+    # A3: 直近 3 観測 local_low + buffer 未達
+    if settings.ENTRY_BLOCK_BELOW_LOCAL_LOW and len(hist) >= 3:
+        local_low = min(p for _, p in hist[-3:])
+        threshold = local_low * (1 + settings.ENTRY_PRICE_LOCAL_LOW_BUFFER)
+        if current < threshold:
+            reason = f"A3: low=${local_low:.2f} cur=${current:.2f}"
+            _log_a1a3_block(symbol, "A3", local_low, current, reason)
+            return False, reason
+    return True, "passed"
 
 # 押し目待ちイベント記録 (IF分析用)
 _PULLBACK_LOG_PATH = Path(_project_root) / "data" / "pullback_log.jsonl"
@@ -412,6 +512,22 @@ def _log_pullback_event(event: dict) -> None:
 # Filter D 候補記録 (log-only 期間中のデータ蓄積用)
 _filter_d_recorded: dict[str, str] = {}
 _FILTER_D_LOG_PATH = Path(_project_root) / "data" / "filter_d_log.jsonl"
+
+# 保有ポジション中のシグナル状況記録 (Claude API 不要・軽量)
+# {symbol: 最後に記録した時刻} で重複/頻度制御
+_IN_POSITION_LOG_PATH = Path(_project_root) / "data" / "in_position_signal.jsonl"
+_in_position_last_logged: dict[str, datetime] = {}
+
+
+def _log_in_position_signal(event: dict) -> None:
+    """保有中シグナル状況を JSONL に記録. エラーは握りつぶし."""
+    try:
+        event = {"date": date.today().isoformat(), **event}
+        _IN_POSITION_LOG_PATH.parent.mkdir(exist_ok=True)
+        with open(_IN_POSITION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(event) + "\n")
+    except Exception:
+        logger.warning("[in_position_log] 記録エラー（無視）", exc_info=True)
 
 # モメンタム検知 (1セッション1回 / Bot再起動でリセット)
 _momentum_scan_done: bool = False
@@ -499,12 +615,15 @@ async def _long_dryrun_record(
     tight_reason: str = "",
     dryrun_type: str = "skip",  # "skip" or "full"
     slot_count_at_signal: int | None = None,
+    spy_change: float | None = None,
+    qqq_change: float | None = None,
 ) -> None:
     """LONG エントリー条件成立を JSONL に記録する (実発注なし).
 
     dryrun_type:
       - "skip": スキップ期間中 (22:30-23:30) のシグナル → long_skip_dryrun.jsonl
       - "full": 5枠フル時のシグナル → long_full_dryrun.jsonl
+      - "rejected": tight_filter で弾かれた通常時間のシグナル → long_rejected_dryrun.jsonl
 
     同一銘柄は1セッション1回のみ記録（最初に条件成立した時点）。
     """
@@ -513,6 +632,9 @@ async def _long_dryrun_record(
         if dryrun_type == "skip":
             recorded_dict = _long_skip_dryrun_recorded
             output_path = _LONG_SKIP_DRYRUN_PATH
+        elif dryrun_type == "rejected":
+            recorded_dict = _long_rejected_dryrun_recorded
+            output_path = _LONG_REJECTED_DRYRUN_PATH
         else:  # "full"
             recorded_dict = _long_full_dryrun_recorded
             output_path = _LONG_FULL_DRYRUN_PATH
@@ -540,7 +662,8 @@ async def _long_dryrun_record(
         if vwap_approx and vwap_approx > 0:
             vwap_dev = (entry_price - vwap_approx) / vwap_approx
 
-        spy_rt = client.get_spy_intraday_change()
+        # 地合いはキャッシュ値を優先 (呼び出し元がループ先頭で取得済み)
+        spy_rt = spy_change if spy_change is not None else client.get_spy_intraday_change()
 
         recorded_dict[symbol] = today
         record = {
@@ -561,6 +684,7 @@ async def _long_dryrun_record(
             "confidence": round(sentiment.confidence, 3),
             "flow_strength": round(flow.strength, 3),
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
+            "qqq_change_realtime": round(qqq_change * 100, 2) if qqq_change is not None else None,
             "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "texts_count": texts_count,
             "is_dynamic": symbol not in settings.WATCHLIST,
@@ -613,7 +737,12 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
     - actual_entry_at/price/pnl: 同じセッションで同銘柄を実エントリーしていれば紐付け
     """
     try:
-        output_path = _LONG_SKIP_DRYRUN_PATH if dryrun_type == "skip" else _LONG_FULL_DRYRUN_PATH
+        if dryrun_type == "skip":
+            output_path = _LONG_SKIP_DRYRUN_PATH
+        elif dryrun_type == "rejected":
+            output_path = _LONG_REJECTED_DRYRUN_PATH
+        else:  # "full"
+            output_path = _LONG_FULL_DRYRUN_PATH
         if not output_path.exists():
             return
 
@@ -936,11 +1065,13 @@ async def main_loop() -> None:
                 # 2) 全ポジションを同期で決済（確実に全注文を送る）
                 order_router.exit_all_sync("ET 15:50 force close")
 
-                # 3) LONG skip/full dryrun の仮想決済 + 実エントリー紐付け
+                # 3) LONG skip/full/rejected dryrun の仮想決済 + 実エントリー紐付け
                 if settings.LONG_SKIP_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
                 if settings.LONG_FULL_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+                # tight_filter REJECT 分は常時記録 (フラグなしで close も走らせる)
+                await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
                 # Filter D log の close_price/virtual_pnl 更新
                 await _filter_d_log_close(client)
 
@@ -953,6 +1084,7 @@ async def main_loop() -> None:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
                 if settings.LONG_FULL_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+                await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
                 await _filter_d_log_close(client)
                 break
 
@@ -998,6 +1130,21 @@ async def main_loop() -> None:
                     break
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 continue
+
+            # --- 地合い指標 (SPY/QQQ) をループ先頭で1度だけ取得しキャッシュ ---
+            # 個別エントリー / in_position_signal で参照される。snapshot ベースなので購読不要。
+            try:
+                _market_indices = client.get_market_indices()
+            except Exception:
+                logger.debug("get_market_indices 取得失敗（無視）", exc_info=True)
+                _market_indices = {"spy": None, "qqq": None}
+            _spy_change = _market_indices.get("spy")
+            _qqq_change = _market_indices.get("qqq")
+            logger.info(
+                "Market: SPY=%s QQQ=%s",
+                f"{_spy_change*100:+.2f}%" if _spy_change is not None else "NA",
+                f"{_qqq_change*100:+.2f}%" if _qqq_change is not None else "NA",
+            )
 
             # --- 銘柄ごとのスキャンループ ---
             logger.info(
@@ -1112,6 +1259,8 @@ async def main_loop() -> None:
                         continue
                     if _pb_snap is None or _pb_snap.last_price <= 0:
                         continue
+                    # 価格履歴に記録 (A1/A3 ルール用)
+                    _record_scan_price(_pb_symbol, _pb_snap.last_price)
                     _pb_vwap = _pb_snap.best_vwap or _pb['vwap_price']
                     _pb_vwap_dev = (
                         (_pb_snap.last_price - _pb_vwap) / _pb_vwap * 100
@@ -1124,8 +1273,47 @@ async def main_loop() -> None:
                         settings.MOMENTUM_VWAP_ENTRY_PCT if _pb_is_momentum_q
                         else settings.PULLBACK_VWAP_ENTRY_PCT
                     )
+
+                    # 反転確認ロジック: vwap_dev の最小値を追跡
+                    # 同値 (横ばい) も「まだ下げ or 横ばい」扱いとして最小値更新・継続
+                    if _pb_vwap_dev <= _pb['min_vwap_dev']:
+                        _pb['min_vwap_dev'] = _pb_vwap_dev
+                        logger.debug(
+                            "[%s] 押し目更新: vwap_dev=%.2f%% (最小値更新/横ばい, 反転待ち)",
+                            _pb_symbol, _pb_vwap_dev,
+                        )
+                        continue  # エントリーしない
+
+                    # ここに到達 = 最小値より上昇している (反転確認済み)
+                    # 閾値以下ならエントリー、閾値超えはキューに留まる (次のループで再チェック)
                     if _pb_vwap_dev <= _pb_entry_threshold:
-                        # 押し目到来 → フローを再チェック
+                        # 直近の価格下落チェック (反転確認とは独立した別チェック)
+                        _pb_prev_price = _last_scan_prices.get(_pb_symbol, _pb_snap.last_price)
+                        _pb_price_change = (
+                            (_pb_snap.last_price - _pb_prev_price) / _pb_prev_price * 100
+                            if _pb_prev_price > 0 else 0.0
+                        )
+                        # A1/A3 ルールチェック (押し目キュー解除時)
+                        _pb_ok, _pb_rule_reason = _check_price_trend_rules(_pb_symbol)
+                        if not _pb_ok:
+                            logger.info(
+                                "[%s] 押し目到来だが price trend BLOCK: %s → 待機継続",
+                                _pb_symbol, _pb_rule_reason,
+                            )
+                            continue  # エントリーせずキューに残す
+
+                        if _pb_price_change < -settings.ENTRY_PRICE_DROP_THRESHOLD:
+                            logger.info(
+                                "[%s] 押し目到来だが直近価格下落中(%.2f→%.2f, %+.3f%%) → 待機継続",
+                                _pb_symbol, _pb_prev_price, _pb_snap.last_price, _pb_price_change,
+                            )
+                            continue  # エントリーせずキューに残す
+
+                        logger.info(
+                            "[%s] 押し目到来(反転確認): vwap_dev=%.2f%% > min=%.2f%% (閾値%.1f%%)",
+                            _pb_symbol, _pb_vwap_dev, _pb['min_vwap_dev'], _pb_entry_threshold,
+                        )
+                        # フローを再チェック
                         _pb_flow = flow_detector.get_flow_signal(_pb_symbol)
                         if (
                             _pb_flow.direction != "BUY"
@@ -1167,6 +1355,7 @@ async def main_loop() -> None:
                             _e_chg_pct = None
                             if _e_signal_price > 0:
                                 _e_chg_pct = (_pb_snap.last_price - _e_signal_price) / _e_signal_price * 100
+                            _e_min_vwap_dev = _pb.get('min_vwap_dev')
                             _log_pullback_event({
                                 "event": "executed",
                                 "symbol": _pb_symbol,
@@ -1174,6 +1363,11 @@ async def main_loop() -> None:
                                 "wait_minutes": round(_elapsed_min, 1),
                                 "entry_price": round(_pb_snap.last_price, 4),
                                 "vwap_dev_at_entry": round(_pb_vwap_dev, 3),
+                                "min_vwap_dev": round(_e_min_vwap_dev, 3) if _e_min_vwap_dev is not None else None,
+                                "reversal_confirmed": (
+                                    _e_min_vwap_dev is not None
+                                    and _pb_vwap_dev > _e_min_vwap_dev
+                                ),
                                 "price_change_pct": round(_e_chg_pct, 3) if _e_chg_pct is not None else None,
                             })
 
@@ -1195,7 +1389,8 @@ async def main_loop() -> None:
                                 atr_pct=_pb_atr_pct,
                                 vwap_above=_pb_vwap_above,
                                 vwap_price=_pb_vwap,
-                                spy_rt=client.get_spy_intraday_change(),
+                                spy_rt=_spy_change,
+                                qqq_rt=_qqq_change,
                                 sentiment_score=_pb['sentiment'].score,
                                 sentiment_confidence=_pb['sentiment'].confidence,
                                 flow_strength=_pb_flow.strength,
@@ -1228,8 +1423,92 @@ async def main_loop() -> None:
                 if _shutdown_requested:
                     break
                 try:
-                    # 0) 既存ポジションがある銘柄はスキップ
+                    # 0) 既存ポジションがある銘柄: シグナル状況のみ記録してスキップ
                     if symbol in existing_symbols:
+                        # 保有中のシグナル状況を軽量記録 (Claude API 呼ばない)
+                        try:
+                            _pos = next(
+                                (p for p in order_router.open_positions.values()
+                                 if p.symbol == symbol), None
+                            )
+                            if _pos is not None:
+                                _ip_flow = flow_detector.get_flow_signal(symbol)
+                                _ip_snap = client.get_snapshot(symbol)
+                                if _ip_snap and _ip_snap.last_price > 0:
+                                    _ip_vwap = _ip_snap.best_vwap or 0.0
+                                    _ip_vwap_dev = (
+                                        (_ip_snap.last_price - _ip_vwap) / _ip_vwap * 100
+                                        if _ip_vwap > 0 else None
+                                    )
+                                    _ip_minutes = (
+                                        datetime.now() - _pos.opened_at
+                                    ).total_seconds() / 60
+                                    _ip_unrealized = (
+                                        (_ip_snap.last_price - _pos.entry_price) * _pos.size
+                                        if _pos.direction == "LONG"
+                                        else (_pos.entry_price - _ip_snap.last_price) * _pos.size
+                                    )
+                                    # 当日高安からの乖離
+                                    _ip_dist_from_hod = None
+                                    _ip_dist_from_lod = None
+                                    if _ip_snap.high_price > 0:
+                                        _ip_dist_from_hod = (_ip_snap.last_price - _ip_snap.high_price) / _ip_snap.high_price * 100
+                                    if _ip_snap.low_price > 0:
+                                        _ip_dist_from_lod = (_ip_snap.last_price - _ip_snap.low_price) / _ip_snap.low_price * 100
+
+                                    _log_in_position_signal({
+                                        "symbol": symbol,
+                                        "time": datetime.now().strftime("%H:%M:%S"),
+                                        "in_position_minutes": round(_ip_minutes, 1),
+                                        "entry_price": round(_pos.entry_price, 4),
+                                        "current_price": round(_ip_snap.last_price, 4),
+                                        "unrealized_pnl": round(_ip_unrealized, 2),
+                                        # VWAP 関連
+                                        "vwap": round(_ip_vwap, 4) if _ip_vwap > 0 else None,
+                                        "vwap_above": (
+                                            _ip_snap.last_price > _ip_vwap
+                                            if _ip_vwap > 0 else None
+                                        ),
+                                        "vwap_dev_pct": round(_ip_vwap_dev, 3) if _ip_vwap_dev is not None else None,
+                                        # 当日レンジ
+                                        "amplitude": round(_ip_snap.amplitude, 3) if _ip_snap.amplitude > 0 else None,
+                                        "high_price": round(_ip_snap.high_price, 4) if _ip_snap.high_price > 0 else None,
+                                        "low_price": round(_ip_snap.low_price, 4) if _ip_snap.low_price > 0 else None,
+                                        "dist_from_hod_pct": round(_ip_dist_from_hod, 3) if _ip_dist_from_hod is not None else None,
+                                        "dist_from_lod_pct": round(_ip_dist_from_lod, 3) if _ip_dist_from_lod is not None else None,
+                                        "change_from_open_pct": (
+                                            round(_ip_snap.change_from_open_pct, 3)
+                                            if _ip_snap.change_from_open_pct is not None else None
+                                        ),
+                                        "price_position_in_range": (
+                                            round(_ip_snap.price_position_in_range, 3)
+                                            if _ip_snap.price_position_in_range is not None else None
+                                        ),
+                                        # 出来高
+                                        "volume_ratio": round(_ip_snap.volume_ratio, 3) if _ip_snap.volume_ratio > 0 else None,
+                                        # シグナル
+                                        "flow_direction": _ip_flow.direction,
+                                        "flow_strength": round(_ip_flow.strength, 3),
+                                        # 地合い (ループ先頭でキャッシュ済み)
+                                        "spy_change_pct": (
+                                            round(_spy_change * 100, 3)
+                                            if _spy_change is not None else None
+                                        ),
+                                        "qqq_change_pct": (
+                                            round(_qqq_change * 100, 3)
+                                            if _qqq_change is not None else None
+                                        ),
+                                    })
+                        except Exception:
+                            logger.debug("[%s] in_position_signal 記録失敗（無視）", symbol, exc_info=True)
+                        continue
+
+                    # is_momentum 判定 (シグナル発火後の各フィルタでも参照される)
+                    is_momentum = symbol in _momentum_added_symbols
+
+                    # MOMENTUM_ONLY_MODE: モメンタム検知銘柄のみエントリー対象
+                    if settings.MOMENTUM_ONLY_MODE and not is_momentum:
+                        logger.debug("[%s] MOMENTUM_ONLY_MODE: スキップ", symbol)
                         continue
 
                     # 1) フロー先行取得（API不要・低コスト）
@@ -1257,6 +1536,8 @@ async def main_loop() -> None:
                                     client=client,
                                     stop_loss=stop_loss_manager,
                                     order_router=order_router,
+                                    spy_change=_spy_change,
+                                    qqq_change=_qqq_change,
                                 )
                             logger.info(
                                 "[%s] flow=SELL(%.2f) -> SHORT candidate (not yet implemented)",
@@ -1273,6 +1554,8 @@ async def main_loop() -> None:
                                     client=client,
                                     stop_loss=stop_loss_manager,
                                     order_router=order_router,
+                                    spy_change=_spy_change,
+                                    qqq_change=_qqq_change,
                                 )
                             logger.info(
                                 "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
@@ -1290,6 +1573,9 @@ async def main_loop() -> None:
 
                     # 買付余力で買えない銘柄はAPIスキップ
                     snap = client.get_snapshot(symbol)
+                    # 価格履歴に記録 (A1/A3 ルール用 + 後付け検証用 JSONL)
+                    if snap.last_price > 0:
+                        _record_scan_price(symbol, snap.last_price)
                     if snap.last_price > 0 and snap.last_price > buying_power:
                         logger.info(
                             "[%s] flow=%s(%.2f) price=$%.0f > power=$%.0f -> SKIP(can't afford)",
@@ -1324,19 +1610,8 @@ async def main_loop() -> None:
                             )
                             continue
 
-                    # Filter E: amplitude (当日値幅率) が小さい日は SL whipsaw リスク高 → スキップ
-                    if (
-                        settings.TIGHT_FILTER_ENABLED
-                        and hasattr(snap, 'amplitude')
-                        and snap.amplitude is not None
-                        and snap.amplitude > 0
-                        and snap.amplitude < settings.TIGHT_AMPLITUDE_MIN
-                    ):
-                        logger.info(
-                            "[%s] Filter E: amplitude=%.2f%% < %.1f%% → SKIP",
-                            symbol, snap.amplitude, settings.TIGHT_AMPLITUDE_MIN,
-                        )
-                        continue
+                    # 注: amplitude チェックは tight_filter_long の Filter F に統合
+                    # (Claude API 後だが、 dryrun 記録に tight_filter_reason として残るため)
 
                     # 3) テキスト収集
                     posts = await board_scraper.fetch_posts(symbol)
@@ -1450,6 +1725,8 @@ async def main_loop() -> None:
                                 tight_reason=tight_reason,
                                 dryrun_type="skip",
                                 slot_count_at_signal=order_router.long_count,
+                                spy_change=_spy_change,
+                                qqq_change=_qqq_change,
                             )
                             continue
 
@@ -1471,6 +1748,8 @@ async def main_loop() -> None:
                                 tight_reason=tight_reason,
                                 dryrun_type="full",
                                 slot_count_at_signal=order_router.long_count,
+                                spy_change=_spy_change,
+                                qqq_change=_qqq_change,
                             )
                             continue
 
@@ -1480,7 +1759,33 @@ async def main_loop() -> None:
                                 "[%s] AND pass but TIGHT FILTER REJECTED: %s",
                                 symbol, tight_reason,
                             )
+                            # IF 分析用: フィルタ無しで実エントリーされていたケースを
+                            # 仮想 PnL で追跡 (本番稼働後もフィルタ精度を検証可能)
+                            await _long_dryrun_record(
+                                symbol=symbol,
+                                sentiment=sentiment,
+                                flow=flow,
+                                snap=snapshot,
+                                vwap_approx=vwap_approx,
+                                vwap_above=vwap_above,
+                                levels=levels,
+                                kline=kline,
+                                stop_loss=stop_loss_manager,
+                                client=client,
+                                texts_count=len(texts),
+                                tight_pass=tight_pass,
+                                tight_reason=tight_reason,
+                                dryrun_type="rejected",
+                                slot_count_at_signal=order_router.long_count,
+                                spy_change=_spy_change,
+                                qqq_change=_qqq_change,
+                            )
                             continue
+
+                        # 価格トレンド記録 (毎スキャン更新、 即エントリー時と押し目キュー実行時の参照用)
+                        _cur_price = snapshot.last_price
+                        _prev_price = _last_scan_prices.get(symbol, _cur_price)
+                        _last_scan_prices[symbol] = _cur_price  # 今回の価格を記録
 
                         # --- 押し目待ち判定 ---
                         # vwap_dev > entry_threshold なら待機キューへ
@@ -1511,6 +1816,8 @@ async def main_loop() -> None:
                                         'kline': kline,
                                         'texts_count': len(texts),
                                         'entry_price_at_signal': snapshot.last_price,
+                                        # 反転確認用: vwap_dev の最小値を追跡
+                                        'min_vwap_dev': vwap_dev_pct_entry,
                                     }
                                     logger.info(
                                         "[%s] 押し目待ちキュー追加: vwap_dev=%.2f%% > %.1f%% → %d分以内に押し目待ち%s",
@@ -1532,6 +1839,29 @@ async def main_loop() -> None:
                                     })
                                 continue  # 今は発注しない
 
+                        # --- 即エントリー直前の価格下落チェック ---
+                        # vwap_dev は閾値以下 (即エントリーパス) で確定
+                        # 直前スキャンから大きく下落していたら見送り (押し目キューにも追加しない)
+                        _price_change_pct = (
+                            (_cur_price - _prev_price) / _prev_price * 100
+                            if _prev_price > 0 else 0.0
+                        )
+                        if _price_change_pct < -settings.ENTRY_PRICE_DROP_THRESHOLD:
+                            logger.info(
+                                "[%s] 即エントリー直前 価格下落中(%.2f→%.2f, %+.3f%%) → スキップ",
+                                symbol, _prev_price, _cur_price, _price_change_pct,
+                            )
+                            continue
+
+                        # A1/A3 ルールチェック (即エントリー直前)
+                        _ok, _rule_reason = _check_price_trend_rules(symbol)
+                        if not _ok:
+                            logger.info(
+                                "[%s] 即エントリー直前 price trend BLOCK: %s → スキップ",
+                                symbol, _rule_reason,
+                            )
+                            continue
+
                         size = position_sizer.calculate(
                             symbol, current_price, buying_power,
                         )
@@ -1543,10 +1873,9 @@ async def main_loop() -> None:
                                 "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
                                 symbol, decision.direction, size, current_price, result.order_id,
                             )
-                            # ATR/SPY を記録用に取得
+                            # ATR を計算（SPY/QQQ はループ先頭でキャッシュ済み）
                             _atr_pct = stop_loss_manager.calc_atr_pct(kline, current_price)
                             _atr_val = current_price * _atr_pct
-                            _spy_rt = client.get_spy_intraday_change()
 
                             # 銘柄の当日騰落率: snapshot の prev_close 優先、フォールバック kline
                             _prev_close_calc = snapshot.prev_close
@@ -1568,7 +1897,8 @@ async def main_loop() -> None:
                                 atr_pct=_atr_pct,
                                 vwap_above=vwap_above,
                                 vwap_price=vwap_approx,
-                                spy_rt=_spy_rt,
+                                spy_rt=_spy_change,
+                                qqq_rt=_qqq_change,
                                 sentiment_score=sentiment.score,
                                 sentiment_confidence=sentiment.confidence,
                                 flow_strength=flow.strength,

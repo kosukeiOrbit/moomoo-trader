@@ -38,6 +38,7 @@ class TradeRecord:
     vwap_above: bool | None = None
     vwap_price: float | None = None
     spy_rt: float | None = None
+    qqq_rt: float | None = None
     mfe: float = 0.0
     mae: float = 0.0
     sentiment_score: float | None = None
@@ -73,7 +74,7 @@ class PnLTracker:
         "opened_at", "closed_at", "hold_minutes",
         "atr_value", "atr_pct",
         "vwap_above", "vwap_price",
-        "spy_rt",
+        "spy_rt", "qqq_rt",
         "mfe", "mae",
         "sentiment_score", "sentiment_confidence",
         "flow_strength", "commission", "net_pnl", "is_dynamic",
@@ -109,6 +110,7 @@ class PnLTracker:
         vwap_above: bool | None = None,
         vwap_price: float | None = None,
         spy_rt: float | None = None,
+        qqq_rt: float | None = None,
         sentiment_score: float | None = None,
         sentiment_confidence: float | None = None,
         flow_strength: float | None = None,
@@ -148,6 +150,7 @@ class PnLTracker:
             vwap_above=vwap_above,
             vwap_price=vwap_price,
             spy_rt=spy_rt,
+            qqq_rt=qqq_rt,
             sentiment_score=sentiment_score,
             sentiment_confidence=sentiment_confidence,
             flow_strength=flow_strength,
@@ -420,6 +423,7 @@ class PnLTracker:
                     t.vwap_above if t.vwap_above is not None else "",
                     f"{t.vwap_price:.4f}" if t.vwap_price is not None else "",
                     f"{t.spy_rt:.4f}" if t.spy_rt is not None else "",
+                    f"{t.qqq_rt:.4f}" if t.qqq_rt is not None else "",
                     f"{t.mfe:.2f}",
                     f"{t.mae:.2f}",
                     f"{t.sentiment_score:.2f}" if t.sentiment_score is not None else "",
