@@ -64,9 +64,12 @@ class StopLossManager:
             )
 
         if direction == "SHORT":
-            sl = entry_price + (atr_value * settings.ATR_SL_MULTIPLIER)
-            tp = entry_price - (atr_value * settings.ATR_TP_MULTIPLIER)
-            trailing = entry_price + (atr_value * settings.ATR_SL_MULTIPLIER * 0.8)
+            # SHORT 専用 ATR 乗数 (LONG とは非対称、 backlog FINAL-7 推奨)
+            sl_mult = settings.ATR_SL_MULTIPLIER_SHORT
+            tp_mult = settings.ATR_TP_MULTIPLIER_SHORT
+            sl = entry_price + (atr_value * sl_mult)
+            tp = entry_price - (atr_value * tp_mult)
+            trailing = entry_price + (atr_value * sl_mult * 0.8)
         else:
             sl = entry_price - (atr_value * settings.ATR_SL_MULTIPLIER)
             tp = entry_price + (atr_value * settings.ATR_TP_MULTIPLIER)

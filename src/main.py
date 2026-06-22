@@ -173,6 +173,10 @@ async def _short_dryrun(
     order_router=None,
     spy_change: float | None = None,
     qqq_change: float | None = None,
+    spy_change_open: float | None = None,
+    qqq_change_open: float | None = None,
+    position_sizer=None,  # 実エントリー時 (ENABLE_SHORT=true) に必要
+    pnl_tracker=None,     # 実エントリー時 (ENABLE_SHORT=true) に必要
 ) -> None:
     """SHORT ドライラン: 発注せず仮想PnLをJSONLに記録する.
 
@@ -238,8 +242,33 @@ async def _short_dryrun(
 
         kline = client.get_kline(symbol)
         atr_pct = stop_loss.calc_atr_pct(kline, entry_price)
-        sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER)
-        tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER)
+        # SHORT 専用 ATR 乗数 (FINAL-7 推奨: SL/TP 共に 0.7)
+        sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER_SHORT)
+        tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER_SHORT)
+
+        # === FINAL-7 フィルタ (6/19 backlog 推奨) ===
+        # 失敗してもメタ情報は dryrun jsonl に記録される (分析統合用)
+        final7_pass = True
+        final7_reason = "passed"
+        # 1. KLAC など構造的負け銘柄を除外
+        if symbol in settings.SHORT_BLOCK_SYMBOLS:
+            final7_pass = False
+            final7_reason = f"BLOCK_SYMBOL: {symbol}"
+        # 2. gap > -2% 必須 (dead cat bounce 罠回避)
+        elif snap.gap_pct is not None and snap.gap_pct <= settings.SHORT_GAP_MIN_PCT:
+            final7_pass = False
+            final7_reason = f"gap={snap.gap_pct:.2f}% <= {settings.SHORT_GAP_MIN_PCT}%"
+        # 3. amp < 7% (過熱反転リスク)
+        elif snap.amplitude is not None and snap.amplitude >= settings.SHORT_AMP_MAX_PCT:
+            final7_pass = False
+            final7_reason = f"amp={snap.amplitude:.2f}% >= {settings.SHORT_AMP_MAX_PCT}%"
+        # 4. SPY prev_close < 0% (弱気相場のみ)
+        elif spy_change is None:
+            final7_pass = False
+            final7_reason = "SPY_PC unavailable"
+        elif spy_change >= settings.SHORT_SPY_MAX_PC / 100.0:
+            final7_pass = False
+            final7_reason = f"SPY_PC={spy_change*100:.2f}% >= {settings.SHORT_SPY_MAX_PC}%"
 
         # 銘柄の当日騰落率: snapshot の prev_close 優先、フォールバックで kline
         prev_close_for_calc = snap.prev_close
@@ -268,6 +297,8 @@ async def _short_dryrun(
         except Exception:
             sec_since_open = None
 
+        # 方向情報 (6/17 Idea B: _price_history deque から計算)
+        _d5_short, _d15_short, _vel_short = _calc_direction_from_history(symbol)
         _dryrun_entered[symbol] = today
         record = {
             "date": today,
@@ -284,8 +315,13 @@ async def _short_dryrun(
             "flow_strength": round(flow_strength, 3),
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
             "qqq_change_realtime": round(qqq_change * 100, 2) if qqq_change is not None else None,
+            "spy_change_open": round(spy_change_open * 100, 2) if spy_change_open is not None else None,
+            "qqq_change_open": round(qqq_change_open * 100, 2) if qqq_change_open is not None else None,
             "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "individual_would_trigger": individual_would_trigger,
+            "direction_5min_pct": round(_d5_short, 3) if _d5_short is not None else None,
+            "direction_15min_pct": round(_d15_short, 3) if _d15_short is not None else None,
+            "direction_velocity": round(_vel_short, 4) if _vel_short is not None else None,
             # 高値掴み判別用フィールド
             "open_price": round(snap.open_price, 4) if snap.open_price > 0 else None,
             "high_price": round(snap.high_price, 4) if snap.high_price > 0 else None,
@@ -308,6 +344,13 @@ async def _short_dryrun(
             ),
             "slot_load_at_signal": slot_load,
             "seconds_since_market_open": sec_since_open,
+            # FINAL-7 フィルタ評価 (6/19 Phase 1 解禁)
+            "final7_pass": final7_pass,
+            "final7_reason": final7_reason,
+            # 実エントリー追跡 (後の実 + 仮想統合分析用、 _short_real_close で更新)
+            "actual_entry_at": None,
+            "actual_entry_price": None,
+            "actual_order_id": None,
             "close_price": None,
             "exit_reason": None,
             "virtual_pnl": None,
@@ -319,10 +362,106 @@ async def _short_dryrun(
         spy_str = f" spy_rt={spy_rt*100:.2f}%" if spy_rt is not None else ""
         logger.info(
             "[DRY-RUN SHORT/%s] %s entry=%.2f SL=%.2f TP=%.2f "
-            "score=%.3f conf=%.3f flow=%.3f%s",
+            "score=%.3f conf=%.3f flow=%.3f%s final7=%s",
             pattern, symbol, entry_price, sl_price, tp_price,
             score, confidence, flow_strength, spy_str,
+            "PASS" if final7_pass else f"FAIL({final7_reason})",
         )
+
+        # === 実エントリー (ENABLE_SHORT=true かつ SHORT_DRY_RUN=false かつ FINAL-7 通過時) ===
+        # SHORT_DRY_RUN=true なら dryrun jsonl 記録のみで実発注しない (safety switch)
+        # ユーザーが Phase 1 開始時に SHORT_DRY_RUN=false に切り替えで本番化
+        if (
+            settings.ENABLE_SHORT
+            and not settings.SHORT_DRY_RUN
+            and final7_pass
+            and order_router is not None
+            and position_sizer is not None
+            and pnl_tracker is not None
+        ):
+            try:
+                from src.signals.and_filter import EntryDecision
+                from src.risk.stop_loss import Levels
+                # 既に SHORT 枠フルなら skip
+                if order_router.short_count >= settings.SHORT_MAX_POSITIONS:
+                    logger.info(
+                        "[%s] SHORT 枠フル (%d/%d) — 実エントリーは見送り",
+                        symbol, order_router.short_count, settings.SHORT_MAX_POSITIONS,
+                    )
+                else:
+                    # SHORT 用サイズ計算 (SHORT_POSITION_SIZE_USD)
+                    bp = client.get_account_balance() or 100_000.0
+                    size = position_sizer.calculate(symbol, entry_price, bp, direction="SHORT")
+                    if size <= 0:
+                        logger.info("[%s] SHORT size=0 — skip", symbol)
+                    else:
+                        # SL/TP levels を構築 (LONG とは方向逆)
+                        levels = Levels(
+                            stop_loss=sl_price,
+                            take_profit=tp_price,
+                            trailing_stop=entry_price + (entry_price - tp_price) * 0.5,
+                        )
+                        decision = EntryDecision(go=True, direction="SHORT")
+                        result = await order_router.enter(
+                            decision, symbol, size, entry_price, levels,
+                        )
+                        if result is not None and result.status == "FILLED":
+                            actual_price = result.filled_price or entry_price
+                            # 実エントリーを dryrun jsonl にも反映 (分析統合)
+                            record["actual_entry_at"] = datetime.now().strftime("%H:%M:%S")
+                            record["actual_entry_price"] = round(actual_price, 4)
+                            record["actual_order_id"] = result.order_id
+                            # 末尾レコードを書き換え (シンプル: 該当行を rewriting せず追記で間に合わせる場合は次回 close 処理時に actual_* を埋める設計)
+                            # → ここでは新規追記でなく、 後で _short_dryrun_close が actual_* を更新する想定
+                            # PnLTracker に登録
+                            _d5_r, _d15_r, _vel_r = _calc_direction_from_history(symbol)
+                            pnl_tracker.register(
+                                result.order_id, symbol, "SHORT",
+                                size, actual_price,
+                                atr_value=atr_pct * entry_price,
+                                atr_pct=atr_pct,
+                                vwap_above=vwap_above,
+                                vwap_price=vwap_value,
+                                spy_rt=spy_rt,
+                                qqq_rt=qqq_change,
+                                spy_rt_open=spy_change_open,
+                                qqq_rt_open=qqq_change_open,
+                                sentiment_score=score,
+                                sentiment_confidence=confidence,
+                                flow_strength=flow_strength,
+                                is_dynamic=symbol not in settings.WATCHLIST,
+                                symbol_change_pct=symbol_change_pct,
+                                vwap_deviation_pct=(
+                                    (entry_price - vwap_value) / vwap_value
+                                    if vwap_value else None
+                                ),
+                                sl_price=sl_price,
+                                tp_price=tp_price,
+                                open_price=snap.open_price if snap.open_price > 0 else None,
+                                high_price=snap.high_price if snap.high_price > 0 else None,
+                                low_price=snap.low_price if snap.low_price > 0 else None,
+                                prev_close=snap.prev_close if snap.prev_close > 0 else None,
+                                change_from_open_pct=snap.change_from_open_pct,
+                                gap_pct=snap.gap_pct,
+                                price_position_in_range=snap.price_position_in_range,
+                                amplitude=snap.amplitude if snap.amplitude > 0 else None,
+                                pre_change_rate=snap.pre_change_rate,
+                                volume_ratio=snap.volume_ratio if snap.volume_ratio > 0 else None,
+                                direction_5min_pct=_d5_r,
+                                direction_15min_pct=_d15_r,
+                                direction_velocity=_vel_r,
+                            )
+                            logger.info(
+                                "[%s] SHORT 実エントリー成功: %d shares @ $%.2f order_id=%s",
+                                symbol, size, actual_price, result.order_id,
+                            )
+                        else:
+                            logger.warning(
+                                "[%s] SHORT 実エントリー失敗 or 不完全約定: result=%s",
+                                symbol, result,
+                            )
+            except Exception:
+                logger.exception("[%s] SHORT 実エントリー処理エラー", symbol)
 
     except Exception:
         logger.warning("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
@@ -463,6 +602,42 @@ def _record_scan_price(symbol: str, price: float, timestamp: datetime | None = N
                 }) + "\n")
         except Exception:
             pass  # ロガー失敗はサイレント (エントリー判定をブロックしない)
+
+
+def _calc_direction_from_history(symbol: str) -> tuple[float | None, float | None, float | None]:
+    """_price_history deque から方向情報を計算する.
+
+    スキャン間隔約 30 秒前提:
+      - direction_5min_pct: 直近 10 サンプル前との変化率 (%) ≒ 5 分前比
+      - direction_15min_pct: 直近 30 サンプル前との変化率 (%) ≒ 15 分前比
+      - direction_velocity: 直近 5 サンプルの平均変化速度 (%/サンプル)
+
+    サンプル不足時は該当する値を None で返す (既存挙動を壊さない)。
+    ENTRY_PRICE_HISTORY_DEPTH=30 設定で 15 分分の履歴を保持する必要あり。
+    """
+    hist = list(_price_history.get(symbol, []))
+    if len(hist) < 2:
+        return None, None, None
+    current = hist[-1][1]
+    if current <= 0:
+        return None, None, None
+    d5 = d15 = vel = None
+    # direction_5min_pct: 10 サンプル前比 (約 5 分前 ≒ スキャン 30 秒 × 10)
+    if len(hist) >= 11:
+        prev_5min = hist[-11][1]
+        if prev_5min > 0:
+            d5 = (current - prev_5min) / prev_5min * 100
+    # direction_15min_pct: 30 サンプル前比 (約 14.5 分前 ≒ deque maxlen=30 の先頭)
+    if len(hist) >= 30:
+        prev_15min = hist[-30][1]
+        if prev_15min > 0:
+            d15 = (current - prev_15min) / prev_15min * 100
+    # direction_velocity: 直近 5 サンプルの平均変化速度 (%/サンプル)
+    if len(hist) >= 6:
+        prev_5 = hist[-6][1]
+        if prev_5 > 0:
+            vel = (current - prev_5) / prev_5 * 100 / 5
+    return d5, d15, vel
 
 
 def _check_price_trend_rules(symbol: str) -> tuple[bool, str]:
@@ -617,6 +792,8 @@ async def _long_dryrun_record(
     slot_count_at_signal: int | None = None,
     spy_change: float | None = None,
     qqq_change: float | None = None,
+    spy_change_open: float | None = None,
+    qqq_change_open: float | None = None,
 ) -> None:
     """LONG エントリー条件成立を JSONL に記録する (実発注なし).
 
@@ -665,6 +842,8 @@ async def _long_dryrun_record(
         # 地合いはキャッシュ値を優先 (呼び出し元がループ先頭で取得済み)
         spy_rt = spy_change if spy_change is not None else client.get_spy_intraday_change()
 
+        # 方向情報 (6/17 Idea B: _price_history deque から計算)
+        _d5_long, _d15_long, _vel_long = _calc_direction_from_history(symbol)
         recorded_dict[symbol] = today
         record = {
             "date": today,
@@ -685,6 +864,8 @@ async def _long_dryrun_record(
             "flow_strength": round(flow.strength, 3),
             "spy_change_realtime": round(spy_rt * 100, 2) if spy_rt is not None else None,
             "qqq_change_realtime": round(qqq_change * 100, 2) if qqq_change is not None else None,
+            "spy_change_open": round(spy_change_open * 100, 2) if spy_change_open is not None else None,
+            "qqq_change_open": round(qqq_change_open * 100, 2) if qqq_change_open is not None else None,
             "symbol_change_pct": round(symbol_change_pct * 100, 2) if symbol_change_pct is not None else None,
             "texts_count": texts_count,
             "is_dynamic": symbol not in settings.WATCHLIST,
@@ -702,6 +883,10 @@ async def _long_dryrun_record(
             # tight filter 評価結果 (IF分析用)
             "tight_filter_pass": tight_pass,
             "tight_filter_reason": tight_reason,
+            # 方向情報 (6/17 Idea B: 1-2 ヶ月蓄積後にフィルタ化判定)
+            "direction_5min_pct": round(_d5_long, 3) if _d5_long is not None else None,
+            "direction_15min_pct": round(_d15_long, 3) if _d15_long is not None else None,
+            "direction_velocity": round(_vel_long, 4) if _vel_long is not None else None,
             # 後で埋める
             "actual_entry_at": None,
             "actual_entry_price": None,
@@ -756,19 +941,42 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
         # pnl_tracker から実トレードを引く (open + closed)
         all_trades = list(pnl_tracker._open_trades.values()) + pnl_tracker._closed_trades
 
+        # 未 close レコードの銘柄を一括取得 (API レート制限緩和)
+        # get_snapshot を 1 件ずつ呼ぶと moomoo の OpenAPI レート制限 (~10req/s) で
+        # 失敗が連鎖し、 多くのレコードが close_price=None のまま残る問題があった。
+        unique_symbols = list({rec["symbol"] for rec in records if rec.get("close_price") is None})
+        snapshot_cache: dict[str, float] = {}
+        if unique_symbols:
+            try:
+                codes = [f"US.{s}" for s in unique_symbols]
+                snaps = client.get_snapshots(codes)
+                for code, snap in snaps.items():
+                    if snap is None or snap.last_price <= 0:
+                        continue
+                    symbol = code.replace("US.", "")
+                    snapshot_cache[symbol] = snap.last_price
+            except Exception:
+                logger.exception("get_snapshots 一括取得失敗 — 個別取得にフォールバック")
+            logger.info(
+                "[DRY-RUN %s CLOSE] 一括 snapshot: %d / %d 銘柄取得",
+                dryrun_type.upper(), len(snapshot_cache), len(unique_symbols),
+            )
+
         updated = False
         for rec in records:
             if rec.get("close_price") is not None:
                 continue  # 処理済み
 
-            # 1) 仮想決済
-            try:
-                snap = client.get_snapshot(rec["symbol"])
-                if snap is None or snap.last_price <= 0:
+            # 1) 仮想決済: 一括キャッシュ → fallback で個別取得
+            close_price = snapshot_cache.get(rec["symbol"], 0)
+            if close_price <= 0:
+                try:
+                    snap = client.get_snapshot(rec["symbol"])
+                    if snap is None or snap.last_price <= 0:
+                        continue
+                    close_price = snap.last_price
+                except Exception:
                     continue
-                close_price = snap.last_price
-            except Exception:
-                continue
 
             entry_price = rec["first_signal_price"]
             sl_price = rec["sl_price"]
@@ -841,8 +1049,13 @@ async def _scan_momentum_symbols(client, watchlist: list[str]) -> None:
       - 既存 watchlist 全銘柄 (固定WL + 動的WL)
       → ユニオンを scan、急騰銘柄全件に momentum フラグを立てる
 
+    MOMENTUM_DETECTION_ENABLED=false で完全無効化される (n=153 分析で損失源と判明)。
+
     エラーは握りつぶして本処理に影響させない。
     """
+    if not settings.MOMENTUM_DETECTION_ENABLED:
+        logger.info("[Momentum] MOMENTUM_DETECTION_ENABLED=false → 検知スキップ")
+        return
     try:
         # 1) 候補銘柄リスト (Finviz top 100、固定WL除外) を読み込み
         candidate_pool: list[str] = []
@@ -1100,8 +1313,23 @@ async def main_loop() -> None:
 
             # --- 口座状態を取得してサーキットブレーカーチェック ---
             _t = _time.monotonic()
+            # 個別タイミング計測 (どちらの API が遅いか切り分け用)
+            _t_bp = _time.monotonic()
             buying_power = client.get_account_balance() or 100_000.0
+            _bp_elapsed = _time.monotonic() - _t_bp
+            if _bp_elapsed > 1.0:
+                logger.warning(
+                    "get_account_balance 遅延: %.2fs (loop #%d)",
+                    _bp_elapsed, _loop_count,
+                )
+            _t_ta = _time.monotonic()
             total_assets = client.get_total_assets() or buying_power
+            _ta_elapsed = _time.monotonic() - _t_ta
+            if _ta_elapsed > 1.0:
+                logger.warning(
+                    "get_total_assets 遅延: %.2fs (loop #%d)",
+                    _ta_elapsed, _loop_count,
+                )
             logger.info(
                 "Account: buying_power=$%.2f total_assets=$%.2f (%.2fs)",
                 buying_power, total_assets, _time.monotonic() - _t,
@@ -1127,23 +1355,54 @@ async def main_loop() -> None:
                     except asyncio.CancelledError:
                         pass
                     order_router.exit_all_sync("Circuit breaker: force close")
+                    # dryrun の close 処理 (ET 15:50 と同様、 累積データを欠損させない)
+                    # サーキット発動時に走らないと、 jsonl の close_price=None レコードが
+                    # 翌営業日まで持ち越され、 IF 分析データが欠落する。
+                    try:
+                        if settings.SHORT_DRY_RUN:
+                            await _short_dryrun_close(client)
+                        if settings.LONG_SKIP_DRY_RUN:
+                            await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")
+                        if settings.LONG_FULL_DRY_RUN:
+                            await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
+                        await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
+                        await _filter_d_log_close(client)
+                    except Exception:
+                        logger.exception("Circuit Breaker 時の dryrun close 失敗")
                     break
                 await asyncio.sleep(settings.LOOP_INTERVAL_SECONDS)
                 continue
 
             # --- 地合い指標 (SPY/QQQ) をループ先頭で1度だけ取得しキャッシュ ---
             # 個別エントリー / in_position_signal で参照される。snapshot ベースなので購読不要。
+            # _spy_change / _qqq_change: 前日終値基準 (主指標、 SPY フィルタ判定用)
+            # _spy_change_open / _qqq_change_open: 当日始値基準 (補助、 過去 cohort 整合)
+            _mi_t = _time.monotonic()
             try:
                 _market_indices = client.get_market_indices()
+                _mi_elapsed = _time.monotonic() - _mi_t
+                if _mi_elapsed > 3.0:
+                    logger.warning(
+                        "get_market_indices 遅延: %.2fs (loop #%d)",
+                        _mi_elapsed, _loop_count,
+                    )
             except Exception:
-                logger.debug("get_market_indices 取得失敗（無視）", exc_info=True)
-                _market_indices = {"spy": None, "qqq": None}
+                _mi_elapsed = _time.monotonic() - _mi_t
+                logger.warning(
+                    "get_market_indices 例外 (%.2fs, loop #%d): フォールバック値使用",
+                    _mi_elapsed, _loop_count, exc_info=True,
+                )
+                _market_indices = {"spy": None, "qqq": None, "spy_open": None, "qqq_open": None}
             _spy_change = _market_indices.get("spy")
             _qqq_change = _market_indices.get("qqq")
+            _spy_change_open = _market_indices.get("spy_open")
+            _qqq_change_open = _market_indices.get("qqq_open")
             logger.info(
-                "Market: SPY=%s QQQ=%s",
+                "Market: SPY=%s (open基準%s) QQQ=%s (open基準%s)",
                 f"{_spy_change*100:+.2f}%" if _spy_change is not None else "NA",
+                f"{_spy_change_open*100:+.2f}%" if _spy_change_open is not None else "NA",
                 f"{_qqq_change*100:+.2f}%" if _qqq_change is not None else "NA",
+                f"{_qqq_change_open*100:+.2f}%" if _qqq_change_open is not None else "NA",
             )
 
             # --- 銘柄ごとのスキャンループ ---
@@ -1332,6 +1591,21 @@ async def main_loop() -> None:
                             del _pullback_queue[_pb_symbol]
                             continue
 
+                        # SPY 地合いフィルタ: 暴落中は押し目キュー解除でもエントリーしない
+                        # キューには残して、 SPY 回復後に出れるようにする
+                        if (
+                            settings.SPY_LONG_BLOCK_THRESHOLD < 0
+                            and _spy_change is not None
+                            and _spy_change < settings.SPY_LONG_BLOCK_THRESHOLD
+                        ):
+                            logger.info(
+                                "[%s] 押し目到来したが SPY 地合いフィルタ BLOCKED: SPY=%+.2f%% < %+.2f%% → 待機継続",
+                                _pb_symbol,
+                                _spy_change * 100,
+                                settings.SPY_LONG_BLOCK_THRESHOLD * 100,
+                            )
+                            continue
+
                         # エントリー実行
                         logger.info(
                             "[%s] 押し目到来(vwap_dev=%.2f%% %.0f分後) → エントリー",
@@ -1382,6 +1656,7 @@ async def main_loop() -> None:
                                 (_pb_snap.last_price - _pb_prev_close) / _pb_prev_close
                                 if _pb_prev_close > 0 else None
                             )
+                            _pb_d5, _pb_d15, _pb_vel = _calc_direction_from_history(_pb_symbol)
                             pnl_tracker.register(
                                 _pb_result.order_id, _pb_symbol, "LONG",
                                 _pb_size, _pb_snap.last_price,
@@ -1391,6 +1666,8 @@ async def main_loop() -> None:
                                 vwap_price=_pb_vwap,
                                 spy_rt=_spy_change,
                                 qqq_rt=_qqq_change,
+                                spy_rt_open=_spy_change_open,
+                                qqq_rt_open=_qqq_change_open,
                                 sentiment_score=_pb['sentiment'].score,
                                 sentiment_confidence=_pb['sentiment'].confidence,
                                 flow_strength=_pb_flow.strength,
@@ -1411,6 +1688,9 @@ async def main_loop() -> None:
                                 pre_change_rate=_pb_snap.pre_change_rate,
                                 volume_ratio=_pb_snap.volume_ratio if _pb_snap.volume_ratio > 0 else None,
                                 is_momentum=_pb_symbol in _momentum_added_symbols,
+                                direction_5min_pct=_pb_d5,
+                                direction_15min_pct=_pb_d15,
+                                direction_velocity=_pb_vel,
                             )
                             notifier.notify_entry(
                                 _pb_symbol, "LONG", _pb_size, _pb_snap.last_price,
@@ -1523,44 +1803,26 @@ async def main_loop() -> None:
                         continue
 
                     # flow=SELL → SHORT処理（必ずcontinue、LONGには流れない）
+                    # ENABLE_SHORT=false → dryrun jsonl 記録のみ (分析データ蓄積継続)
+                    # ENABLE_SHORT=true + SHORT_DRY_RUN=true → dryrun のみ (実発注なし、 Phase 1 準備)
+                    # ENABLE_SHORT=true + SHORT_DRY_RUN=false → 実エントリー + dryrun 並行記録
                     if flow.direction == "SELL":
-                        if settings.ENABLE_SHORT:
-                            # SHORT 実エントリー処理（将来実装）
-                            if settings.SHORT_DRY_RUN:
-                                await _short_dryrun(
-                                    symbol=symbol,
-                                    flow_strength=flow.strength,
-                                    board_scraper=board_scraper,
-                                    news_feed=news_feed,
-                                    sentiment_analyzer=sentiment_analyzer,
-                                    client=client,
-                                    stop_loss=stop_loss_manager,
-                                    order_router=order_router,
-                                    spy_change=_spy_change,
-                                    qqq_change=_qqq_change,
-                                )
-                            logger.info(
-                                "[%s] flow=SELL(%.2f) -> SHORT candidate (not yet implemented)",
-                                symbol, flow.strength,
-                            )
-                        else:
-                            if settings.SHORT_DRY_RUN:
-                                await _short_dryrun(
-                                    symbol=symbol,
-                                    flow_strength=flow.strength,
-                                    board_scraper=board_scraper,
-                                    news_feed=news_feed,
-                                    sentiment_analyzer=sentiment_analyzer,
-                                    client=client,
-                                    stop_loss=stop_loss_manager,
-                                    order_router=order_router,
-                                    spy_change=_spy_change,
-                                    qqq_change=_qqq_change,
-                                )
-                            logger.info(
-                                "[%s] flow=SELL(%.2f) -> SKIP(SHORT disabled)",
-                                symbol, flow.strength,
-                            )
+                        await _short_dryrun(
+                            symbol=symbol,
+                            flow_strength=flow.strength,
+                            board_scraper=board_scraper,
+                            news_feed=news_feed,
+                            sentiment_analyzer=sentiment_analyzer,
+                            client=client,
+                            stop_loss=stop_loss_manager,
+                            order_router=order_router,
+                            spy_change=_spy_change,
+                            qqq_change=_qqq_change,
+                            spy_change_open=_spy_change_open,
+                            qqq_change_open=_qqq_change_open,
+                            position_sizer=position_sizer,
+                            pnl_tracker=pnl_tracker,
+                        )
                         continue  # flow=SELL は必ず continue
 
                     # flow.strength が閾値未満ならAPIスキップ
@@ -1727,6 +1989,8 @@ async def main_loop() -> None:
                                 slot_count_at_signal=order_router.long_count,
                                 spy_change=_spy_change,
                                 qqq_change=_qqq_change,
+                                spy_change_open=_spy_change_open,
+                                qqq_change_open=_qqq_change_open,
                             )
                             continue
 
@@ -1750,6 +2014,8 @@ async def main_loop() -> None:
                                 slot_count_at_signal=order_router.long_count,
                                 spy_change=_spy_change,
                                 qqq_change=_qqq_change,
+                                spy_change_open=_spy_change_open,
+                                qqq_change_open=_qqq_change_open,
                             )
                             continue
 
@@ -1779,6 +2045,49 @@ async def main_loop() -> None:
                                 slot_count_at_signal=order_router.long_count,
                                 spy_change=_spy_change,
                                 qqq_change=_qqq_change,
+                                spy_change_open=_spy_change_open,
+                                qqq_change_open=_qqq_change_open,
+                            )
+                            continue
+
+                        # SPY 地合いフィルタ: 暴落中の LONG エントリーをブロック (案 1)
+                        # SPY <-0.5% で SL ヒット率 80%+ (n=62 分析) のため、 暴落中は LONG 控える。
+                        # blocked シグナルは rejected dryrun に記録し、 「もし入っていたら」 の
+                        # 仮想 pnl を後から評価可能にする (リバウンド取りこぼしの IF 分析)。
+                        if (
+                            decision.direction == "LONG"
+                            and settings.SPY_LONG_BLOCK_THRESHOLD < 0
+                            and _spy_change is not None
+                            and _spy_change < settings.SPY_LONG_BLOCK_THRESHOLD
+                        ):
+                            spy_block_reason = (
+                                f"SPY_BLOCK: SPY={_spy_change*100:+.2f}% "
+                                f"< threshold={settings.SPY_LONG_BLOCK_THRESHOLD*100:+.2f}%"
+                            )
+                            logger.info(
+                                "[%s] SPY 地合いフィルタ BLOCKED: %s",
+                                symbol, spy_block_reason,
+                            )
+                            await _long_dryrun_record(
+                                symbol=symbol,
+                                sentiment=sentiment,
+                                flow=flow,
+                                snap=snapshot,
+                                vwap_approx=vwap_approx,
+                                vwap_above=vwap_above,
+                                levels=levels,
+                                kline=kline,
+                                stop_loss=stop_loss_manager,
+                                client=client,
+                                texts_count=len(texts),
+                                tight_pass=False,
+                                tight_reason=spy_block_reason,
+                                dryrun_type="rejected",
+                                slot_count_at_signal=order_router.long_count,
+                                spy_change=_spy_change,
+                                qqq_change=_qqq_change,
+                                spy_change_open=_spy_change_open,
+                                qqq_change_open=_qqq_change_open,
                             )
                             continue
 
@@ -1890,6 +2199,7 @@ async def main_loop() -> None:
                             if vwap_approx and vwap_approx > 0:
                                 _vwap_dev = (current_price - vwap_approx) / vwap_approx
 
+                            _d5, _d15, _vel = _calc_direction_from_history(symbol)
                             pnl_tracker.register(
                                 result.order_id, symbol, decision.direction,
                                 size, current_price,
@@ -1899,6 +2209,8 @@ async def main_loop() -> None:
                                 vwap_price=vwap_approx,
                                 spy_rt=_spy_change,
                                 qqq_rt=_qqq_change,
+                                spy_rt_open=_spy_change_open,
+                                qqq_rt_open=_qqq_change_open,
                                 sentiment_score=sentiment.score,
                                 sentiment_confidence=sentiment.confidence,
                                 flow_strength=flow.strength,
@@ -1920,6 +2232,9 @@ async def main_loop() -> None:
                                 pre_change_rate=snapshot.pre_change_rate,
                                 volume_ratio=snapshot.volume_ratio if snapshot.volume_ratio > 0 else None,
                                 is_momentum=symbol in _momentum_added_symbols,
+                                direction_5min_pct=_d5,
+                                direction_15min_pct=_d15,
+                                direction_velocity=_vel,
                             )
                             notifier.notify_entry(
                                 symbol, decision.direction, size, current_price,

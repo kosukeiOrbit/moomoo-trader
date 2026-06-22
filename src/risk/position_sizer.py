@@ -50,13 +50,20 @@ class PositionSizer:
             return 0.0
         return self._wins / total
 
-    def calculate(self, symbol: str, price: float, account_balance: float) -> int:
+    def calculate(
+        self,
+        symbol: str,
+        price: float,
+        account_balance: float,
+        direction: str = "LONG",
+    ) -> int:
         """ポジションサイズ（株数）を計算する.
 
         Args:
             symbol: 銘柄シンボル
             price: 現在の株価
             account_balance: 口座残高（買付余力）
+            direction: "LONG" or "SHORT" — SHORT は SHORT_POSITION_SIZE_USD を使う
 
         Returns:
             発注株数
@@ -64,8 +71,11 @@ class PositionSizer:
         if price <= 0 or account_balance <= 0:
             return 0
 
-        # 固定額で株数を計算
-        position_value = settings.POSITION_SIZE_USD
+        # 固定額で株数を計算 (SHORT は専用サイズ)
+        if direction == "SHORT":
+            position_value = settings.SHORT_POSITION_SIZE_USD
+        else:
+            position_value = settings.POSITION_SIZE_USD
         shares = int(position_value / price)
 
         # MIN_POSITION_SHARES の保証

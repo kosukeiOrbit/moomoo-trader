@@ -150,6 +150,10 @@ class MoomooClient:
         self._trade_ctx: OpenSecTradeContext | None = None
         self._trd_env: Any = None
         self._connected: bool = False
+        # 信用取引対応: CASH と MARGIN それぞれの acc_id を保持
+        # connect() 時に get_acc_list() で取得
+        self._cash_acc_id: int = 0      # 現物口座
+        self._margin_acc_id: int = 0    # 信用口座 (未開設なら 0)
 
     @property
     def is_connected(self) -> bool:
@@ -207,11 +211,53 @@ class MoomooClient:
             if ret != RET_OK:
                 logger.error("トレードアンロック失敗: %s", data)
 
+        # 口座一覧を取得して CASH / MARGIN それぞれの acc_id を保持
+        # 信用買い (USE_MARGIN_LONG=true) 時は MARGIN acc_id を発注で指定する
+        try:
+            ret, acc_data = self._trade_ctx.get_acc_list()
+            if ret == RET_OK and acc_data is not None and not acc_data.empty:
+                target_env = "REAL" if self._trd_env == TrdEnv.REAL else "SIMULATE"
+                for _, row in acc_data.iterrows():
+                    if str(row.get("trd_env", "")) != target_env:
+                        continue
+                    acc_id = int(row.get("acc_id", 0))
+                    acc_type = str(row.get("acc_type", ""))
+                    if acc_type == "CASH" and self._cash_acc_id == 0:
+                        self._cash_acc_id = acc_id
+                    elif acc_type == "MARGIN" and self._margin_acc_id == 0:
+                        self._margin_acc_id = acc_id
+                logger.info(
+                    "acc_list: CASH=%d MARGIN=%d (env=%s)",
+                    self._cash_acc_id, self._margin_acc_id, target_env,
+                )
+            else:
+                logger.warning("get_acc_list 失敗 (ret=%s) — acc_id 未取得", ret)
+        except Exception:
+            logger.exception("get_acc_list 取得エラー — acc_id 未取得 (デフォルト発注に fallback)")
+
+        # USE_MARGIN_LONG が有効なのに MARGIN acc_id が取れない場合は警告
+        if settings.USE_MARGIN_LONG and self._margin_acc_id == 0:
+            logger.error(
+                "USE_MARGIN_LONG=true だが MARGIN 口座 acc_id が取得できません。"
+                " 信用口座が開設されているか確認してください。 現物口座にフォールバックします"
+            )
+
         self._connected = True
         logger.info(
-            "moomoo OpenAPI 接続完了 (host=%s:%d env=%s)",
+            "moomoo OpenAPI 接続完了 (host=%s:%d env=%s USE_MARGIN_LONG=%s active_acc=%d)",
             settings.MOOMOO_HOST, settings.MOOMOO_PORT, settings.TRADE_ENV,
+            settings.USE_MARGIN_LONG, self._get_active_acc_id(),
         )
+
+    def _get_active_acc_id(self) -> int:
+        """USE_MARGIN_LONG 設定に応じて使用する acc_id を返す.
+
+        信用買い時は MARGIN acc_id、 通常は CASH acc_id。
+        いずれも 0 (未取得) なら 0 を返す (futu SDK では 0 = 既定アカウント)。
+        """
+        if settings.USE_MARGIN_LONG and self._margin_acc_id > 0:
+            return self._margin_acc_id
+        return self._cash_acc_id
 
     def reconnect(self) -> bool:
         """接続断時に自動再接続を試みる.
@@ -311,7 +357,15 @@ class MoomooClient:
         assert self._quote_ctx is not None
         if not codes:
             return {}
+        import time as _t
+        _api_start = _t.monotonic()
         ret, data = self._quote_ctx.get_market_snapshot(codes)
+        _api_elapsed = _t.monotonic() - _api_start
+        if _api_elapsed > 3.0:
+            logger.warning(
+                "get_market_snapshot 遅延: %.2fs (ret=%s, codes=%d)",
+                _api_elapsed, ret, len(codes),
+            )
         if ret != RET_OK or data is None or data.empty:
             logger.debug("Batch snapshot unavailable: ret=%s codes=%d", ret, len(codes))
             return {}
@@ -405,22 +459,45 @@ class MoomooClient:
         return indices.get("spy")
 
     def get_market_indices(self) -> dict[str, float | None]:
-        """SPY / QQQ の当日変化率を一括取得する.
+        """SPY / QQQ の変化率を 2 基準で一括取得する.
 
         snapshot ベースのため購読不要 (subscribe 済みでなくても動作).
-        当日始値からの変化率を返す。
+
+        2 つの基準を両方返す (IF 分析の連続性のため):
+          - spy / qqq: **前日終値からの変化率** (= 一般的な「日次変化率」、 .SPX/Yahoo と同じ)
+              SPY フィルタの判定はこちらを使う (6/11 修正)。
+          - spy_open / qqq_open: **当日始値からの変化率** (= 6/10 までの旧基準)
+              当日寄付き後のトレンド (寄り高失速 vs 寄り安戻し) 検知用、 過去 cohort と整合。
+
+        修正履歴 (6/11): 旧 get は spy_open のみ返していた。 gap-down で始まる日
+        (例: 6/10 ET = SPY 前日比 -1.6%) に「open から +0.3%」 と誤認する問題があり、
+        prev_close 基準を主指標に、 open 基準を補助指標に変更。
 
         Returns:
-            {'spy': 0.005, 'qqq': 0.008} のような辞書。
-            取得不可ならその値は None。
+            {'spy': -0.016, 'qqq': -0.020, 'spy_open': +0.003, 'qqq_open': +0.005}
+            のような辞書。 取得不可ならその値は None。
         """
+        import time as _t
+        _start = _t.monotonic()
         snaps = self.get_snapshots(["US.SPY", "US.QQQ"])
-        result: dict[str, float | None] = {"spy": None, "qqq": None}
+        _snap_elapsed = _t.monotonic() - _start
+        if _snap_elapsed > 2.0:
+            logger.warning(
+                "get_market_indices: get_snapshots(SPY/QQQ) 遅延 %.2fs",
+                _snap_elapsed,
+            )
+        result: dict[str, float | None] = {
+            "spy": None, "qqq": None,
+            "spy_open": None, "qqq_open": None,
+        }
         for sym, snap in snaps.items():
-            if snap is None or snap.last_price <= 0 or snap.open_price <= 0:
+            if snap is None or snap.last_price <= 0:
                 continue
-            change = (snap.last_price - snap.open_price) / snap.open_price
-            result[sym.lower()] = change
+            key = sym.lower()  # us.spy / us.qqq → spy / qqq
+            if snap.prev_close > 0:
+                result[key] = (snap.last_price - snap.prev_close) / snap.prev_close
+            if snap.open_price > 0:
+                result[f"{key}_open"] = (snap.last_price - snap.open_price) / snap.open_price
         return result
 
     # ------------------------------------------------------------------
@@ -548,17 +625,57 @@ class MoomooClient:
         """口座の総資産（現金 + ポジション評価額）を取得する.
 
         ドローダウン計算に使用。
+
+        信用取引時の特殊対応:
+          - 信用口座の accinfo_query は total_assets が現金部分のみで、
+            株式時価 (market_val) が反映されないラグがある
+          - また cash 口座にも資産 (現物保有株) が存在する
+          - そのため両口座の total_assets を合算し、 信用口座のポジションの
+            時価を別途加算して、 真の純資産を算出する
         """
-        info = self._query_account_info()
-        return float(info.get("total_assets", 0) or 0)
+        assert self._trade_ctx is not None
+        total = 0.0
+        for acc_id in [self._cash_acc_id, self._margin_acc_id]:
+            if acc_id <= 0:
+                continue
+            try:
+                ret, data = self._trade_ctx.accinfo_query(
+                    trd_env=self._trd_env, currency="USD", acc_id=acc_id
+                )
+                if ret == RET_OK and not data.empty:
+                    row = data.iloc[0]
+                    total += float(row.get("total_assets", 0) or 0)
+            except Exception as exc:
+                logger.warning("acc_id=%s の accinfo_query 失敗: %s", acc_id, exc)
+        # 信用口座のポジションは total_assets に market_val が含まれない場合があるため
+        # position_list_query から保有株式のコスト基準額を加算して補正する
+        if self._margin_acc_id > 0:
+            try:
+                ret, pos_data = self._trade_ctx.position_list_query(
+                    trd_env=self._trd_env, acc_id=self._margin_acc_id
+                )
+                if ret == RET_OK and not pos_data.empty:
+                    for _, row in pos_data.iterrows():
+                        qty = float(row.get("qty", 0) or 0)
+                        cost = float(row.get("cost_price", 0) or 0)
+                        market_val = float(row.get("market_val", 0) or 0)
+                        # market_val が取得できればそれを、 だめなら qty * cost を使う
+                        if market_val > 0:
+                            total += market_val
+                        elif qty > 0 and cost > 0:
+                            total += qty * cost
+            except Exception as exc:
+                logger.warning("信用口座 position 取得失敗: %s", exc)
+        return total
 
     def _query_account_info(self) -> dict:
         """accinfo_query の結果を dict で返す."""
         assert self._trade_ctx is not None
-        ret, data = self._trade_ctx.accinfo_query(
-            trd_env=self._trd_env,
-            currency="USD",
-        )
+        kwargs = {"trd_env": self._trd_env, "currency": "USD"}
+        acc_id = self._get_active_acc_id()
+        if acc_id:
+            kwargs["acc_id"] = acc_id
+        ret, data = self._trade_ctx.accinfo_query(**kwargs)
         if ret != RET_OK or data.empty:
             logger.warning("口座残高取得失敗")
             return {}
@@ -571,24 +688,65 @@ class MoomooClient:
     def get_positions(self) -> dict[str, dict]:
         """ペーパー/本番口座の保有ポジションを取得する.
 
+        moomoo の position_list_query は以下のレコードも返す:
+          - 当日決済済みの建玉 (qty=0)
+          - 信用買いで複数回エントリーした際の個別建玉 (同銘柄で複数 position_id)
+        これらを単純に dict[symbol] に格納すると以下の問題が発生する:
+          - 最後の行が qty=0 だと「保有なし」と誤判定されて重複建てが起きる
+          - 同銘柄複数建玉時に最後の 1 件しか認識されない
+
+        対策:
+          - qty>0 のレコードのみ採用 (決済済みを除外)
+          - 同銘柄の複数 position_id は加重平均で集約
+
         Returns:
-            {symbol: {"qty": float, "cost_price": float, "market_val": float, "pl_val": float}}
+            {symbol: {"qty": float, "cost_price": float, "market_val": float, "pl_val": float, "position_id": str}}
         """
         assert self._trade_ctx is not None
-        ret, data = self._trade_ctx.position_list_query(trd_env=self._trd_env)
+        kwargs = {"trd_env": self._trd_env}
+        acc_id = self._get_active_acc_id()
+        if acc_id:
+            kwargs["acc_id"] = acc_id
+        ret, data = self._trade_ctx.position_list_query(**kwargs)
         if ret != RET_OK or data.empty:
             return {}
-        result: dict[str, dict] = {}
+        aggregates: dict[str, list[dict]] = {}
         for _, row in data.iterrows():
+            qty = float(row["qty"])
+            if qty <= 0:
+                continue
             code = str(row["code"])  # "US.NVDA"
             symbol = code.replace("US.", "")
-            result[symbol] = {
-                "qty": float(row["qty"]),
+            aggregates.setdefault(symbol, []).append({
+                "qty": qty,
                 "cost_price": float(row["cost_price"]),
                 "market_val": float(row.get("market_val", 0)),
                 "pl_val": float(row.get("pl_val", 0)),
                 "position_id": str(row.get("position_id", "")),
+            })
+        result: dict[str, dict] = {}
+        for symbol, pos_list in aggregates.items():
+            total_qty = sum(p["qty"] for p in pos_list)
+            # 加重平均コスト価格
+            weighted_cost = sum(p["qty"] * p["cost_price"] for p in pos_list)
+            avg_cost = weighted_cost / total_qty if total_qty > 0 else 0.0
+            total_market_val = sum(p["market_val"] for p in pos_list)
+            total_pl = sum(p["pl_val"] for p in pos_list)
+            # position_id は qty 最大のものを代表として使用
+            primary = max(pos_list, key=lambda p: p["qty"])
+            result[symbol] = {
+                "qty": total_qty,
+                "cost_price": avg_cost,
+                "market_val": total_market_val,
+                "pl_val": total_pl,
+                "position_id": primary["position_id"],
+                "position_count": len(pos_list),
             }
+            if len(pos_list) > 1:
+                logger.info(
+                    "[%s] 複数建玉を集約: %d件 → total_qty=%.0f avg_cost=$%.2f",
+                    symbol, len(pos_list), total_qty, avg_cost,
+                )
         return result
 
     def has_position(self, symbol: str) -> bool:
@@ -599,9 +757,11 @@ class MoomooClient:
     def get_order_status(self, order_id: str) -> str:
         """指定 order_id の注文ステータスを取得する."""
         assert self._trade_ctx is not None
-        ret, data = self._trade_ctx.order_list_query(
-            order_id=order_id, trd_env=self._trd_env,
-        )
+        kwargs = {"order_id": order_id, "trd_env": self._trd_env}
+        acc_id = self._get_active_acc_id()
+        if acc_id:
+            kwargs["acc_id"] = acc_id
+        ret, data = self._trade_ctx.order_list_query(**kwargs)
         if ret != RET_OK or data.empty:
             return "UNKNOWN"
         return str(data.iloc[0].get("order_status", "UNKNOWN"))
@@ -613,13 +773,20 @@ class MoomooClient:
     def get_margin_balance(self) -> dict[str, float]:
         """信用口座の残高・空売り余力を返す.
 
+        信用口座が開設されていれば MARGIN acc_id で問い合わせる。
+        未開設なら CASH acc_id (現物口座) の値を返す。
+
         Returns:
             {"power": float, "max_power_short": float, "cash": float, ...}
         """
         assert self._trade_ctx is not None
-        ret, data = self._trade_ctx.accinfo_query(
-            trd_env=self._trd_env, currency="USD",
-        )
+        kwargs = {"trd_env": self._trd_env, "currency": "USD"}
+        # 信用残高は必ず MARGIN acc_id (あれば) を使う
+        if self._margin_acc_id > 0:
+            kwargs["acc_id"] = self._margin_acc_id
+        elif self._cash_acc_id > 0:
+            kwargs["acc_id"] = self._cash_acc_id
+        ret, data = self._trade_ctx.accinfo_query(**kwargs)
         if ret != RET_OK or data.empty:
             logger.warning("信用口座残高取得失敗")
             return {"power": 0.0, "max_power_short": 0.0, "cash": 0.0}
@@ -645,12 +812,16 @@ class MoomooClient:
         assert self._trade_ctx is not None
         code = f"US.{symbol}"
         try:
-            ret, data = self._trade_ctx.acctradinginfo_query(
-                order_type=OrderType.MARKET,
-                code=code,
-                price=price,
-                trd_env=self._trd_env,
-            )
+            kwargs = {
+                "order_type": OrderType.MARKET,
+                "code": code,
+                "price": price,
+                "trd_env": self._trd_env,
+            }
+            # 空売り情報は MARGIN acc_id (あれば) で
+            if self._margin_acc_id > 0:
+                kwargs["acc_id"] = self._margin_acc_id
+            ret, data = self._trade_ctx.acctradinginfo_query(**kwargs)
             if ret != RET_OK or data.empty:
                 logger.debug("空売り可能株数取得失敗: %s", symbol)
                 return 0
@@ -692,6 +863,10 @@ class MoomooClient:
             order_type=order_type,
             trd_env=self._trd_env,
         )
+        # 信用買い (USE_MARGIN_LONG=true) なら MARGIN acc_id、 そうでなければ CASH acc_id
+        active_acc_id = self._get_active_acc_id()
+        if active_acc_id:
+            base_kwargs["acc_id"] = active_acc_id
 
         if order.side == "BUY":
             # BUY は設定の口座区分で1回だけ
@@ -725,13 +900,17 @@ class MoomooClient:
     def cancel_order(self, order_id: str) -> bool:
         """注文をキャンセルする."""
         assert self._trade_ctx is not None
-        ret, data = self._trade_ctx.modify_order(
-            modify_order_op=ModifyOrderOp.CANCEL,
-            order_id=order_id,
-            qty=0,
-            price=0,
-            trd_env=self._trd_env,
-        )
+        kwargs = {
+            "modify_order_op": ModifyOrderOp.CANCEL,
+            "order_id": order_id,
+            "qty": 0,
+            "price": 0,
+            "trd_env": self._trd_env,
+        }
+        acc_id = self._get_active_acc_id()
+        if acc_id:
+            kwargs["acc_id"] = acc_id
+        ret, data = self._trade_ctx.modify_order(**kwargs)
         if ret != RET_OK:
             logger.warning("キャンセル失敗: order_id=%s — %s", order_id, data)
             return False

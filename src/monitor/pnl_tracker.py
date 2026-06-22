@@ -37,8 +37,10 @@ class TradeRecord:
     atr_pct: float | None = None
     vwap_above: bool | None = None
     vwap_price: float | None = None
-    spy_rt: float | None = None
-    qqq_rt: float | None = None
+    spy_rt: float | None = None              # SPY 前日終値比 (主指標、 6/11〜)
+    qqq_rt: float | None = None              # QQQ 前日終値比 (主指標、 6/11〜)
+    spy_rt_open: float | None = None         # SPY 当日始値比 (補助、 過去 cohort 整合、 〜6/10 の spy_rt と同基準)
+    qqq_rt_open: float | None = None         # QQQ 当日始値比 (補助)
     mfe: float = 0.0
     mae: float = 0.0
     sentiment_score: float | None = None
@@ -63,6 +65,10 @@ class TradeRecord:
     amplitude: float | None = None              # 当日値幅率 (%)
     pre_change_rate: float | None = None        # プレマーケット変化率 (%)
     volume_ratio: float | None = None           # 普段との出来高比
+    # 方向情報 (6/17 Idea B 追加、 1-2 ヶ月蓄積後にフィルタ化判定)
+    direction_5min_pct: float | None = None     # 直近 10 サンプル (≒ 5 分) 前との変化率 (%)
+    direction_15min_pct: float | None = None    # 直近 30 サンプル (≒ 15 分) 前との変化率 (%)
+    direction_velocity: float | None = None     # 直近 5 サンプルの平均変化速度 (%/サンプル)
 
 
 class PnLTracker:
@@ -84,6 +90,8 @@ class PnLTracker:
         "change_from_open_pct", "gap_pct", "price_position_in_range",
         "amplitude", "pre_change_rate", "volume_ratio",
         "is_momentum",
+        "spy_rt_open", "qqq_rt_open",  # 補助: 当日始値基準 (過去 cohort 整合用、 6/11追加)
+        "direction_5min_pct", "direction_15min_pct", "direction_velocity",  # 方向情報 (6/17追加)
     ]
 
     def __init__(self, csv_dir: Path | str | None = None) -> None:
@@ -111,6 +119,8 @@ class PnLTracker:
         vwap_price: float | None = None,
         spy_rt: float | None = None,
         qqq_rt: float | None = None,
+        spy_rt_open: float | None = None,
+        qqq_rt_open: float | None = None,
         sentiment_score: float | None = None,
         sentiment_confidence: float | None = None,
         flow_strength: float | None = None,
@@ -131,6 +141,9 @@ class PnLTracker:
         pre_change_rate: float | None = None,
         volume_ratio: float | None = None,
         is_momentum: bool | None = None,
+        direction_5min_pct: float | None = None,
+        direction_15min_pct: float | None = None,
+        direction_velocity: float | None = None,
     ) -> None:
         """新規トレードを記録する（重複登録は無視）."""
         if order_id in self._open_trades:
@@ -151,6 +164,8 @@ class PnLTracker:
             vwap_price=vwap_price,
             spy_rt=spy_rt,
             qqq_rt=qqq_rt,
+            spy_rt_open=spy_rt_open,
+            qqq_rt_open=qqq_rt_open,
             sentiment_score=sentiment_score,
             sentiment_confidence=sentiment_confidence,
             flow_strength=flow_strength,
@@ -171,6 +186,9 @@ class PnLTracker:
             pre_change_rate=pre_change_rate,
             volume_ratio=volume_ratio,
             is_momentum=is_momentum,
+            direction_5min_pct=direction_5min_pct,
+            direction_15min_pct=direction_15min_pct,
+            direction_velocity=direction_velocity,
         )
         logger.info(
             "トレード記録: %s %s %s %d株 @ %.2f",
@@ -267,7 +285,20 @@ class PnLTracker:
     # ------------------------------------------------------------------
 
     def update_peak_balance(self, current_balance: float) -> None:
-        """ピーク残高を更新する."""
+        """ピーク残高を更新する.
+
+        信用買い直後の一時的な計算ノイズ (株式時価の二重加算ラグ等) で
+        total_assets が急上昇するケースを抑制するため、 1 スキャン間隔で
+        5% 超の急上昇は peak に反映しない。 急下落は記録する (DD 検出のため)。
+        """
+        if self._peak_balance > 0:
+            change_pct = (current_balance - self._peak_balance) / self._peak_balance
+            if change_pct > 0.05:
+                logger.warning(
+                    "peak balance の急上昇を抑制: %.1f%% (%.2f → %.2f)。 信用買い直後の計算ノイズと判定",
+                    change_pct * 100, self._peak_balance, current_balance,
+                )
+                return
         if current_balance > self._peak_balance:
             self._peak_balance = current_balance
 
@@ -448,6 +479,11 @@ class PnLTracker:
                     f"{t.pre_change_rate:.3f}" if t.pre_change_rate is not None else "",
                     f"{t.volume_ratio:.3f}" if t.volume_ratio is not None else "",
                     t.is_momentum if t.is_momentum is not None else "",
+                    f"{t.spy_rt_open:.4f}" if t.spy_rt_open is not None else "",
+                    f"{t.qqq_rt_open:.4f}" if t.qqq_rt_open is not None else "",
+                    f"{t.direction_5min_pct:.3f}" if t.direction_5min_pct is not None else "",
+                    f"{t.direction_15min_pct:.3f}" if t.direction_15min_pct is not None else "",
+                    f"{t.direction_velocity:.4f}" if t.direction_velocity is not None else "",
                 ])
 
         logger.info("CSVに保存: %s (%d件)", filepath, len(self._closed_trades))

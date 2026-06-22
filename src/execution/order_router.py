@@ -81,6 +81,10 @@ class OrderRouter:
         self._circuit_breaker = circuit_breaker
         self._positions: dict[str, Position] = {}
         self._on_exit = on_exit
+        # 同銘柄の enter() 多重実行を防ぐためのロックセット
+        # 発注処理進行中 (SUBMITTED〜約定確認完了まで) は symbol を保持し、
+        # その間の同銘柄 enter() は即 skip する
+        self._in_flight_symbols: set[str] = set()
         logger.info(
             "OrderRouter initialized (env=%s, long_max=%d, short_max=%d)",
             settings.TRADE_ENV, settings.LONG_MAX_POSITIONS, settings.SHORT_MAX_POSITIONS,
@@ -158,6 +162,16 @@ class OrderRouter:
         if not signal.go or size <= 0:
             return None
 
+        # 同銘柄の発注処理進行中なら即 skip (race condition 対策)
+        # moomoo の position_list_query は約定後しばらく qty=0 のラグがあり、
+        # has_position() だけでは未約定発注を捕捉できないため
+        if symbol in self._in_flight_symbols:
+            logger.warning(
+                "[%s] 発注処理進行中 — duplicate entry blocked (in-flight)",
+                symbol,
+            )
+            return None
+
         if signal.direction == "LONG":
             if self.long_count >= settings.LONG_MAX_POSITIONS:
                 logger.info(
@@ -177,6 +191,22 @@ class OrderRouter:
             if pos.symbol == symbol:
                 logger.info("[%s] Duplicate entry blocked (internal dict)", symbol)
                 return None
+
+        self._in_flight_symbols.add(symbol)
+        try:
+            return await self._enter_inner(signal, symbol, size, price, levels)
+        finally:
+            self._in_flight_symbols.discard(symbol)
+
+    async def _enter_inner(
+        self,
+        signal: EntryDecision,
+        symbol: str,
+        size: int,
+        price: float,
+        levels: Levels | None,
+    ) -> OrderResult | None:
+        """enter() の内部処理 — in-flight ロック内で実行."""
 
         # --- DRYRUN モード: 実発注せず仮想ポジション登録 ---
         if not settings.ENABLE_REAL_TRADING:
@@ -246,10 +276,43 @@ class OrderRouter:
         filled = await self._wait_for_fill(symbol, size, order_id=result.order_id)
 
         if filled is None:
-            # タイムアウト: 未約定 → キャンセルしてポジション作成しない
+            # タイムアウト時、 まず最終 order_status を確認する。
+            # moomoo の position_list_query は約定後でも数秒〜数十秒 qty=0 のラグがあるため、
+            # FILLED_ALL/FILLED_PART でも _wait_for_fill がタイムアウトすることがある。
+            # その場合に cancel_order を呼ぶと「約定済みのため無効」となるが、
+            # bot 内部は「キャンセル扱い」 で _positions に登録されないので、
+            # 次のスキャンで同銘柄に再発注され重複建てが発生する。
+            # 約定済みなら必ず _positions に登録してスロットを消費させる。
+            final_status = "?"
+            try:
+                final_status = self._client.get_order_status(result.order_id)
+            except Exception:
+                logger.exception("[%s] 最終ステータス取得失敗", symbol)
+            if "FILLED" in final_status:
+                logger.warning(
+                    "[%s] 約定確認タイムアウトしたが order_status=%s — position_list ラグと判断しポジション登録 (order_id=%s)",
+                    symbol, final_status, result.order_id,
+                )
+                order_id = result.order_id
+                self._positions[order_id] = Position(
+                    order_id=order_id, symbol=symbol,
+                    direction=signal.direction, size=size,
+                    entry_price=price, levels=levels,
+                )
+                logger.info(
+                    "ENTRY COMPLETE (lag): %s %s %d shares @ $%.2f id=%s (SL=$%.2f TP=$%.2f)",
+                    signal.direction, symbol, size, price, order_id,
+                    levels.stop_loss if levels else 0,
+                    levels.take_profit if levels else 0,
+                )
+                return OrderResult(
+                    order_id=order_id, status="FILLED",
+                    filled_price=price, filled_quantity=size,
+                )
+            # 真に未約定 → キャンセル
             logger.warning(
-                "[%s] 約定確認タイムアウト (%.0fs) — 注文キャンセル order_id=%s",
-                symbol, FILL_CHECK_MAX_WAIT, result.order_id,
+                "[%s] 約定確認タイムアウト (%.0fs) order_status=%s — 注文キャンセル order_id=%s",
+                symbol, FILL_CHECK_MAX_WAIT, final_status, result.order_id,
             )
             self._client.cancel_order(result.order_id)
             return OrderResult(order_id=result.order_id, status="CANCELLED")
