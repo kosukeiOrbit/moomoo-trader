@@ -158,7 +158,10 @@ def _handle_shutdown(signum: int, frame: object) -> None:
 # SHORT ドライラン
 # ---------------------------------------------------------------------------
 
-_dryrun_entered: dict[str, str] = {}
+# dryrun jsonl への記録済みフラグ (同銘柄を 1 日 1 回だけ jsonl に追記する重複防止)
+_short_dryrun_recorded: dict[str, str] = {}
+# 実エントリー試行済みフラグ (1 日 1 銘柄 1 回限定で実発注を抑制)
+_short_entered_real: dict[str, str] = {}
 _DRYRUN_PATH = Path(_project_root) / "data" / "short_dryrun.jsonl"
 
 
@@ -225,8 +228,17 @@ async def _short_dryrun(
     """
     try:
         today = date.today().isoformat()
-        if _dryrun_entered.get(symbol) == today:
+        already_real = _short_entered_real.get(symbol) == today
+        already_recorded = _short_dryrun_recorded.get(symbol) == today
+
+        # 実エントリー試行済みなら完全スキップ (1 日 1 銘柄 1 回限定)
+        if already_real:
             return
+        # dryrun 専用モードで既に記録済みなら完全スキップ (jsonl 重複防止)
+        if already_recorded and (not settings.ENABLE_SHORT or settings.SHORT_DRY_RUN):
+            return
+        # 残りのケース: 初回 SELL flow、 もしくは ENABLE_SHORT=true + SHORT_DRY_RUN=false で
+        # まだ実エントリーされていない銘柄 → 案C 再評価のため処理続行 (dryrun jsonl 重複は後段で抑制)
 
         # テキスト収集（条件A/B 共通で使用）
         posts = await board_scraper.fetch_posts(symbol)
@@ -353,7 +365,6 @@ async def _short_dryrun(
 
         # 方向情報 (6/17 Idea B: _price_history deque から計算)
         _d5_short, _d15_short, _vel_short = _calc_direction_from_history(symbol)
-        _dryrun_entered[symbol] = today
         record = {
             "date": today,
             "symbol": symbol,
@@ -409,18 +420,28 @@ async def _short_dryrun(
             "exit_reason": None,
             "virtual_pnl": None,
         }
-        _DRYRUN_PATH.parent.mkdir(exist_ok=True)
-        with open(_DRYRUN_PATH, "a", encoding="utf-8") as f:
-            f.write(_json.dumps(record) + "\n")
+        # dryrun jsonl 記録は同日 1 回限定 (フラグ already_recorded で重複防止)
+        if not already_recorded:
+            _DRYRUN_PATH.parent.mkdir(exist_ok=True)
+            with open(_DRYRUN_PATH, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(record) + "\n")
+            _short_dryrun_recorded[symbol] = today
 
-        spy_str = f" spy_rt={spy_rt*100:.2f}%" if spy_rt is not None else ""
-        logger.info(
-            "[DRY-RUN SHORT/%s] %s entry=%.2f SL=%.2f TP=%.2f "
-            "score=%.3f conf=%.3f flow=%.3f%s final7=%s",
-            pattern, symbol, entry_price, sl_price, tp_price,
-            score, confidence, flow_strength, spy_str,
-            "PASS" if final7_pass else f"FAIL({final7_reason})",
-        )
+            spy_str = f" spy_rt={spy_rt*100:.2f}%" if spy_rt is not None else ""
+            logger.info(
+                "[DRY-RUN SHORT/%s] %s entry=%.2f SL=%.2f TP=%.2f "
+                "score=%.3f conf=%.3f flow=%.3f%s final7=%s",
+                pattern, symbol, entry_price, sl_price, tp_price,
+                score, confidence, flow_strength, spy_str,
+                "PASS" if final7_pass else f"FAIL({final7_reason})",
+            )
+        else:
+            # 2 回目以降の SELL flow: jsonl 記録はスキップ、 final7 再評価のみ実施
+            logger.info(
+                "[SHORT 再評価] %s entry=%.2f flow=%.3f final7=%s (jsonl は初回記録のみ)",
+                symbol, entry_price, flow_strength,
+                "PASS" if final7_pass else f"FAIL({final7_reason})",
+            )
 
         # === 実エントリー (ENABLE_SHORT=true かつ SHORT_DRY_RUN=false かつ FINAL-7 通過時) ===
         # SHORT_DRY_RUN=true なら dryrun jsonl 記録のみで実発注しない (safety switch)
@@ -505,6 +526,8 @@ async def _short_dryrun(
                                 direction_15min_pct=_d15_r,
                                 direction_velocity=_vel_r,
                             )
+                            # 実エントリー成功フラグをセット (同日内で再評価ループを抑止)
+                            _short_entered_real[symbol] = today
                             logger.info(
                                 "[%s] SHORT 実エントリー成功: %d shares @ $%.2f order_id=%s",
                                 symbol, size, actual_price, result.order_id,
