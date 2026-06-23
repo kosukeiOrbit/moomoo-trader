@@ -1274,8 +1274,8 @@ async def main_loop() -> None:
 
             # --- ET 15:50 強制決済 ---
             if should_force_exit():
-                # SHORT ドライランの仮想決済を先に記録
-                if settings.SHORT_DRY_RUN:
+                # SHORT dryrun jsonl の仮想決済 (本番運用中でも final7 BLOCK レコード等は dryrun 記録のみなので必須)
+                if settings.ENABLE_SHORT:
                     await _short_dryrun_close(client)
 
             if should_force_exit() and order_router.position_count > 0:
@@ -1373,7 +1373,7 @@ async def main_loop() -> None:
                     # サーキット発動時に走らないと、 jsonl の close_price=None レコードが
                     # 翌営業日まで持ち越され、 IF 分析データが欠落する。
                     try:
-                        if settings.SHORT_DRY_RUN:
+                        if settings.ENABLE_SHORT:
                             await _short_dryrun_close(client)
                         if settings.LONG_SKIP_DRY_RUN:
                             await _long_dryrun_close(client, pnl_tracker, dryrun_type="skip")

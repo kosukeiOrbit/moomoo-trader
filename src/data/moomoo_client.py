@@ -116,10 +116,17 @@ class QuoteSnapshot:
 
 @dataclass
 class Order:
-    """発注情報."""
+    """発注情報.
+
+    side の意味:
+      - "BUY":         現物買い / 信用買い (acc_id で口座区分)
+      - "SELL":        既存保有ポジションの売却 (LONG クローズ)
+      - "SELL_SHORT":  信用空売り (新規 SHORT エントリー) — jp_acc_type=JP_TOKUTEI_SHORT
+      - "BUY_BACK":    信用空売りの買い戻し (SHORT クローズ) — jp_acc_type=JP_TOKUTEI_SHORT
+    """
 
     symbol: str
-    side: str  # "BUY" or "SELL"
+    side: str  # "BUY" / "SELL" / "SELL_SHORT" / "BUY_BACK"
     quantity: int
     price: float | None = None  # None = 成行
 
@@ -717,22 +724,35 @@ class MoomooClient:
                 continue
             code = str(row["code"])  # "US.NVDA"
             symbol = code.replace("US.", "")
+            # position_side: "LONG" / "SHORT" の文字列 (PositionSide enum)
+            # 信用空売り建玉は position_side="SHORT" で qty も正の値で返る
+            position_side = str(row.get("position_side", "LONG"))
+            if position_side not in ("LONG", "SHORT"):
+                position_side = "LONG"  # 不明値はフォールバック
             aggregates.setdefault(symbol, []).append({
                 "qty": qty,
                 "cost_price": float(row["cost_price"]),
                 "market_val": float(row.get("market_val", 0)),
                 "pl_val": float(row.get("pl_val", 0)),
                 "position_id": str(row.get("position_id", "")),
+                "position_side": position_side,
             })
         result: dict[str, dict] = {}
         for symbol, pos_list in aggregates.items():
+            # 同銘柄で LONG と SHORT は同時保有不可なので、 通常はすべて同 side
+            # 念のため side ごとに集計 (異なる場合は警告ログ)
+            sides = {p["position_side"] for p in pos_list}
+            if len(sides) > 1:
+                logger.warning(
+                    "[%s] 同銘柄で LONG/SHORT 両建玉を検出 (理論上ありえない): %s",
+                    symbol, sides,
+                )
+            direction = pos_list[0]["position_side"]  # 代表値
             total_qty = sum(p["qty"] for p in pos_list)
-            # 加重平均コスト価格
             weighted_cost = sum(p["qty"] * p["cost_price"] for p in pos_list)
             avg_cost = weighted_cost / total_qty if total_qty > 0 else 0.0
             total_market_val = sum(p["market_val"] for p in pos_list)
             total_pl = sum(p["pl_val"] for p in pos_list)
-            # position_id は qty 最大のものを代表として使用
             primary = max(pos_list, key=lambda p: p["qty"])
             result[symbol] = {
                 "qty": total_qty,
@@ -741,11 +761,12 @@ class MoomooClient:
                 "pl_val": total_pl,
                 "position_id": primary["position_id"],
                 "position_count": len(pos_list),
+                "direction": direction,  # "LONG" or "SHORT"
             }
             if len(pos_list) > 1:
                 logger.info(
-                    "[%s] 複数建玉を集約: %d件 → total_qty=%.0f avg_cost=$%.2f",
-                    symbol, len(pos_list), total_qty, avg_cost,
+                    "[%s] 複数建玉を集約: %d件 (direction=%s) → total_qty=%.0f avg_cost=$%.2f",
+                    symbol, len(pos_list), direction, total_qty, avg_cost,
                 )
         return result
 
@@ -845,13 +866,25 @@ class MoomooClient:
     def place_order(self, order: Order) -> OrderResult:
         """注文を発注する.
 
-        BUY: 設定の口座区分 (JP_TOKUTEI) で発注
-        SELL: JP_TOKUTEI → 省略(デフォルト) → JP_GENERAL の順でリトライ
-              （特定口座・一般口座どちらのポジションも売れるようにする）
+        side 別の処理:
+          - BUY        : 現物/信用買い、 _get_jp_acc_type() で 1 回発注
+          - SELL       : LONG クローズ、 JP_TOKUTEI → DEFAULT → JP_GENERAL リトライ
+          - SELL_SHORT : 信用空売り (新規 SHORT)、 JP_TOKUTEI_SHORT → JP_GENERAL_SHORT リトライ
+                         (trd_side=SELL + 信用売り口座 jp_acc_type)
+          - BUY_BACK   : 信用空売りの買い戻し、 JP_TOKUTEI_SHORT → JP_GENERAL_SHORT リトライ
+                         (trd_side=BUY + 信用売り口座 jp_acc_type)
         """
         assert self._trade_ctx is not None
         code = f"US.{order.symbol}"
-        side = TrdSide.BUY if order.side == "BUY" else TrdSide.SELL
+        # 概念上の side → moomoo の trd_side マッピング
+        # (SELL_SHORT 発注は trd_side=SELL、 BUY_BACK は trd_side=BUY、 jp_acc_type で信用売り口座を指定)
+        if order.side in ("BUY", "BUY_BACK"):
+            side = TrdSide.BUY
+        elif order.side in ("SELL", "SELL_SHORT"):
+            side = TrdSide.SELL
+        else:
+            logger.error("place_order: 未知の side=%s (order=%s)", order.side, order)
+            return OrderResult(order_id="", status="FAILED")
         order_type = OrderType.MARKET if order.price is None else OrderType.NORMAL
         price = order.price or 0.0
 
@@ -863,21 +896,56 @@ class MoomooClient:
             order_type=order_type,
             trd_env=self._trd_env,
         )
-        # 信用買い (USE_MARGIN_LONG=true) なら MARGIN acc_id、 そうでなければ CASH acc_id
-        active_acc_id = self._get_active_acc_id()
-        if active_acc_id:
-            base_kwargs["acc_id"] = active_acc_id
+        # SHORT (SELL_SHORT/BUY_BACK) は必ず MARGIN acc_id を使う (信用口座必須)
+        # LONG (BUY/SELL) は USE_MARGIN_LONG 設定に従う
+        if order.side in ("SELL_SHORT", "BUY_BACK"):
+            if self._margin_acc_id == 0:
+                logger.error(
+                    "[%s] SHORT 発注不可: MARGIN 口座 acc_id が取得できていない (side=%s)",
+                    order.symbol, order.side,
+                )
+                return OrderResult(order_id="", status="FAILED")
+            base_kwargs["acc_id"] = self._margin_acc_id
+        else:
+            active_acc_id = self._get_active_acc_id()
+            if active_acc_id:
+                base_kwargs["acc_id"] = active_acc_id
 
         if order.side == "BUY":
-            # BUY は設定の口座区分で1回だけ
+            # 現物/信用買い: 設定の口座区分で 1 回
             attempts = [("BUY", {**base_kwargs, "jp_acc_type": self._get_jp_acc_type()})]
-        else:
-            # SELL はリトライ: 特定口座 → 省略(デフォルト) → 一般口座
+        elif order.side == "SELL":
+            # LONG クローズ: 特定口座 → 省略 → 一般口座 リトライ
             attempts = [
                 ("SELL/TOKUTEI", {**base_kwargs, "jp_acc_type": SubAccType.JP_TOKUTEI}),
-                ("SELL/DEFAULT", {**base_kwargs}),  # jp_acc_type 省略
+                ("SELL/DEFAULT", {**base_kwargs}),
                 ("SELL/GENERAL", {**base_kwargs, "jp_acc_type": SubAccType.JP_GENERAL}),
             ]
+        elif order.side == "SELL_SHORT":
+            # 信用空売り (新規 SHORT): 特定信用 → 一般信用 リトライ
+            attempts = [
+                ("SELL_SHORT/TOKUTEI_SHORT",
+                 {**base_kwargs, "jp_acc_type": SubAccType.JP_TOKUTEI_SHORT}),
+                ("SELL_SHORT/GENERAL_SHORT",
+                 {**base_kwargs, "jp_acc_type": SubAccType.JP_GENERAL_SHORT}),
+            ]
+        else:  # BUY_BACK
+            # 買い戻し (SHORT クローズ): 特定信用 → 一般信用 リトライ
+            attempts = [
+                ("BUY_BACK/TOKUTEI_SHORT",
+                 {**base_kwargs, "jp_acc_type": SubAccType.JP_TOKUTEI_SHORT}),
+                ("BUY_BACK/GENERAL_SHORT",
+                 {**base_kwargs, "jp_acc_type": SubAccType.JP_GENERAL_SHORT}),
+            ]
+
+        # SHORT 系は発注前にデバッグログを出す (原因特定用)
+        if order.side in ("SELL_SHORT", "BUY_BACK"):
+            logger.info(
+                "[%s] SHORT 系発注準備: side=%s trd_side=%s acc_id=%d qty=%d price=%s order_type=%s candidates=%s",
+                order.symbol, order.side, side, base_kwargs.get("acc_id", 0),
+                order.quantity, price if price > 0 else "MARKET", order_type,
+                [a[0] for a in attempts],
+            )
 
         for label, kwargs in attempts:
             ret, data = self._trade_ctx.place_order(**kwargs)
@@ -891,7 +959,15 @@ class MoomooClient:
                 logger.info("[%s] %s: Insufficient positions — next acc_type", order.symbol, label)
                 continue
 
-            logger.error("発注失敗: %s (%s) — %s", order, label, data)
+            # SHORT 系で失敗したらエラー詳細をすべて記録 (空売り不可・借株不足の原因特定用)
+            if order.side in ("SELL_SHORT", "BUY_BACK"):
+                logger.error(
+                    "[%s] SHORT 発注失敗: side=%s label=%s ret=%s data=%s kwargs=%s",
+                    order.symbol, order.side, label, ret, data,
+                    {k: v for k, v in kwargs.items() if k != "trd_env"},
+                )
+            else:
+                logger.error("発注失敗: %s (%s) — %s", order, label, data)
             return OrderResult(order_id="", status="FAILED")
 
         logger.error("発注失敗: %s — 全口座区分で失敗", order)

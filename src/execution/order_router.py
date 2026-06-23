@@ -111,17 +111,19 @@ class OrderRouter:
             if order_id in self._positions:
                 continue
             cost_price = info["cost_price"]
+            # get_positions() が direction ("LONG"/"SHORT") を返す。 SHORT 建玉も復元する
+            direction = info.get("direction", "LONG")
             self._positions[order_id] = Position(
                 order_id=order_id,
                 symbol=symbol,
-                direction="LONG",
+                direction=direction,
                 size=qty,
                 entry_price=cost_price,
                 levels=None,
             )
             logger.info(
-                "[RECOVERED] %s %d shares @ $%.2f (id=%s)",
-                symbol, qty, cost_price, order_id,
+                "[RECOVERED] %s %s %d shares @ $%.2f (id=%s)",
+                symbol, direction, qty, cost_price, order_id,
             )
             count += 1
         if count == 0:
@@ -237,19 +239,38 @@ class OrderRouter:
             logger.exception("[%s] has_position() で例外", symbol)
         logger.debug("[%s] has_position() チェック完了 (%.2fs)", symbol, time.monotonic() - t0)
 
-        side = "BUY" if signal.direction == "LONG" else "SELL"
-        # 保護指値: BUY なら last × (1 + pct)、 SELL なら × (1 - pct)
-        # pct=0 で従来の成行、 pct=0.05 で +5%/-5% 指値 (実質成行 + 上限/下限保護)
+        # エントリー時の side: LONG→BUY (現物/信用買い)、 SHORT→SELL_SHORT (信用空売り、 JP_TOKUTEI_SHORT)
+        side = "BUY" if signal.direction == "LONG" else "SELL_SHORT"
+
+        # SHORT エントリー前に max_sell_short qty をチェック (借株不足で発注失敗を未然回避)
+        if signal.direction == "SHORT":
+            try:
+                max_short = self._client.get_max_sell_short_qty(symbol)
+                if max_short < size:
+                    logger.warning(
+                        "[%s] SHORT 発注スキップ: max_sell_short=%d < 要求 qty=%d (借株不足)",
+                        symbol, max_short, size,
+                    )
+                    return OrderResult(order_id="", status="FAILED")
+                logger.info("[%s] SHORT 借株 OK: max_sell_short=%d >= qty=%d", symbol, max_short, size)
+            except Exception:
+                # max_sell_short 取得失敗時は発注は試行する (moomoo 側で最終判定)
+                logger.exception("[%s] max_sell_short 取得失敗 — 発注は試行", symbol)
+
+        # 保護指値: 買い系 (BUY/BUY_BACK) は last × (1 + pct)、 売り系 (SELL_SHORT) は × (1 - pct)
+        # pct=0 で従来の成行、 pct=0.02 で +2%/-2% 指値 (実質成行 + 上限/下限保護)
         protective_pct = settings.ORDER_PROTECTIVE_LIMIT_PCT
+        is_buy_side = side in ("BUY", "BUY_BACK")
         if protective_pct > 0 and price > 0:
             limit_price = (
                 round(price * (1 + protective_pct), 2)
-                if side == "BUY"
+                if is_buy_side
                 else round(price * (1 - protective_pct), 2)
             )
             logger.info(
-                "[%s] place_order() 呼び出し: side=%s qty=%d limit=$%.2f (last=$%.2f, +%.0f%% 保護)",
-                symbol, side, size, limit_price, price, protective_pct * 100,
+                "[%s] place_order() 呼び出し: side=%s qty=%d limit=$%.2f (last=$%.2f, %s%.0f%% 保護)",
+                symbol, side, size, limit_price, price,
+                "+" if is_buy_side else "-", protective_pct * 100,
             )
             order_obj = Order(symbol=symbol, side=side, quantity=size, price=limit_price)
         else:
@@ -416,8 +437,12 @@ class OrderRouter:
                     logger.exception("on_exit callback error")
             return exit_result
 
-        side = "SELL" if position.direction == "LONG" else "BUY"
-        logger.info("[%s] place_order() 呼び出し: side=%s qty=%d", position.symbol, side, position.size)
+        # クローズ時の side: LONG ポジションは SELL (現物売却)、 SHORT ポジションは BUY_BACK (信用買い戻し)
+        side = "SELL" if position.direction == "LONG" else "BUY_BACK"
+        logger.info(
+            "[%s] EXIT place_order() 呼び出し: side=%s direction=%s qty=%d",
+            position.symbol, side, position.direction, position.size,
+        )
         t0 = time.monotonic()
         result = self._client.place_order(
             Order(symbol=position.symbol, side=side, quantity=position.size),
@@ -429,7 +454,10 @@ class OrderRouter:
         )
 
         if result.status == "FAILED":
-            logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
+            logger.error(
+                "[%s] EXIT order failed: id=%s direction=%s side=%s",
+                position.symbol, order_id, position.direction, side,
+            )
             return None
 
         # 決済確認: asyncio.sleep で待機（イベントループをブロックしない）
@@ -554,7 +582,12 @@ class OrderRouter:
                     logger.exception("on_exit callback error")
             return exit_result
 
-        side = "SELL" if position.direction == "LONG" else "BUY"
+        # 同期版 EXIT (強制決済) — LONG→SELL、 SHORT→BUY_BACK
+        side = "SELL" if position.direction == "LONG" else "BUY_BACK"
+        logger.info(
+            "[%s] EXIT_SYNC place_order() 呼び出し: side=%s direction=%s qty=%d",
+            position.symbol, side, position.direction, position.size,
+        )
         t0 = time.monotonic()
         result = self._client.place_order(
             Order(symbol=position.symbol, side=side, quantity=position.size),
@@ -566,7 +599,10 @@ class OrderRouter:
         )
 
         if result.status == "FAILED":
-            logger.error("[%s] EXIT order failed: id=%s", position.symbol, order_id)
+            logger.error(
+                "[%s] EXIT_SYNC order failed: id=%s direction=%s side=%s",
+                position.symbol, order_id, position.direction, side,
+            )
             return None
 
         # 同期で決済確認
