@@ -174,7 +174,15 @@ class SentimentAnalyzer:
                 reasoning=reasoning,
             )
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-            logger.error("Response parse error: %s", e)
+            # raw response を残して原因特定 (NVDA で頻発する parse failure の解析用)
+            raw_preview = "<取得失敗>"
+            try:
+                raw_text = response.content[0].text
+                # repr で改行を可視化、 先頭 200 文字でログ肥大化抑制
+                raw_preview = repr(raw_text[:200])
+            except Exception:
+                pass
+            logger.error("Response parse error: %s | raw[:200]=%s", e, raw_preview)
             return SentimentResult(
                 score=0.0, confidence=0.0, reasoning=f"Parse error: {e}",
             )
