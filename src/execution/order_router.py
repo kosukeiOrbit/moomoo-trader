@@ -242,20 +242,21 @@ class OrderRouter:
         # エントリー時の side: LONG→BUY (現物/信用買い)、 SHORT→SELL_SHORT (信用空売り、 JP_TOKUTEI_SHORT)
         side = "BUY" if signal.direction == "LONG" else "SELL_SHORT"
 
-        # SHORT エントリー前に max_sell_short qty をチェック (借株不足で発注失敗を未然回避)
+        # SHORT エントリー前に max_short qty をチェック (借株不足で発注失敗を未然回避)
         if signal.direction == "SHORT":
             try:
-                max_short = self._client.get_max_sell_short_qty(symbol)
+                # 実関数名: get_max_short_qty(symbol, price) — acctradinginfo_query を裏で叩く
+                max_short = self._client.get_max_short_qty(symbol, price)
                 if max_short < size:
                     logger.warning(
-                        "[%s] SHORT 発注スキップ: max_sell_short=%d < 要求 qty=%d (借株不足)",
+                        "[%s] SHORT 発注スキップ: max_short=%d < 要求 qty=%d (借株不足 or 取得失敗で 0)",
                         symbol, max_short, size,
                     )
                     return OrderResult(order_id="", status="FAILED")
-                logger.info("[%s] SHORT 借株 OK: max_sell_short=%d >= qty=%d", symbol, max_short, size)
+                logger.info("[%s] SHORT 借株 OK: max_short=%d >= qty=%d", symbol, max_short, size)
             except Exception:
-                # max_sell_short 取得失敗時は発注は試行する (moomoo 側で最終判定)
-                logger.exception("[%s] max_sell_short 取得失敗 — 発注は試行", symbol)
+                # 取得失敗時は発注は試行する (moomoo 側で最終判定)
+                logger.exception("[%s] max_short 取得失敗 — 発注は試行", symbol)
 
         # 保護指値: 買い系 (BUY/BUY_BACK) は last × (1 + pct)、 売り系 (SELL_SHORT) は × (1 - pct)
         # pct=0 で従来の成行、 pct=0.02 で +2%/-2% 指値 (実質成行 + 上限/下限保護)

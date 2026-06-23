@@ -162,6 +162,46 @@ _dryrun_entered: dict[str, str] = {}
 _DRYRUN_PATH = Path(_project_root) / "data" / "short_dryrun.jsonl"
 
 
+def _update_short_dryrun_record(updated: dict) -> None:
+    """short_dryrun.jsonl の (symbol, entry_time) 一致レコードを上書き.
+
+    _short_dryrun で実エントリー成功後、 actual_entry_at/actual_entry_price/actual_order_id を
+    永続化するために使う。 末尾から逆向きに走査し、 最初にマッチした行を更新する。
+    """
+    if not _DRYRUN_PATH.exists():
+        return
+    try:
+        with open(_DRYRUN_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+        target_sym = updated.get("symbol")
+        target_time = updated.get("entry_time")
+        if not target_sym or not target_time:
+            return
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].strip()
+            if not line:
+                continue
+            try:
+                rec = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            if rec.get("symbol") == target_sym and rec.get("entry_time") == target_time:
+                lines[i] = _json.dumps(updated) + "\n"
+                with open(_DRYRUN_PATH, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                logger.debug(
+                    "[DRY-RUN SHORT] actual_* 更新成功: %s entry=%s actual=%s",
+                    target_sym, target_time, updated.get("actual_entry_at"),
+                )
+                return
+        logger.warning(
+            "[DRY-RUN SHORT] actual_* 更新: 該当レコードなし symbol=%s entry_time=%s",
+            target_sym, target_time,
+        )
+    except Exception:
+        logger.warning("[DRY-RUN SHORT] actual_* 更新エラー（無視）", exc_info=True)
+
+
 async def _short_dryrun(
     symbol: str,
     flow_strength: float,
@@ -421,12 +461,12 @@ async def _short_dryrun(
                         )
                         if result is not None and result.status == "FILLED":
                             actual_price = result.filled_price or entry_price
-                            # 実エントリーを dryrun jsonl にも反映 (分析統合)
+                            # 実エントリーを dryrun jsonl にも反映 (実 + 仮想統合分析用)
                             record["actual_entry_at"] = datetime.now().strftime("%H:%M:%S")
                             record["actual_entry_price"] = round(actual_price, 4)
                             record["actual_order_id"] = result.order_id
-                            # 末尾レコードを書き換え (シンプル: 該当行を rewriting せず追記で間に合わせる場合は次回 close 処理時に actual_* を埋める設計)
-                            # → ここでは新規追記でなく、 後で _short_dryrun_close が actual_* を更新する想定
+                            # 既に書き込まれた jsonl の該当行を更新 (symbol+entry_time で照合)
+                            _update_short_dryrun_record(record)
                             # PnLTracker に登録
                             _d5_r, _d15_r, _vel_r = _calc_direction_from_history(symbol)
                             pnl_tracker.register(
