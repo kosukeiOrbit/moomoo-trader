@@ -246,7 +246,7 @@ async def _short_dryrun(
         sl_price = entry_price * (1 + atr_pct * settings.ATR_SL_MULTIPLIER_SHORT)
         tp_price = entry_price * (1 - atr_pct * settings.ATR_TP_MULTIPLIER_SHORT)
 
-        # === FINAL-7 フィルタ (6/19 backlog 推奨) ===
+        # === FINAL-7 フィルタ + 案C 拡張 (amp 下限, vol_ratio 範囲) ===
         # 失敗してもメタ情報は dryrun jsonl に記録される (分析統合用)
         final7_pass = True
         final7_reason = "passed"
@@ -254,15 +254,29 @@ async def _short_dryrun(
         if symbol in settings.SHORT_BLOCK_SYMBOLS:
             final7_pass = False
             final7_reason = f"BLOCK_SYMBOL: {symbol}"
-        # 2. gap > -2% 必須 (dead cat bounce 罠回避)
+        # 2. gap > SHORT_GAP_MIN_PCT 必須 (default -100% で実質無効化、 .env で -2.0 等を指定)
         elif snap.gap_pct is not None and snap.gap_pct <= settings.SHORT_GAP_MIN_PCT:
             final7_pass = False
             final7_reason = f"gap={snap.gap_pct:.2f}% <= {settings.SHORT_GAP_MIN_PCT}%"
-        # 3. amp < 7% (過熱反転リスク)
+        # 3. amp < SHORT_AMP_MAX_PCT (過熱反転リスク)
         elif snap.amplitude is not None and snap.amplitude >= settings.SHORT_AMP_MAX_PCT:
             final7_pass = False
             final7_reason = f"amp={snap.amplitude:.2f}% >= {settings.SHORT_AMP_MAX_PCT}%"
-        # 4. SPY prev_close < 0% (弱気相場のみ)
+        # 3b. (案C 6/23) amp >= SHORT_AMP_MIN_PCT (値動き不足を除外)
+        elif snap.amplitude is not None and snap.amplitude < settings.SHORT_AMP_MIN_PCT:
+            final7_pass = False
+            final7_reason = f"amp={snap.amplitude:.2f}% < {settings.SHORT_AMP_MIN_PCT}% (下限)"
+        # 3c. (案C 6/23) vol_ratio が [MIN, MAX) 範囲外 → 弛緩/過熱を除外
+        elif snap.volume_ratio is not None and (
+            snap.volume_ratio < settings.SHORT_VOL_RATIO_MIN
+            or snap.volume_ratio >= settings.SHORT_VOL_RATIO_MAX
+        ):
+            final7_pass = False
+            final7_reason = (
+                f"vol={snap.volume_ratio:.2f} 範囲外 "
+                f"[{settings.SHORT_VOL_RATIO_MIN}, {settings.SHORT_VOL_RATIO_MAX})"
+            )
+        # 4. SPY prev_close < SHORT_SPY_MAX_PC% (弱気相場のみ)
         elif spy_change is None:
             final7_pass = False
             final7_reason = "SPY_PC unavailable"
