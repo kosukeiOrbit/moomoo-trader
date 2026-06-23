@@ -719,16 +719,20 @@ class MoomooClient:
             return {}
         aggregates: dict[str, list[dict]] = {}
         for _, row in data.iterrows():
-            qty = float(row["qty"])
-            if qty <= 0:
+            raw_qty = float(row["qty"])
+            # 決済済みのレコード (qty=0) は除外
+            # 信用空売り建玉は qty が負の値で返る (2026-06-23 手動検証で確認: GLW SHORT qty=-1.0)
+            # → abs() を取って正の建玉株数として扱い、 LONG/SHORT は position_side で判別
+            if raw_qty == 0:
                 continue
+            qty = abs(raw_qty)
             code = str(row["code"])  # "US.NVDA"
             symbol = code.replace("US.", "")
             # position_side: "LONG" / "SHORT" の文字列 (PositionSide enum)
-            # 信用空売り建玉は position_side="SHORT" で qty も正の値で返る
             position_side = str(row.get("position_side", "LONG"))
             if position_side not in ("LONG", "SHORT"):
-                position_side = "LONG"  # 不明値はフォールバック
+                # フォールバック: qty 符号で direction を推定 (position_side フィールド欠落時)
+                position_side = "SHORT" if raw_qty < 0 else "LONG"
             aggregates.setdefault(symbol, []).append({
                 "qty": qty,
                 "cost_price": float(row["cost_price"]),
@@ -877,11 +881,17 @@ class MoomooClient:
         assert self._trade_ctx is not None
         code = f"US.{order.symbol}"
         # 概念上の side → moomoo の trd_side マッピング
-        # (SELL_SHORT 発注は trd_side=SELL、 BUY_BACK は trd_side=BUY、 jp_acc_type で信用売り口座を指定)
-        if order.side in ("BUY", "BUY_BACK"):
+        # 公式 doc では「BUY/SELL のみ」 とあるが、 moomoo Japan の信用取引では
+        # SELL_SHORT/BUY_BACK を直接渡さないと "An error occurred" で拒否される。
+        # 2026-06-23 GLW 手動テストで SELL_SHORT 直接指定で発注成功を確認済み。
+        if order.side == "BUY":
             side = TrdSide.BUY
-        elif order.side in ("SELL", "SELL_SHORT"):
+        elif order.side == "SELL":
             side = TrdSide.SELL
+        elif order.side == "SELL_SHORT":
+            side = TrdSide.SELL_SHORT
+        elif order.side == "BUY_BACK":
+            side = TrdSide.BUY_BACK
         else:
             logger.error("place_order: 未知の side=%s (order=%s)", order.side, order)
             return OrderResult(order_id="", status="FAILED")
