@@ -46,7 +46,7 @@ class SentimentAnalyzer:
         '{"score": 0.0, "confidence": 0.0, "reasoning": ""}\n\n'
         "score: -1.0 (非常に弱気) ~ +1.0 (非常に強気)\n"
         "confidence: 0.0 (確信なし) ~ 1.0 (強い確信)\n"
-        "reasoning: 判定理由の簡潔な説明（日本語）"
+        "reasoning: 判定理由を50文字以内で簡潔に（日本語、長文禁止）"
     )
 
     BATCH_LIMIT = 20  # 1回のAPIコールで処理する最大テキスト数
@@ -124,7 +124,7 @@ class SentimentAnalyzer:
         try:
             response = self._client.messages.create(
                 model=settings.CLAUDE_MODEL,
-                max_tokens=256,
+                max_tokens=512,  # 256→512: 日本語 reasoning が長文化した時の JSON 打ち切り対策 (2026-06-24)
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_message}],
             )
