@@ -180,6 +180,21 @@ class AndFilter:
                 f"Filter G: atr_pct={atr_pct*100:.2f}% < {settings.TIGHT_ATR_PCT_MIN*100:.2f}%"
             )
 
+        # Filter I (6/27 追加): volume_ratio < 1.0 = 普段より出来高薄の銘柄を除外
+        # 全期間 LONG 累計 n=296 分析: vol 0.85-1.0 が n=9 / WR 11% / net -$168 で集中損失帯
+        # vol 1.0-1.2 は n=15 / WR 87% / net +$158 で最強帯 → 閾値 1.0 で明確分岐
+        # 「普段並み以上の関心が集まっている銘柄のみ LONG」 という意図
+        if (
+            settings.TIGHT_VOL_RATIO_MIN > 0
+            and hasattr(snap, 'volume_ratio')
+            and snap.volume_ratio is not None
+            and snap.volume_ratio > 0
+            and snap.volume_ratio < settings.TIGHT_VOL_RATIO_MIN
+        ):
+            return False, (
+                f"Filter I: volume_ratio={snap.volume_ratio:.2f} < {settings.TIGHT_VOL_RATIO_MIN}"
+            )
+
         # Filter H: 過熱ガード (午前序盤の gap/pre 過熱銘柄をブロック)
         # n=72 分析: gap/pre >= +5% かつ ET 9:30-10:30 = n=13 WR 46% net -$199
         #          同じ過熱でも ET 10:30 以降は n=6 WR 83% net +$57 → 午前のみ阻止

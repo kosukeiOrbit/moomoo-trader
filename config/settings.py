@@ -47,6 +47,8 @@ WATCHLIST = [
     # n=153 分析で不調 4 銘柄 (CRWD -$44, CAT -$13, GS -$9, AAPL -$7) を除外。
     # CRWD/AAPL は動的 WL (Finviz technology セクター) で機会あれば再度拾われる。
     # GS/CAT は対象外セクター/低 amp で実質取引対象外に。
+    # 6/27 拡張 (10 → 12): LONG 累計勝ち頭 INTC (+$167 / WR 63%) と PANW (+$80 / WR 80%) を追加。
+    # 動的 WL に偶発的に入らない日の機会逸失防止。
     # ハイテク・グロース
     "NVDA", "TSLA", "META", "MSFT",
     # 金融 (JPM のみ残し、 GS 除外)
@@ -59,6 +61,9 @@ WATCHLIST = [
     "AVGO",  # AI半導体
     "PLTR",  # AI・防衛
     "TSM",   # 半導体製造
+    # 6/27 追加: LONG 累計勝ち頭
+    "INTC",  # n=16 / WR 63% / net +$167 / avg +$10.45 (LONG 累計最強)
+    "PANW",  # n=5 / WR 80% / net +$80 / avg +$16.07 (高 WR)
 ]
 
 # --- シグナル閾値 ---
@@ -79,6 +84,13 @@ TIGHT_AMPLITUDE_MIN: float = float(os.getenv("TIGHT_AMPLITUDE_MIN", "3.0"))
 # 5/12-5/18 ドライラン IF 分析: amp>=3% AND atr>=2.5% で n=20 / WR=90% / avg=+$10.19
 # 0 で実質無効
 TIGHT_ATR_PCT_MIN: float = float(os.getenv("TIGHT_ATR_PCT_MIN", "0.025"))
+
+# Filter I: volume_ratio (普段との出来高比) これ未満ならスキップ
+# 全期間 LONG 累計 n=296 分析 (6/26 確定): vol<1.0 cohort n=19 / net -$191 / WR 21%
+# 内訳: vol 0.85-1.0 が n=9 / net -$168 / WR 11% で異常な損失帯
+# 一方 vol 1.0-1.2 は n=15 / net +$158 / WR 87% で最強帯 → 閾値 1.0 で明確に分岐
+# 0 で実質無効
+TIGHT_VOL_RATIO_MIN: float = float(os.getenv("TIGHT_VOL_RATIO_MIN", "0.0"))
 
 # Filter H: 過熱ガード (寄付き直後の gap/pre 過熱銘柄をブロック)
 # n=72 分析: gap or pre >= +5% かつ ET 9:30-10:30 = n=13 / WR 46% / net -$199
