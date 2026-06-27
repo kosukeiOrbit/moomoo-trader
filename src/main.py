@@ -544,8 +544,166 @@ async def _short_dryrun(
         logger.warning("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
 
 
+def _close_dryrun_record_via_intraday(
+    rec: dict,
+    direction: str,
+    client,
+    entry_price_key: str = "entry_price",
+    entry_time_key: str = "entry_time",
+) -> bool:
+    """1 分足ベースで dryrun レコードを仮想クローズする (LONG/SHORT 共通).
+
+    エントリー時刻以降の各 1 分バーを順次評価し、 SL/TP に到達した最初のバーで決済。
+    両方とも到達しなければ最後のバーの close で EOD クローズ。
+    同一バー内で SL/TP 両方到達した場合は保守的に SL を優先 (実トレードの最悪値想定)。
+
+    Args:
+        rec: dryrun jsonl レコード (dict、 in-place 更新)
+        direction: "LONG" or "SHORT"
+        client: MoomooClient
+        entry_price_key: rec から entry_price を引くキー (LONG dryrun は "first_signal_price")
+        entry_time_key: rec から entry_time を引くキー (LONG dryrun は "first_signal_time")
+
+    Returns:
+        更新したか (close_price がセットされたら True)
+    """
+    try:
+        symbol = rec["symbol"]
+        entry_price = rec[entry_price_key]
+        sl_price = rec["sl_price"]
+        tp_price = rec["tp_price"]
+        entry_time_str = rec.get(entry_time_key)
+        date_str = rec.get("date")
+        if not entry_time_str or not date_str:
+            return False
+        try:
+            entry_dt = datetime.fromisoformat(f"{date_str}T{entry_time_str}")
+        except Exception:
+            return False
+
+        kline_1m = client.get_intraday_kline(symbol, ktype="K_1M", days=1)
+        # フォールバック: 1 分足取得失敗時は snapshot ベースの旧ロジック
+        if kline_1m is None or kline_1m.empty:
+            snap = client.get_snapshot(symbol)
+            if snap is None or snap.last_price <= 0:
+                return False
+            close_price = float(snap.last_price)
+            if direction == "SHORT":
+                if close_price >= sl_price:
+                    exit_reason, pnl = "SL", entry_price - sl_price
+                elif close_price <= tp_price:
+                    exit_reason, pnl = "TP", entry_price - tp_price
+                else:
+                    exit_reason, pnl = "FORCE_CLOSE", entry_price - close_price
+            else:  # LONG
+                if close_price <= sl_price:
+                    exit_reason, pnl = "SL", sl_price - entry_price
+                elif close_price >= tp_price:
+                    exit_reason, pnl = "TP", tp_price - entry_price
+                else:
+                    exit_reason, pnl = "FORCE_CLOSE", close_price - entry_price
+            rec["close_price"] = round(close_price, 4)
+            rec["close_time"] = datetime.now().strftime("%H:%M:%S")
+            rec["virtual_pnl"] = round(pnl, 4)
+            rec["exit_reason"] = exit_reason
+            rec["price_source"] = "snapshot_fallback"
+            rec["mfe"] = None
+            rec["mae"] = None
+            return True
+
+        # エントリー時刻以降のバーだけ抽出
+        # time_key は futu の文字列 'YYYY-MM-DD HH:MM:SS'
+        kline_1m = kline_1m.copy()
+        # 文字列のまま datetime にパース (pd.to_datetime は遅いので手動)
+        bars = []
+        for _, row in kline_1m.iterrows():
+            try:
+                tk = str(row["time_key"])
+                bar_dt = datetime.fromisoformat(tk)
+                if bar_dt >= entry_dt:
+                    bars.append({
+                        "dt": bar_dt,
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                    })
+            except Exception:
+                continue
+        if not bars:
+            return False
+
+        # SL/TP 到達バーを探索
+        sl_bar = None
+        tp_bar = None
+        if direction == "SHORT":
+            # SHORT: high が SL 超過で SL ヒット、 low が TP 以下で TP ヒット
+            for b in bars:
+                if sl_bar is None and b["high"] >= sl_price:
+                    sl_bar = b
+                if tp_bar is None and b["low"] <= tp_price:
+                    tp_bar = b
+                if sl_bar and tp_bar:
+                    break
+            mfe = entry_price - min(b["low"] for b in bars)
+            mae = max(b["high"] for b in bars) - entry_price
+        else:  # LONG
+            for b in bars:
+                if sl_bar is None and b["low"] <= sl_price:
+                    sl_bar = b
+                if tp_bar is None and b["high"] >= tp_price:
+                    tp_bar = b
+                if sl_bar and tp_bar:
+                    break
+            mfe = max(b["high"] for b in bars) - entry_price
+            mae = entry_price - min(b["low"] for b in bars)
+
+        # 同一バー内で両方該当時は保守的に SL 優先
+        if sl_bar and tp_bar:
+            if sl_bar["dt"] <= tp_bar["dt"]:
+                tp_bar = None
+            else:
+                sl_bar = None
+
+        if sl_bar is not None:
+            exit_reason = "SL"
+            close_price = sl_price
+            close_time = sl_bar["dt"].strftime("%H:%M:%S")
+            pnl = (entry_price - sl_price) if direction == "SHORT" else (sl_price - entry_price)
+        elif tp_bar is not None:
+            exit_reason = "TP"
+            close_price = tp_price
+            close_time = tp_bar["dt"].strftime("%H:%M:%S")
+            pnl = (entry_price - tp_price) if direction == "SHORT" else (tp_price - entry_price)
+        else:
+            # EOD = 最後のバーの close
+            last_bar = bars[-1]
+            exit_reason = "FORCE_CLOSE"
+            close_price = last_bar["close"]
+            close_time = last_bar["dt"].strftime("%H:%M:%S")
+            pnl = (entry_price - close_price) if direction == "SHORT" else (close_price - entry_price)
+
+        rec["close_price"] = round(close_price, 4)
+        rec["close_time"] = close_time
+        rec["virtual_pnl"] = round(pnl, 4)
+        rec["exit_reason"] = exit_reason
+        rec["mfe"] = round(mfe, 4)
+        rec["mae"] = round(mae, 4)
+        rec["price_source"] = "kline_1m"
+        return True
+    except Exception:
+        logger.warning("[DRY-RUN %s CLOSE] レコード close 失敗: %s",
+                       direction, rec.get("symbol", "?"), exc_info=True)
+        return False
+
+
 async def _short_dryrun_close(client) -> None:
-    """SHORT ドライラン仮想決済: 未決済のエントリーを現在価格でクローズ."""
+    """SHORT ドライラン仮想決済: 未決済のエントリーを 1 分足で SL/TP 判定する.
+
+    エントリー時刻以降の 1 分バーを順次走査し、 SL/TP の最初の到達バーで決済確定。
+    同一バー内に両方到達した場合は保守的に SL を優先。
+    どちらも到達しなければ最後のバーの close で EOD 決済。
+    1 分足取得失敗時は旧ロジック (snapshot ベース) にフォールバック。
+    """
     try:
         if not _DRYRUN_PATH.exists():
             return
@@ -562,34 +720,15 @@ async def _short_dryrun_close(client) -> None:
             # 未決済レコードを全て処理（日付に関係なく）
             if rec.get("close_price") is not None:
                 continue
-            snap = client.get_snapshot(rec["symbol"])
-            if snap is None or snap.last_price <= 0:
-                continue
-            close_price = snap.last_price
-            close_time = datetime.now().strftime("%H:%M:%S")
-
-            if close_price >= rec["sl_price"]:
-                exit_reason = "SL"
-                pnl = rec["entry_price"] - rec["sl_price"]
-            elif close_price <= rec["tp_price"]:
-                exit_reason = "TP"
-                pnl = rec["entry_price"] - rec["tp_price"]
-            else:
-                exit_reason = "FORCE_CLOSE"
-                pnl = rec["entry_price"] - close_price
-
-            rec["close_price"] = round(close_price, 4)
-            rec["close_time"] = close_time
-            rec["virtual_pnl"] = round(pnl, 4)
-            rec["exit_reason"] = exit_reason
-            updated = True
-
-            logger.info(
-                "[DRY-RUN SHORT CLOSE] %s entry=%.2f close=%.2f "
-                "pnl=%+.4f reason=%s",
-                rec["symbol"], rec["entry_price"],
-                close_price, pnl, exit_reason,
-            )
+            if _close_dryrun_record_via_intraday(rec, "SHORT", client):
+                updated = True
+                logger.info(
+                    "[DRY-RUN SHORT CLOSE] %s entry=%.2f close=%.2f "
+                    "pnl=%+.4f reason=%s mfe=%s mae=%s src=%s",
+                    rec["symbol"], rec["entry_price"],
+                    rec["close_price"], rec["virtual_pnl"], rec["exit_reason"],
+                    rec.get("mfe"), rec.get("mae"), rec.get("price_source"),
+                )
 
         if updated:
             with open(_DRYRUN_PATH, "w", encoding="utf-8") as f:
@@ -1018,61 +1157,39 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
         # pnl_tracker から実トレードを引く (open + closed)
         all_trades = list(pnl_tracker._open_trades.values()) + pnl_tracker._closed_trades
 
-        # 未 close レコードの銘柄を一括取得 (API レート制限緩和)
-        # get_snapshot を 1 件ずつ呼ぶと moomoo の OpenAPI レート制限 (~10req/s) で
-        # 失敗が連鎖し、 多くのレコードが close_price=None のまま残る問題があった。
-        unique_symbols = list({rec["symbol"] for rec in records if rec.get("close_price") is None})
-        snapshot_cache: dict[str, float] = {}
-        if unique_symbols:
-            try:
-                codes = [f"US.{s}" for s in unique_symbols]
-                snaps = client.get_snapshots(codes)
-                for code, snap in snaps.items():
-                    if snap is None or snap.last_price <= 0:
-                        continue
-                    symbol = code.replace("US.", "")
-                    snapshot_cache[symbol] = snap.last_price
-            except Exception:
-                logger.exception("get_snapshots 一括取得失敗 — 個別取得にフォールバック")
-            logger.info(
-                "[DRY-RUN %s CLOSE] 一括 snapshot: %d / %d 銘柄取得",
-                dryrun_type.upper(), len(snapshot_cache), len(unique_symbols),
-            )
-
         updated = False
+        intraday_ok = 0
+        intraday_fail = 0
         for rec in records:
             if rec.get("close_price") is not None:
                 continue  # 処理済み
 
-            # 1) 仮想決済: 一括キャッシュ → fallback で個別取得
-            close_price = snapshot_cache.get(rec["symbol"], 0)
-            if close_price <= 0:
-                try:
-                    snap = client.get_snapshot(rec["symbol"])
-                    if snap is None or snap.last_price <= 0:
-                        continue
-                    close_price = snap.last_price
-                except Exception:
-                    continue
-
-            entry_price = rec["first_signal_price"]
-            sl_price = rec["sl_price"]
-            tp_price = rec["tp_price"]
-
-            if close_price <= sl_price:
-                exit_reason = "SL"
-                v_pnl = sl_price - entry_price
-            elif close_price >= tp_price:
-                exit_reason = "TP"
-                v_pnl = tp_price - entry_price
+            # 1 分足ベースで SL/TP 判定 (LONG dryrun は first_signal_price / first_signal_time)
+            if _close_dryrun_record_via_intraday(
+                rec, "LONG", client,
+                entry_price_key="first_signal_price",
+                entry_time_key="first_signal_time",
+            ):
+                updated = True
+                if rec.get("price_source") == "kline_1m":
+                    intraday_ok += 1
+                else:
+                    intraday_fail += 1
             else:
-                exit_reason = "FORCE_CLOSE"
-                v_pnl = close_price - entry_price
+                continue
 
-            rec["close_price"] = round(close_price, 4)
-            rec["close_time"] = datetime.now().strftime("%H:%M:%S")
-            rec["virtual_pnl"] = round(v_pnl, 4)
-            rec["exit_reason"] = exit_reason
+        logger.info(
+            "[DRY-RUN %s CLOSE] 1分足成功 %d 件、 フォールバック %d 件",
+            dryrun_type.upper(), intraday_ok, intraday_fail,
+        )
+
+        # 後段の「実エントリー紐付け」 のために close_price/exit_reason は既にセット済み
+        for rec in records:
+            if rec.get("actual_entry_at") is not None:
+                continue  # 既に紐付け済み
+            if rec.get("close_price") is None:
+                continue
+            close_price = rec["close_price"]
 
             # 2) 実エントリー紐付け（同銘柄・direction=LONG・first_signal_time 以降）
             try:
@@ -1096,11 +1213,11 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
                 rec["actual_pnl"] = round(actual_pnl, 4)
                 break  # 最初のマッチのみ
 
-            updated = True
             logger.info(
-                "[DRY-RUN LONG-%s CLOSE] %s entry=%.2f close=%.2f v_pnl=%+.2f actual=%s",
+                "[DRY-RUN LONG-%s CLOSE] %s entry=%.2f close=%.2f v_pnl=%+.2f reason=%s mfe=%s mae=%s src=%s actual=%s",
                 dryrun_type.upper(),
-                rec["symbol"], entry_price, close_price, v_pnl,
+                rec["symbol"], rec["first_signal_price"], rec["close_price"], rec["virtual_pnl"],
+                rec.get("exit_reason"), rec.get("mfe"), rec.get("mae"), rec.get("price_source"),
                 f"{rec['actual_entry_at']}@{rec['actual_entry_price']}" if rec["actual_entry_at"] else "なし",
             )
 

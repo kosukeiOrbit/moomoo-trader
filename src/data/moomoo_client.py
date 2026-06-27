@@ -456,6 +456,70 @@ class MoomooClient:
             logger.exception("K線データ取得エラー: %s", symbol)
             return None
 
+    def get_intraday_kline(
+        self,
+        symbol: str,
+        ktype: str = "K_1M",
+        days: int = 1,
+    ) -> "pd.DataFrame | None":
+        """当日 (or 直近N日) の分足 K 線データを取得する.
+
+        dryrun の SL/TP 判定で「エントリー時刻以降の high/low」 を 1 分解像度で再生する用途。
+        ATR 計算用の get_kline (K_DAY) とは別途、 分足を返す。
+
+        Args:
+            symbol: 銘柄シンボル
+            ktype: "K_1M" / "K_3M" / "K_5M" / "K_15M" など
+            days: 取得日数 (デフォルト 1 = 当日のみ)
+
+        Returns:
+            time_key (str), open, high, low, close, volume 列を含む DataFrame
+            取得失敗時は None
+        """
+        from datetime import date as _date, timedelta as _td
+        assert self._quote_ctx is not None
+        code = f"US.{symbol}"
+        end_date = _date.today().strftime("%Y-%m-%d")
+        # days=1 なら当日のみ、 days=2 以上なら遡る
+        start_date = (_date.today() - _td(days=max(days - 1, 0))).strftime("%Y-%m-%d")
+        # ktype マッピング
+        kt_map = {
+            "K_1M": KLType.K_1M,
+            "K_3M": KLType.K_3M,
+            "K_5M": KLType.K_5M,
+            "K_15M": KLType.K_15M,
+            "K_30M": KLType.K_30M,
+            "K_60M": KLType.K_60M,
+        }
+        kl_type = kt_map.get(ktype, KLType.K_1M)
+        # 1 取引日は ET 9:30-16:00 = 390 分 → 1 分足は約 390 本/日。 余裕を持って 500
+        max_count = 500 * max(days, 1)
+        try:
+            ret, data, _ = self._quote_ctx.request_history_kline(
+                code,
+                ktype=kl_type,
+                start=start_date,
+                end=end_date,
+                autype=AuType.QFQ,
+                max_count=max_count,
+            )
+            if ret != RET_OK or data is None or data.empty:
+                logger.debug("get_intraday_kline 失敗: %s (ret=%s)", symbol, ret)
+                return None
+            required = {"time_key", "high", "low", "close"}
+            if not required.issubset(data.columns):
+                logger.debug("get_intraday_kline カラム欠落: %s columns=%s", symbol, list(data.columns))
+                return None
+            # 必要な列だけ抽出 (open/volume はあれば含める)
+            cols = ["time_key", "high", "low", "close"]
+            for opt in ("open", "volume"):
+                if opt in data.columns:
+                    cols.append(opt)
+            return data[cols].copy()
+        except Exception:
+            logger.exception("get_intraday_kline エラー: %s", symbol)
+            return None
+
     def get_spy_intraday_change(self) -> float | None:
         """SPY の当日始値からの変化率を返す.
 
