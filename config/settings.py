@@ -16,6 +16,13 @@ TRADE_ENV: str = os.getenv("TRADE_ENV", "SIMULATE")  # "SIMULATE" or "REAL"
 SECURITY_FIRM: str = os.getenv("SECURITY_FIRM", "FUTUJP")  # moomoo証券（日本）
 JP_ACC_TYPE: str = os.getenv("JP_ACC_TYPE", "SPECIFIC")  # "GENERAL" or "SPECIFIC"
 
+# --- 手数料プラン (moomoo Japan、 1 日 1 回変更可能) ---
+# "basic":   約定代金 × 0.132% / 最低 $0.01 / 上限 $22 (small size 向き)
+# "advance": 株数ベース、 取引 max($0.00539/株, $1.08) + システム max($0.0055/株, $1.10)
+#            + 清算 $0.006/株、 上限は取引/システム各 約定代金×0.55% (large size 向き)
+# size $2500+ ではほぼ全銘柄で advance 有利。 size $1500 以下は basic 有利
+FEE_PLAN: str = os.getenv("FEE_PLAN", "basic").lower()
+
 # --- 信用取引 (margin) ---
 # True: LONG エントリーを信用買いで発注 (取引額の最大 ~2 倍まで利用可)
 # False: 現物買いで発注 (デフォルト)

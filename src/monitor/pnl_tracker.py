@@ -13,7 +13,36 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+from config import settings
+
 logger = logging.getLogger(__name__)
+
+
+def calc_one_way_fee(price: float, size: int) -> float:
+    """moomoo Japan 米国株 片道手数料 (settings.FEE_PLAN で切替).
+
+    "basic": 約定代金 × 0.132% / 最低 $0.01 / 上限 $22 (現状デフォルト)
+    "advance": 株数ベース (1 日 1 回変更可能、 ユーザーが moomoo アプリで切替):
+      - 取引手数料: max($0.00539 × 株数, $1.08)、 上限 約定代金 × 0.55%
+      - システム利用料: max($0.0055 × 株数, $1.10)、 上限 約定代金 × 0.55%
+      - 現地清算費用: $0.006 × 株数 (最低/上限なし)
+
+    注意: ユーザーの実プランと settings.FEE_PLAN を一致させる必要がある。
+    切り替え忘れると trades CSV の commission / net_pnl が実請求と乖離する。
+    """
+    if price <= 0 or size <= 0:
+        return 0.01
+    notional = price * size
+    plan = (settings.FEE_PLAN or "basic").lower()
+    if plan == "advance":
+        cap = notional * 0.0055
+        trade_fee = min(max(0.00539 * size, 1.08), cap)
+        system_fee = min(max(0.0055 * size, 1.10), cap)
+        clearing_fee = 0.006 * size
+        return round(trade_fee + system_fee + clearing_fee, 4)
+    # "basic" (default fallback)
+    fee = notional * 0.00132
+    return round(max(min(fee, 22.0), 0.01), 4)
 
 # CSV保存先のデフォルトディレクトリ
 DEFAULT_CSV_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "trades"
@@ -234,11 +263,10 @@ class PnLTracker:
         trade.closed_at = datetime.now()
         trade.mfe = mfe
 
-        # 手数料計算（moomoo日本: 約定代金の0.132%(税込), 上限$22, 最低$0.01, 往復）
-        entry_comm = min(trade.entry_price * trade.size * 0.00132, 22.0)
-        exit_comm = min(exit_price * trade.size * 0.00132, 22.0)
-        entry_comm = max(entry_comm, 0.01)
-        exit_comm = max(exit_comm, 0.01)
+        # 手数料計算 (moomoo Japan 米国株、 settings.FEE_PLAN で basic/advance 切替)
+        # ユーザーが moomoo アプリで切り替えたら settings.FEE_PLAN を一致させる
+        entry_comm = calc_one_way_fee(trade.entry_price, trade.size)
+        exit_comm = calc_one_way_fee(exit_price, trade.size)
         trade.commission = round(entry_comm + exit_comm, 2)
         trade.mae = mae
         self._closed_trades.append(trade)
