@@ -755,6 +755,26 @@ _LONG_FULL_DRYRUN_PATH = Path(_project_root) / "data" / "long_full_dryrun.jsonl"
 _long_rejected_dryrun_recorded: dict[str, str] = {}
 _LONG_REJECTED_DRYRUN_PATH = Path(_project_root) / "data" / "long_rejected_dryrun.jsonl"
 
+# Shadow: sentiment 撤廃案の検証用 (8/4 追加)
+# AND filter で reject された signal のうち、 「もし sentiment 判定を無視していたら
+# tight_filter を通過してエントリーされていた」 signal を記録する。
+# 実発注ロジックには一切影響しない (read-only 追加)。
+_long_sentiment_shadow_recorded: dict[str, str] = {}
+_LONG_SENTIMENT_SHADOW_PATH = Path(_project_root) / "data" / "long_sentiment_shadow_dryrun.jsonl"
+
+# Shadow: auto-daytrade 方針検証用 (8/13 追加)
+# 別プロジェクト auto-daytrade (日本株、 WR 79%) の Pattern B ロング L1 判定条件を
+# 米国株にポートして shadow 記録する。
+# 現行の flow / sentiment / SPY_BLOCK / QQQ_BLOCK / AND / tight_filter を**すべて無視**、
+# 全銘柄で毎スキャン判定 (auto-daytrade 準拠、 完全独立 shadow)。
+# 実発注には一切影響しない (read-only 追加)。
+_long_autodaytrade_shadow_recorded: dict[str, str] = {}
+_LONG_AUTODAYTRADE_SHADOW_PATH = Path(_project_root) / "data" / "long_autodaytrade_shadow.jsonl"
+
+# セクター ETF (XLK/XLC 等) 当日変動キャッシュ
+# {etf_symbol: {"day_chg_pct": float, "fetched_at": datetime, "open_price": float}}
+_sector_etf_context: dict[str, dict] = {}
+
 # 押し目待ちキュー: vwap_dev > PULLBACK_VWAP_ENTRY_PCT で発火した銘柄を保持
 # {symbol: {fired_at, decision, sentiment, vwap_price, kline, texts_count,
 #           entry_price_at_signal, min_vwap_dev}}
@@ -1004,12 +1024,13 @@ async def _long_dryrun_record(
     texts_count: int,
     tight_pass: bool = True,
     tight_reason: str = "",
-    dryrun_type: str = "skip",  # "skip" or "full"
+    dryrun_type: str = "skip",  # "skip" / "full" / "rejected" / "shadow_sent"
     slot_count_at_signal: int | None = None,
     spy_change: float | None = None,
     qqq_change: float | None = None,
     spy_change_open: float | None = None,
     qqq_change_open: float | None = None,
+    and_reject_reason: str | None = None,  # shadow_sent 用: AND filter の reject 理由
 ) -> None:
     """LONG エントリー条件成立を JSONL に記録する (実発注なし).
 
@@ -1017,6 +1038,7 @@ async def _long_dryrun_record(
       - "skip": スキップ期間中 (22:30-23:30) のシグナル → long_skip_dryrun.jsonl
       - "full": 5枠フル時のシグナル → long_full_dryrun.jsonl
       - "rejected": tight_filter で弾かれた通常時間のシグナル → long_rejected_dryrun.jsonl
+      - "shadow_sent": AND (sentiment) 落ちだが tight_filter 通過するシグナル → long_sentiment_shadow_dryrun.jsonl
 
     同一銘柄は1セッション1回のみ記録（最初に条件成立した時点）。
     """
@@ -1028,6 +1050,9 @@ async def _long_dryrun_record(
         elif dryrun_type == "rejected":
             recorded_dict = _long_rejected_dryrun_recorded
             output_path = _LONG_REJECTED_DRYRUN_PATH
+        elif dryrun_type == "shadow_sent":
+            recorded_dict = _long_sentiment_shadow_recorded
+            output_path = _LONG_SENTIMENT_SHADOW_PATH
         else:  # "full"
             recorded_dict = _long_full_dryrun_recorded
             output_path = _LONG_FULL_DRYRUN_PATH
@@ -1111,6 +1136,8 @@ async def _long_dryrun_record(
             "close_time": None,
             "exit_reason": None,
             "virtual_pnl": None,
+            # shadow_sent 用: AND filter が実際にどんな理由で reject したかを記録
+            "and_reject_reason": and_reject_reason,
         }
         output_path.parent.mkdir(exist_ok=True)
         with open(output_path, "a", encoding="utf-8") as f:
@@ -1142,6 +1169,10 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
             output_path = _LONG_SKIP_DRYRUN_PATH
         elif dryrun_type == "rejected":
             output_path = _LONG_REJECTED_DRYRUN_PATH
+        elif dryrun_type == "shadow_sent":
+            output_path = _LONG_SENTIMENT_SHADOW_PATH
+        elif dryrun_type == "autodaytrade_shadow":
+            output_path = _LONG_AUTODAYTRADE_SHADOW_PATH
         else:  # "full"
             output_path = _LONG_FULL_DRYRUN_PATH
         if not output_path.exists():
@@ -1228,6 +1259,220 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
 
     except Exception:
         logger.warning("[DRY-RUN LONG-%s CLOSE] エラー（無視）", dryrun_type.upper(), exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# auto-daytrade 方針 shadow (8/13 追加)
+# ---------------------------------------------------------------------------
+
+def _update_sector_etf_context(client) -> None:
+    """セクター ETF (XLK/XLC/XLY/XLF/XLV/XLE/XLI) の当日変動を取得・キャッシュ.
+
+    auto-daytrade §5.2 の sector_day_chg 代替として、 SPDR セクター ETF の
+    (現在値 - 寄り値) / 寄り値 を計算し `_sector_etf_context` に格納する。
+    10 分キャッシュ (settings.AUTODAY_SECTOR_ETF_CACHE_SEC で調整可)。
+
+    判定不能時 (寄り値取れない等) は 該当 ETF エントリーを更新せず、
+    _get_sector_etf_day_chg() が None を返す。
+    """
+    if not settings.AUTODAY_SHADOW_ENABLED:
+        return
+    now = datetime.now()
+    # 対象 ETF は GICS_SECTOR_ETF マッピングに現れる ETF の unique 集合
+    target_etfs = set(settings.GICS_SECTOR_ETF.values())
+    updated = []
+    failed = []
+    cached = 0
+    for etf in target_etfs:
+        ctx = _sector_etf_context.get(etf)
+        if ctx and (now - ctx["fetched_at"]).total_seconds() < settings.AUTODAY_SECTOR_ETF_CACHE_SEC:
+            cached += 1
+            continue  # キャッシュ内、 スキップ
+        try:
+            snap = client.get_snapshot(etf)
+            if not snap or snap.last_price <= 0:
+                failed.append(f"{etf}(no_snap)")
+                continue
+            open_price = snap.open_price if snap.open_price > 0 else None
+            if not open_price:
+                # 寄り値取れない場合はスキップ (day は取れない)
+                failed.append(f"{etf}(no_open)")
+                continue
+            day_chg = (snap.last_price - open_price) / open_price * 100
+            _sector_etf_context[etf] = {
+                "day_chg_pct": round(day_chg, 3),
+                "fetched_at": now,
+                "open_price": open_price,
+                "last_price": snap.last_price,
+            }
+            updated.append(f"{etf}={day_chg:+.2f}%")
+        except Exception:
+            failed.append(f"{etf}(exc)")
+            logger.warning("[AUTODAY] セクター ETF %s 取得例外", etf, exc_info=True)
+
+    # 取得結果を info ログで可視化 (キャッシュヒットのみのときは静音)
+    if updated or failed:
+        logger.info(
+            "[AUTODAY] セクター ETF 更新: %d 銘柄取得 [%s]%s (cached=%d)",
+            len(updated), ", ".join(updated),
+            f" 失敗={','.join(failed)}" if failed else "",
+            cached,
+        )
+
+
+def _get_sector_etf_day_chg(symbol: str) -> tuple[str | None, float | None]:
+    """銘柄 → (対応セクター ETF、 当日変動%)"""
+    etf = settings.GICS_SECTOR_ETF.get(symbol)
+    if not etf:
+        return (None, None)
+    ctx = _sector_etf_context.get(etf)
+    if not ctx:
+        return (etf, None)
+    return (etf, ctx.get("day_chg_pct"))
+
+
+def _calc_5bar_momentum(symbol: str) -> float | None:
+    """直近 5 サンプルの価格変化率 (%) を返す (auto-daytrade §5.1 モメンタム条件相当).
+
+    _price_history deque (30 秒 scan × 30 サンプル保持) から最新 5 サンプル間の
+    (最新 - 5サンプル前) / 5サンプル前 * 100 を計算。
+    5 サンプル未満なら None。
+    """
+    hist = _price_history.get(symbol)
+    if not hist or len(hist) < 5:
+        return None
+    # deque の要素は (timestamp, price)
+    try:
+        prices = [p for _, p in list(hist)[-5:]]
+        if len(prices) < 5 or prices[0] <= 0:
+            return None
+        return (prices[-1] - prices[0]) / prices[0] * 100
+    except Exception:
+        return None
+
+
+async def _long_autodaytrade_shadow_record(
+    symbol: str,
+    snap,
+    kline,
+    stop_loss,
+    sector_etf: str,
+    sector_etf_chg: float,
+    momentum_5bar_pct: float,
+    vwap: float,
+    vwap_dev_pct: float,
+    flow_direction: str | None = None,
+    flow_strength: float | None = None,
+    spy_change: float | None = None,
+    qqq_change: float | None = None,
+    spy_change_open: float | None = None,
+    qqq_change_open: float | None = None,
+) -> None:
+    """auto-daytrade 方針の shadow レコード記録 (記録のみ、 判定は呼び出し側).
+
+    呼び出し側 (hook) が全条件を通過確認済で呼ぶ想定。
+    実発注ロジックには一切影響しない (read-only 追加)。
+    """
+    try:
+        today = date.today().isoformat()
+        _long_autodaytrade_shadow_recorded[symbol] = today
+
+        entry_price = snap.last_price
+        atr_pct = stop_loss.calc_atr_pct(kline, entry_price) if kline is not None else None
+        # SL/TP 計算 (8/27 バグ修正: close 関数が rec["sl_price"] を必須アクセスするため)
+        # 現行 LONG と同じ ATR ベース (SL=ATR×0.7, TP=ATR×1.0) で計算し、
+        # `_close_dryrun_record_via_intraday` が 1 分足リプレイで SL/TP hit 判定できるようにする。
+        # auto-daytrade 哲学 (TP/SL なし・大引 force close のみ) 的には全て FORCE_CLOSE 判定を期待
+        # するが、 参考データとして SL/TP hit 情報も記録することで分析価値が上がる。
+        sl_price = None
+        tp_price = None
+        if kline is not None:
+            try:
+                _levels = stop_loss.calculate_levels(
+                    symbol, entry_price, price_history=kline, direction="LONG",
+                )
+                if _levels:
+                    sl_price = round(_levels.stop_loss, 4)
+                    tp_price = round(_levels.take_profit, 4)
+            except Exception:
+                pass
+        prev_close = snap.prev_close if snap.prev_close > 0 else None
+
+        # direction 情報 (Idea B: _price_history deque から)
+        _d5, _d15, _vel = _calc_direction_from_history(symbol)
+
+        # 相対強度 (auto-daytrade high-value 指標): 銘柄変動% − セクター ETF 変動%
+        cfo = snap.change_from_open_pct if snap.change_from_open_pct is not None else None
+        relative_strength = (cfo - sector_etf_chg) if cfo is not None else None
+
+        record = {
+            "date": today,
+            "symbol": symbol,
+            "dryrun_type": "autodaytrade_shadow",
+            "first_signal_time": datetime.now().strftime("%H:%M:%S"),
+            "first_signal_price": round(entry_price, 4),
+            # SL/TP (8/27 追加、 close 関数の必須アクセス回避)
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            # コア判定値
+            "vwap": round(vwap, 4),
+            "vwap_deviation_pct": round(vwap_dev_pct, 3),
+            "momentum_5bar_pct": round(momentum_5bar_pct, 3),
+            "volume_ratio": round(snap.volume_ratio, 3) if snap.volume_ratio > 0 else None,
+            "sector_etf": sector_etf,
+            "sector_etf_day_chg_pct": sector_etf_chg,
+            # 銘柄属性
+            "open_price": round(snap.open_price, 4) if snap.open_price > 0 else None,
+            "high_price": round(snap.high_price, 4) if snap.high_price > 0 else None,
+            "low_price": round(snap.low_price, 4) if snap.low_price > 0 else None,
+            "prev_close": round(prev_close, 4) if prev_close else None,
+            "gap_pct": round(snap.gap_pct, 3) if snap.gap_pct is not None else None,
+            "amplitude": round(snap.amplitude, 3) if snap.amplitude > 0 else None,
+            "change_from_open_pct": round(cfo, 3) if cfo is not None else None,
+            "pre_change_rate": round(snap.pre_change_rate, 3),
+            "price_position_in_range": round(snap.price_position_in_range, 3) if snap.price_position_in_range is not None else None,
+            "atr_pct": round(atr_pct, 4) if atr_pct is not None else None,
+            "is_dynamic": symbol not in settings.WATCHLIST,
+            # 追加指標 (auto-daytrade high-value + 現行 dryrun 互換)
+            "relative_strength_vs_etf": round(relative_strength, 3) if relative_strength is not None else None,
+            "direction_5min_pct": round(_d5, 3) if _d5 is not None else None,
+            "direction_15min_pct": round(_d15, 3) if _d15 is not None else None,
+            "direction_velocity": round(_vel, 4) if _vel is not None else None,
+            # 地合い (ループ先頭でキャッシュ済み、 記録用)
+            "spy_change_realtime": round(spy_change * 100, 2) if spy_change is not None else None,
+            "qqq_change_realtime": round(qqq_change * 100, 2) if qqq_change is not None else None,
+            "spy_change_open": round(spy_change_open * 100, 2) if spy_change_open is not None else None,
+            "qqq_change_open": round(qqq_change_open * 100, 2) if qqq_change_open is not None else None,
+            # 現行 filter 参照値 (後付け検証: 「もし flow と組み合わせたら」)
+            "flow_direction": flow_direction,
+            "flow_strength": round(flow_strength, 3) if flow_strength is not None else None,
+            # 後で close ロジックが埋める
+            "actual_entry_at": None,
+            "actual_entry_price": None,
+            "actual_pnl": None,
+            "close_price": None,
+            "close_time": None,
+            "exit_reason": None,
+            "virtual_pnl": None,
+            "mfe": None,
+            "mae": None,
+            "price_source": None,
+        }
+        _LONG_AUTODAYTRADE_SHADOW_PATH.parent.mkdir(exist_ok=True)
+        with open(_LONG_AUTODAYTRADE_SHADOW_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
+
+        logger.info(
+            "[AUTODAY SHADOW] %s entry=%.2f vwap=%.2f dev=%+.2f%% mom5=%+.2f%% vol=%.2f "
+            "sector=%s(%+.2f%%) rs=%s is_dyn=%s",
+            symbol, entry_price, vwap, vwap_dev_pct, momentum_5bar_pct,
+            snap.volume_ratio if snap.volume_ratio else 0,
+            sector_etf, sector_etf_chg,
+            f"{relative_strength:+.2f}" if relative_strength is not None else "NA",
+            record["is_dynamic"],
+        )
+    except Exception:
+        logger.warning("[AUTODAY SHADOW] %s 記録エラー (無視)", symbol, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1479,6 +1724,12 @@ async def main_loop() -> None:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
                 # tight_filter REJECT 分は常時記録 (フラグなしで close も走らせる)
                 await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
+                # sentiment shadow (フラグ有効時のみ close も走らせる)
+                if settings.SHADOW_SENTIMENT_ENABLED:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="shadow_sent")
+                # auto-daytrade shadow (フラグ有効時のみ close も走らせる)
+                if settings.AUTODAY_SHADOW_ENABLED:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="autodaytrade_shadow")
                 # Filter D log の close_price/virtual_pnl 更新
                 await _filter_d_log_close(client)
 
@@ -1492,6 +1743,10 @@ async def main_loop() -> None:
                 if settings.LONG_FULL_DRY_RUN:
                     await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
                 await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
+                if settings.SHADOW_SENTIMENT_ENABLED:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="shadow_sent")
+                if settings.AUTODAY_SHADOW_ENABLED:
+                    await _long_dryrun_close(client, pnl_tracker, dryrun_type="autodaytrade_shadow")
                 await _filter_d_log_close(client)
                 break
 
@@ -1560,6 +1815,10 @@ async def main_loop() -> None:
                         if settings.LONG_FULL_DRY_RUN:
                             await _long_dryrun_close(client, pnl_tracker, dryrun_type="full")
                         await _long_dryrun_close(client, pnl_tracker, dryrun_type="rejected")
+                        if settings.SHADOW_SENTIMENT_ENABLED:
+                            await _long_dryrun_close(client, pnl_tracker, dryrun_type="shadow_sent")
+                        if settings.AUTODAY_SHADOW_ENABLED:
+                            await _long_dryrun_close(client, pnl_tracker, dryrun_type="autodaytrade_shadow")
                         await _filter_d_log_close(client)
                     except Exception:
                         logger.exception("Circuit Breaker 時の dryrun close 失敗")
@@ -1606,6 +1865,9 @@ async def main_loop() -> None:
                 order_router.short_count, settings.SHORT_MAX_POSITIONS,
                 total_assets, buying_power, pnl_tracker.daily_pnl,
             )
+            # auto-daytrade shadow: セクター ETF (XLK/XLC等) 当日変動を 10 分キャッシュで更新
+            # (AUTODAY_SHADOW_ENABLED=false なら関数内で早期 return)
+            _update_sector_etf_context(client)
             # スキャンスキップ判定
             # - LONG_SKIP_DRY_RUN=true なら寄り付き期間もスキャン (実発注なし、JSONL記録のみ)
             # - LONG_FULL_DRY_RUN=true なら枠フル時もスキャン (実発注なし、JSONL記録のみ)
@@ -1800,6 +2062,20 @@ async def main_loop() -> None:
                             )
                             continue
 
+                        # QQQ 地合いフィルタ: テック弱の日は LONG エントリーをブロック (SPY_BLOCK と OR 判定)
+                        if (
+                            settings.QQQ_LONG_BLOCK_THRESHOLD < 0
+                            and _qqq_change is not None
+                            and _qqq_change < settings.QQQ_LONG_BLOCK_THRESHOLD
+                        ):
+                            logger.info(
+                                "[%s] 押し目到来したが QQQ 地合いフィルタ BLOCKED: QQQ=%+.2f%% < %+.2f%% → 待機継続",
+                                _pb_symbol,
+                                _qqq_change * 100,
+                                settings.QQQ_LONG_BLOCK_THRESHOLD * 100,
+                            )
+                            continue
+
                         # エントリー実行
                         logger.info(
                             "[%s] 押し目到来(vwap_dev=%.2f%% %.0f分後) → エントリー",
@@ -1977,6 +2253,72 @@ async def main_loop() -> None:
                             logger.debug("[%s] in_position_signal 記録失敗（無視）", symbol, exc_info=True)
                         continue
 
+                    # ------------------------------------------------------------
+                    # auto-daytrade shadow hook (8/13 追加、 完全独立)
+                    # 現行の flow / sentiment / SPY_BLOCK / QQQ_BLOCK / AND / tight_filter は
+                    # 一切参照せず、 auto-daytrade §5.2 の判定条件で shadow 記録する。
+                    # 実発注ロジックへの影響ゼロ (read-only 追加)。
+                    #
+                    # 副作用回避:
+                    #   - _record_scan_price は呼ばない (通常フローが後で必ず呼ぶため二重記録防止)
+                    #   - kline は snap ベース条件 (1-4) 通過後に遅延取得 (API コスト削減)
+                    # ------------------------------------------------------------
+                    if settings.AUTODAY_SHADOW_ENABLED:
+                        try:
+                            _ad_etf, _ad_sector_chg = _get_sector_etf_day_chg(symbol)
+                            # 条件 5: セクター ETF 上昇 (snap 取得すら省く早期チェック)
+                            if (
+                                _ad_etf is not None
+                                and _ad_sector_chg is not None
+                                and _ad_sector_chg >= settings.AUTODAY_SECTOR_MIN_CHG_PCT
+                                and _long_autodaytrade_shadow_recorded.get(symbol) != date.today().isoformat()
+                            ):
+                                _ad_snap = client.get_snapshot(symbol)
+                                if _ad_snap and _ad_snap.last_price > 0:
+                                    _ad_entry = _ad_snap.last_price
+                                    _ad_vwap = _ad_snap.best_vwap
+                                    _ad_vol = _ad_snap.volume_ratio or 0
+                                    # snap ベース条件 (1-4) を先にチェック
+                                    if (
+                                        _ad_vwap and _ad_vwap > 0
+                                        # 条件 1: 現在値 > VWAP × min_mult
+                                        and _ad_entry > _ad_vwap * settings.AUTODAY_VWAP_MIN_MULT
+                                        # 条件 3: volume_ratio
+                                        and _ad_vol >= settings.AUTODAY_VOL_RATIO_MIN
+                                    ):
+                                        _ad_vwap_dev = (_ad_entry - _ad_vwap) / _ad_vwap * 100
+                                        # 条件 4: vwap_dev
+                                        if _ad_vwap_dev < settings.AUTODAY_VWAP_MAX_DEV_PCT:
+                                            _ad_momentum = _calc_5bar_momentum(symbol)
+                                            # 条件 2: momentum
+                                            if (
+                                                _ad_momentum is not None
+                                                and _ad_momentum >= settings.AUTODAY_MOMENTUM_MIN_PCT
+                                            ):
+                                                # 全条件通過 → kline 取得して記録
+                                                # flow は shadow 独立記録 (auto-daytrade は判定不使用だが後付け検証用)
+                                                _ad_flow = flow_detector.get_flow_signal(symbol)
+                                                _ad_kline = client.get_kline(symbol)
+                                                await _long_autodaytrade_shadow_record(
+                                                    symbol=symbol,
+                                                    snap=_ad_snap,
+                                                    kline=_ad_kline,
+                                                    stop_loss=stop_loss_manager,
+                                                    sector_etf=_ad_etf,
+                                                    sector_etf_chg=_ad_sector_chg,
+                                                    momentum_5bar_pct=_ad_momentum,
+                                                    vwap=_ad_vwap,
+                                                    vwap_dev_pct=_ad_vwap_dev,
+                                                    flow_direction=_ad_flow.direction,
+                                                    flow_strength=_ad_flow.strength,
+                                                    spy_change=_spy_change,
+                                                    qqq_change=_qqq_change,
+                                                    spy_change_open=_spy_change_open,
+                                                    qqq_change_open=_qqq_change_open,
+                                                )
+                        except Exception:
+                            logger.debug("[AUTODAY SHADOW] %s hook エラー (無視)", symbol, exc_info=True)
+
                     # is_momentum 判定 (シグナル発火後の各フィルタでも参照される)
                     is_momentum = symbol in _momentum_added_symbols
 
@@ -2105,6 +2447,109 @@ async def main_loop() -> None:
                         vwap_str,
                         "ENTRY" if decision.go else f"SKIP({decision.reason[:50]})",
                     )
+
+                    # ------------------------------------------------------------
+                    # Phase 2: Sentiment Bypass Final 案 (8/28 実装)
+                    # AND filter で reject された signal のうち、 以下 3 条件をすべて満たすなら
+                    # sentiment 判定を bypass して LONG 実売する。
+                    #   1) amp >= AMP_MIN (default 4.0%)
+                    #   2) gap < GAP_MAX (default 3.0%)
+                    #   3) cfo < CFO_MAX (default 3.0%)
+                    # 現行実売はそのまま、 これは追加 layer (並列動作)。
+                    # revert: SENTIMENT_BYPASS_FINAL_ENABLED=false で即無効化 (default false)。
+                    # 実測 (shadow n=18): WR 72% avg +$51、 現行実売 avg +$8.75 の 6 倍。
+                    # ------------------------------------------------------------
+                    if (
+                        settings.SENTIMENT_BYPASS_FINAL_ENABLED
+                        and not decision.go
+                        and flow.direction == "BUY"
+                        and flow.strength > settings.FLOW_BUY_THRESHOLD
+                        and not in_open_skip
+                        and not slots_full
+                    ):
+                        _fb_amp = snap.amplitude if snap.amplitude and snap.amplitude > 0 else 0
+                        _fb_gap = snap.gap_pct if snap.gap_pct is not None else 999
+                        _fb_cfo = snap.change_from_open_pct if snap.change_from_open_pct is not None else 999
+                        if (
+                            _fb_amp >= settings.SENTIMENT_BYPASS_AMP_MIN
+                            and _fb_gap < settings.SENTIMENT_BYPASS_GAP_MAX
+                            and _fb_cfo < settings.SENTIMENT_BYPASS_CFO_MAX
+                        ):
+                            # Final 案条件 pass → decision を上書きして実売経路に流す
+                            _final_reason = (
+                                f"[FINAL bypass] amp={_fb_amp:.2f}% gap={_fb_gap:+.2f}% cfo={_fb_cfo:+.2f}% "
+                                f"(sentiment bypass: score={sentiment.score:.2f} conf={sentiment.confidence:.2f})"
+                            )
+                            decision.go = True
+                            decision.direction = "LONG"
+                            decision.reason = _final_reason
+                            logger.info("[%s] 🔀 %s", symbol, _final_reason)
+
+                    # ------------------------------------------------------------
+                    # Shadow (8/4 追加): sentiment 撤廃案の検証用
+                    # AND filter で reject された signal のうち、
+                    # flow=BUY & strength>閾値 で、 tight_filter 通過するなら記録。
+                    # 実発注ロジックには一切影響しない (read-only 追加)。
+                    # in_open_skip / slots_full 時は既に skip/full dryrun が記録するので除外。
+                    # 注: Final 案で bypass された signal は decision.go=True になっているので
+                    # このブロックには入らない (自然に排除される)。
+                    # ------------------------------------------------------------
+                    if (
+                        settings.SHADOW_SENTIMENT_ENABLED
+                        and not decision.go
+                        and flow.direction == "BUY"
+                        and flow.strength > settings.FLOW_BUY_THRESHOLD
+                        and not in_open_skip
+                        and not slots_full
+                        and _long_sentiment_shadow_recorded.get(symbol) != date.today().isoformat()
+                    ):
+                        try:
+                            _shadow_snap = client.get_snapshot(symbol)
+                            _shadow_cp = _shadow_snap.last_price if _shadow_snap else 0.0
+                            if _shadow_cp > 0:
+                                _shadow_kline = client.get_kline(symbol)
+                                _shadow_levels = stop_loss_manager.calculate_levels(
+                                    symbol, _shadow_cp,
+                                    price_history=_shadow_kline, direction="LONG",
+                                )
+                                _shadow_atr_pct = stop_loss_manager.calc_atr_pct(_shadow_kline, _shadow_cp)
+                                _shadow_is_dyn = symbol not in settings.WATCHLIST
+                                _shadow_is_mom = symbol in _momentum_added_symbols
+                                _shadow_tight_pass, _shadow_tight_reason = and_filter.tight_filter_long(
+                                    _shadow_snap, vwap_approx,
+                                    atr_pct=_shadow_atr_pct,
+                                    is_dynamic=_shadow_is_dyn,
+                                    is_momentum=_shadow_is_mom,
+                                )
+                                if _shadow_tight_pass:
+                                    logger.info(
+                                        "[SHADOW %s] AND reject but tight PASS -> record (and_reason=%s)",
+                                        symbol, decision.reason[:40] if decision.reason else "n/a",
+                                    )
+                                    await _long_dryrun_record(
+                                        symbol=symbol,
+                                        sentiment=sentiment,
+                                        flow=flow,
+                                        snap=_shadow_snap,
+                                        vwap_approx=vwap_approx,
+                                        vwap_above=vwap_above,
+                                        levels=_shadow_levels,
+                                        kline=_shadow_kline,
+                                        stop_loss=stop_loss_manager,
+                                        client=client,
+                                        texts_count=len(texts),
+                                        tight_pass=_shadow_tight_pass,
+                                        tight_reason=_shadow_tight_reason,
+                                        dryrun_type="shadow_sent",
+                                        slot_count_at_signal=order_router.long_count,
+                                        spy_change=_spy_change,
+                                        qqq_change=_qqq_change,
+                                        spy_change_open=_spy_change_open,
+                                        qqq_change_open=_qqq_change_open,
+                                        and_reject_reason=(decision.reason[:80] if decision.reason else None),
+                                    )
+                        except Exception:
+                            logger.warning("[SHADOW] %s 記録エラー（無視）", symbol, exc_info=True)
 
                     if decision.go:
                         snapshot = client.get_snapshot(symbol)
@@ -2276,6 +2721,46 @@ async def main_loop() -> None:
                                 texts_count=len(texts),
                                 tight_pass=False,
                                 tight_reason=spy_block_reason,
+                                dryrun_type="rejected",
+                                slot_count_at_signal=order_router.long_count,
+                                spy_change=_spy_change,
+                                qqq_change=_qqq_change,
+                                spy_change_open=_spy_change_open,
+                                qqq_change_open=_qqq_change_open,
+                            )
+                            continue
+
+                        # QQQ 地合いフィルタ: テック弱の日 (QQQ<-0.5%) の LONG エントリーをブロック
+                        # n=30 実売分析 (6/12-7/6): QQQ<-0.5% で 3/3 全敗 net -$94、 うち TSM 7/2 SL -$66.55。
+                        # SPY -0.18% (SPY_BLOCK 通過) だが QQQ -1.39% の局面で LONG 大負けを防ぐ。
+                        if (
+                            decision.direction == "LONG"
+                            and settings.QQQ_LONG_BLOCK_THRESHOLD < 0
+                            and _qqq_change is not None
+                            and _qqq_change < settings.QQQ_LONG_BLOCK_THRESHOLD
+                        ):
+                            qqq_block_reason = (
+                                f"QQQ_BLOCK: QQQ={_qqq_change*100:+.2f}% "
+                                f"< threshold={settings.QQQ_LONG_BLOCK_THRESHOLD*100:+.2f}%"
+                            )
+                            logger.info(
+                                "[%s] QQQ 地合いフィルタ BLOCKED: %s",
+                                symbol, qqq_block_reason,
+                            )
+                            await _long_dryrun_record(
+                                symbol=symbol,
+                                sentiment=sentiment,
+                                flow=flow,
+                                snap=snapshot,
+                                vwap_approx=vwap_approx,
+                                vwap_above=vwap_above,
+                                levels=levels,
+                                kline=kline,
+                                stop_loss=stop_loss_manager,
+                                client=client,
+                                texts_count=len(texts),
+                                tight_pass=False,
+                                tight_reason=qqq_block_reason,
                                 dryrun_type="rejected",
                                 slot_count_at_signal=order_router.long_count,
                                 spy_change=_spy_change,

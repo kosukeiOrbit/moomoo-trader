@@ -50,27 +50,21 @@ MIN_TEXTS_FOR_ANALYSIS: int = 1  # これ未満のテキスト数ではAPI呼び
 #     "UNH",
 # ]
 WATCHLIST = [
-    # 固定 WL は 6/10 整理: 14 → 10 銘柄。
-    # n=153 分析で不調 4 銘柄 (CRWD -$44, CAT -$13, GS -$9, AAPL -$7) を除外。
-    # CRWD/AAPL は動的 WL (Finviz technology セクター) で機会あれば再度拾われる。
-    # GS/CAT は対象外セクター/低 amp で実質取引対象外に。
-    # 6/27 拡張 (10 → 12): LONG 累計勝ち頭 INTC (+$167 / WR 63%) と PANW (+$80 / WR 80%) を追加。
-    # 動的 WL に偶発的に入らない日の機会逸失防止。
-    # ハイテク・グロース
-    "NVDA", "TSLA", "META", "MSFT",
-    # 金融 (JPM のみ残し、 GS 除外)
-    "JPM",
-    # エネルギー
-    "XOM",
-    # ヘルスケア
-    "UNH",
-    # AI/半導体
-    "AVGO",  # AI半導体
-    "PLTR",  # AI・防衛
-    "TSM",   # 半導体製造
-    # 6/27 追加: LONG 累計勝ち頭
-    "INTC",  # n=16 / WR 63% / net +$167 / avg +$10.45 (LONG 累計最強)
-    "PANW",  # n=5 / WR 80% / net +$80 / avg +$16.07 (高 WR)
+    # 8/11 大幅縮小: 12 → 5 銘柄。
+    # 根拠: 実売 n=49 (6/11-8/10) の分析で
+    #   固定 WL: n=17 / net -$53 (実質ゼロ)
+    #   動的 WL: n=32 / net +$558 (圧勝)
+    #   8月除外でも 固定 -$1 vs 動的 +$495 で構造的差
+    # 削除銘柄の理由:
+    #   PLTR (n=3 -$69), TSM (n=3 -$36), AVGO (n=1 -$31), INTC 固定経由 (n=4 -$57) = 実売負け組
+    #   JPM/XOM/UNH = 実売 0 件 (低 amp セクターで対象外)
+    # 残す 5 銘柄の役割:
+    "TSLA",  # 実売 n=3 net +$130 WR 100% = 固定 WL 唯一の稼ぎ頭
+    "NVDA",  # 市場代表、 高流動性、 動く日は必ず動く
+    "META",  # メガテック代表、 ノイズ源にならず
+    "MSFT",  # メガテック代表、 保険的枠 (Finviz で選ばれない日のバックアップ)
+    "PANW",  # 実売 n=2 net+ (+$8)、 サイバーセキュリティで動的 WL に入りにくい
+    # 削除銘柄は動的 WL (Finviz) で拾われれば取引される (INTC は動的経由 n=4 +$115 の実績あり)
 ]
 
 # --- シグナル閾値 ---
@@ -107,7 +101,9 @@ TIGHT_VOL_RATIO_MIN: float = float(os.getenv("TIGHT_VOL_RATIO_MIN", "0.0"))
 TIGHT_GAP_MAX_PCT: float = float(os.getenv("TIGHT_GAP_MAX_PCT", "5.0"))
 TIGHT_PRE_MAX_PCT: float = float(os.getenv("TIGHT_PRE_MAX_PCT", "5.0"))
 TIGHT_OVERHEAT_GUARD_MINUTES: int = int(os.getenv("TIGHT_OVERHEAT_GUARD_MINUTES", "60"))
-# 適用範囲: ET 9:30 から N 分間。 60=10:30まで、 90=11:00まで、 0で常時ON
+# 適用範囲: ET 9:30 から N 分間。 60=10:30まで、 90=11:00まで、 120=11:30まで、 999=常時ON
+# 0 は Filter H を **完全無効化** (過熱ガードなし) 。 常時ON にしたい場合は 999 (or 400 以上) を指定
+# 7/10 修正: 旧コメントで「0で常時ON」 と誤記載していた (実装は `if > 0`)
 
 # --- 暴落日 LONG エントリーブロック (SPY 地合いフィルタ) ---
 # SPY のリアルタイム変動率がこの閾値を下回ったら LONG エントリーをブロック。
@@ -118,6 +114,109 @@ TIGHT_OVERHEAT_GUARD_MINUTES: int = int(os.getenv("TIGHT_OVERHEAT_GUARD_MINUTES"
 # IF 分析で後から測定可能 (tight_reason="SPY_BLOCK:...")。
 # 0 (or 未設定) で無効化。
 SPY_LONG_BLOCK_THRESHOLD: float = float(os.getenv("SPY_LONG_BLOCK_THRESHOLD", "0"))
+
+# --- 暴落日 LONG エントリーブロック (QQQ 地合いフィルタ、 7/8 追加) ---
+# QQQ (テック指数) のリアルタイム変動率がこの閾値を下回ったら LONG エントリーをブロック。
+# n=30 分析 (6/12-7/6 実売): QQQ_rt<-0.5% cohort は WR 0%、 3/3 全敗、 net -$94。
+# うち 1 件 (TSM 7/2) は SL タッチで -$66.55、 この 3 週間の単発最大負け。
+# SPY_BLOCK と AND ではなく OR で判定 (SPY か QQQ どちらか閾値割れば block)。
+# blocked シグナルは long_rejected_dryrun.jsonl に QQQ_BLOCK 理由で記録し、
+# IF 分析で「もし取っていたら」の仮想 pnl を後から評価可能。
+# 0 (or 未設定) で無効化。 -0.005 = -0.5%
+QQQ_LONG_BLOCK_THRESHOLD: float = float(os.getenv("QQQ_LONG_BLOCK_THRESHOLD", "0"))
+
+# --- Shadow: sentiment 撤廃案 の検証用 (8/4 追加) ---
+# true にすると、 AND filter で reject された signal のうち
+# 「flow=BUY & strength>0.65 & tight_filter 通過」 する signal を
+# data/long_sentiment_shadow_dryrun.jsonl に shadow 記録する。
+# 実発注 (実運用) には**一切影響しない** (read-only 追加)。
+# 蓄積後、 「sentiment 撤廃した場合の想定 net」 を Phase 2 で検証する。
+# false で機能無効化 (デフォルト false = 安全側)。
+SHADOW_SENTIMENT_ENABLED: bool = os.getenv("SHADOW_SENTIMENT_ENABLED", "false").lower() == "true"
+
+# --- Phase 2: Sentiment Bypass Final 案 (8/28 実装) ---
+# shadow n=80 分析で発見した勝ちパターンを実売化する追加 layer。
+# 現行 AND filter (sentiment>0.6 & confidence>0.7) で reject された signal のうち、
+# 以下の 3 条件をすべて満たす場合は sentiment 判定を bypass して実売する:
+#   1) amp >= AMP_MIN (default 4.0%) — 十分な値動き
+#   2) gap < GAP_MAX (default 3.0%) — 過熱 gap up 除外
+#   3) cfo < CFO_MAX (default 3.0%) — 寄からの過熱除外
+# 現行実売 (sentiment 通過) はそのまま並列動作、 shadow 記録も継続。
+# revert: `SENTIMENT_BYPASS_FINAL_ENABLED=false` で即座に無効化 (default false = 安全)。
+# 実測データ (shadow n=18 で WR 72% avg +$51、 現行実売 avg +$8.75 の 6 倍)。
+SENTIMENT_BYPASS_FINAL_ENABLED: bool = os.getenv("SENTIMENT_BYPASS_FINAL_ENABLED", "false").lower() == "true"
+SENTIMENT_BYPASS_AMP_MIN: float = float(os.getenv("SENTIMENT_BYPASS_AMP_MIN", "4.0"))
+SENTIMENT_BYPASS_GAP_MAX: float = float(os.getenv("SENTIMENT_BYPASS_GAP_MAX", "3.0"))
+SENTIMENT_BYPASS_CFO_MAX: float = float(os.getenv("SENTIMENT_BYPASS_CFO_MAX", "3.0"))
+
+# --- auto-daytrade 方針 shadow (8/13 追加、 別プロジェクト検証案) ---
+# 別プロジェクト (auto-daytrade、 日本株 kabu 経由) の Pattern B ロング L1 が
+# WR 79% で成功しているため、 その判定条件を米国株に移植して shadow 記録する。
+# 判定条件 (auto-daytrade §5.1 + §5.2):
+#   1) 現在値 > VWAP × 1.002 (VWAP 直上・押し目後の反発)
+#   2) 直近5サンプル (~2.5分) で +0.3% 上昇 (モメンタム)
+#   3) volume_ratio >= 2.0 (出来高急増)
+#   4) VWAP 乖離 < +1.0% (押し目〜ちょい高)
+#   5) セクター ETF (XLK/XLC 等) 当日変動 >= +1.0% (業種上昇日のみ)
+# 現行の flow / sentiment / SPY_BLOCK / QQQ_BLOCK / AND filter / tight_filter は
+# **すべて無視** (auto-daytrade 準拠)、 全銘柄で毎スキャン判定。
+# 実発注ロジックには**一切影響しない** (read-only 追加、 完全独立 shadow)。
+# 蓄積目標: n=30-50 (1-2 週間)、 avg net が現行実売 (avg +$10) を超えるか検証。
+# false で機能無効化 (デフォルト false = 安全側)。
+AUTODAY_SHADOW_ENABLED: bool = os.getenv("AUTODAY_SHADOW_ENABLED", "false").lower() == "true"
+AUTODAY_SECTOR_MIN_CHG_PCT: float = float(os.getenv("AUTODAY_SECTOR_MIN_CHG_PCT", "1.0"))    # セクター ETF 上昇率 >= この値
+AUTODAY_VWAP_MAX_DEV_PCT: float = float(os.getenv("AUTODAY_VWAP_MAX_DEV_PCT", "1.0"))         # VWAP 乖離 < この値
+AUTODAY_VWAP_MIN_MULT: float = float(os.getenv("AUTODAY_VWAP_MIN_MULT", "1.002"))             # 現在値 > VWAP × この倍率
+AUTODAY_MOMENTUM_MIN_PCT: float = float(os.getenv("AUTODAY_MOMENTUM_MIN_PCT", "0.3"))         # 直近5サンプル差 >= この値
+AUTODAY_VOL_RATIO_MIN: float = float(os.getenv("AUTODAY_VOL_RATIO_MIN", "2.0"))               # volume_ratio >= この値
+AUTODAY_SECTOR_ETF_CACHE_SEC: int = int(os.getenv("AUTODAY_SECTOR_ETF_CACHE_SEC", "600"))     # セクター ETF キャッシュ秒数 (default 10 分)
+
+# 銘柄 → GICS セクター ETF マッピング
+# 主要な現行 WL 銘柄 + 過去 dryrun 出現銘柄をカバー
+# 未マッピング銘柄は shadow 判定不能扱いでスキップされる
+GICS_SECTOR_ETF: dict[str, str] = {
+    # Technology (XLK)
+    "NVDA": "XLK", "MSFT": "XLK", "AVGO": "XLK", "PANW": "XLK", "CRWD": "XLK",
+    "DELL": "XLK", "AMD": "XLK", "MU": "XLK", "INTC": "XLK", "ADBE": "XLK",
+    "SMCI": "XLK", "IBM": "XLK", "ORCL": "XLK", "SNPS": "XLK", "CDNS": "XLK",
+    "PTC": "XLK", "AMAT": "XLK", "KLAC": "XLK", "LRCX": "XLK", "TSM": "XLK",
+    "QCOM": "XLK", "DDOG": "XLK", "FTNT": "XLK", "INTU": "XLK", "WDAY": "XLK",
+    "NOW": "XLK", "ADSK": "XLK", "GLW": "XLK", "WDC": "XLK", "STX": "XLK",
+    "SNDK": "XLK", "LITE": "XLK", "APH": "XLK", "TXN": "XLK", "CSCO": "XLK",
+    "COHR": "XLK", "NTAP": "XLK", "FSLR": "XLK", "MRVL": "XLK", "APP": "XLK",
+    "TER": "XLK", "KEYS": "XLK", "JBL": "XLK", "FLEX": "XLK", "ANET": "XLK",
+    "ZBRA": "XLK", "MPWR": "XLK", "MSI": "XLK", "MCHP": "XLK", "HPE": "XLK",
+    "TYL": "XLK",
+    # 8/19 追加 (今日の動的 WL の未マップ分)
+    "AAPL": "XLK",  # Apple, Info Tech
+    "PLTR": "XLK",  # Palantir, IT/Software
+    "CIEN": "XLK",  # Ciena, Communications Equipment (GICS IT)
+    # 8/21 追加 (5 セクター拡張後の動的 WL の未マップ分)
+    "CRM": "XLK",   # Salesforce, Software
+    "ADI": "XLK",   # Analog Devices, 半導体
+    "CDW": "XLK",   # CDW Corp, Tech distribution
+    "AKAM": "XLK",  # Akamai, CDN/Security
+    # Communication Services (XLC)
+    "META": "XLC", "GOOG": "XLC", "GOOGL": "XLC", "NFLX": "XLC", "DIS": "XLC",
+    "CMCSA": "XLC", "TMUS": "XLC", "WBD": "XLC", "CHTR": "XLC", "TTD": "XLC",
+    "TTWO": "XLC", "EA": "XLC", "LYV": "XLC", "OMC": "XLC", "MELI": "XLC",
+    "SATS": "XLC",
+    "FOX": "XLC",  # 8/19 追加: Fox Corp, Communication Services
+    # Consumer Discretionary (XLY)
+    "TSLA": "XLY", "UBER": "XLY", "MRNA": "XLY",
+    # Financials (XLF)
+    "JPM": "XLF", "PAYX": "XLF", "ADP": "XLF", "JKHY": "XLF", "GPN": "XLF",
+    "CPAY": "XLF", "FIS": "XLF",
+    "XYZ": "XLF",  # 8/19 追加: Block Inc (旧 Square), Financials/Fintech
+    "BR": "XLF",   # 8/21 追加: Broadridge, Financial data services
+    # Health Care (XLV)
+    "UNH": "XLV", "BMY": "XLV", "BAX": "XLV", "MRK": "XLV", "GILD": "XLV",
+    "CVS": "XLV", "ABT": "XLV", "BSX": "XLV",
+    # Energy (XLE)
+    "XOM": "XLE",
+    # Industrials (XLI)
+    "ROP": "XLI", "ECHO": "XLI",
+}
 
 # --- 押し目待ち (Pullback Wait) ---
 PULLBACK_ENABLED: bool = os.getenv("PULLBACK_ENABLED", "true").lower() == "true"

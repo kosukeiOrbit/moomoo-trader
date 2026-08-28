@@ -21,6 +21,8 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import requests
+
 # プロジェクトルートを sys.path に追加
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
@@ -59,11 +61,26 @@ EXCLUDE_SYMBOLS = {
 }
 
 # スクリーニング対象セクター（Finviz フィルタキー）
+# 8/19 再拡張: 2 → 5 セクター (auto-daytrade shadow データ拡充のため)
+# 目的: shadow 検証を「業種上昇日 = LONG」 の auto-daytrade 哲学どおり全業種で検証したい。
+#   XLK 下落日でも XLV/XLY/XLF が上昇していれば対応銘柄で shadow 発火させたい。
+# 実発注リスクの想定: 現行 Filter F (amp>=3.5%) / AND filter (sentiment>0.6) が
+#   strict なので、 defensive セクター銘柄の実売すり抜けは限定的な想定。
+# revert 基準: 1-2 週間運用で以下発生時に 2 セクターに戻す:
+#   - defensive セクター銘柄 (consumer / healthcare / financial の non-tech) で
+#     実売 n>=3 の負け発生 → 8/11 削減の再現と判断
+#   - shadow の tech/comm 中心の signal 数が有意に減る (対象銘柄が薄まる)
+# 8/11 縮小時の根拠 (動的 WL 由来 dryrun+実売 n=217):
+#   consumer (communication) : n=10 net -$200 avg -$19.99 ← 主に CMCSA/DIS/WBD 由来
+#   healthcare               : n=4 net -$22 (n 小)
+#   financial                : 実売 0 件 (低 amp で AND filter 通らず)
+# ↑ このパターンが再現するか観察しつつ、 shadow データを蓄積する
 TARGET_SECTORS = [
     "sec_technology",
     "sec_communicationservices",
-    "sec_healthcare",
-    "sec_financial",
+    "sec_healthcare",              # 8/19 再追加 (shadow 用、 XLV 上昇日カバー)
+    "sec_financial",               # 8/19 再追加 (shadow 用、 XLF カバー)
+    "sec_consumercyclical",        # 8/19 新規 (shadow 用、 XLY = Consumer Discretionary カバー)
 ]
 
 
@@ -119,7 +136,20 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
                     table="Overview",
                     order="-volume",
                 )
-                tickers = [s["Ticker"] for s in stocks if s["Ticker"] not in EXCLUDE_SYMBOLS]
+                # 7/23 修正: Finviz の HTML カラム構造変更で全カラムが 1 個ずつシフト。
+                # 旧: s["Ticker"] が実 Ticker → 現在は先頭 1 文字 (例: SMCI→'S', NVDA→'N')
+                # 新: s["Company"] に実 Ticker が入る (7/22 手動確認済み)
+                # safety net: 単文字 (旧バグ) や空文字は除外
+                tickers = []
+                for s in stocks:
+                    t = s.get("Company", "").strip()
+                    if not t or len(t) < 2:
+                        continue  # 1 文字以下は Ticker として無効
+                    if not t.replace(".", "").replace("-", "").isalnum():
+                        continue  # 記号混入等の異常データ除外
+                    if t in EXCLUDE_SYMBOLS:
+                        continue
+                    tickers.append(t)
                 logger.info("[Screener] Finviz %s: %d銘柄", sector, len(tickers))
                 all_tickers.extend(tickers)
             except Exception:
@@ -245,6 +275,83 @@ def save_results(symbols: list[str]) -> None:
     logger.info("[Screener] 保存: %s (%d銘柄)", OUTPUT_PATH, len(symbols))
 
 
+# ---------------------------------------------------------------------------
+# リトライ + Discord アラート (7/25 追加)
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES = 3           # Finviz 取得試行回数 (最初 + リトライ 2 回)
+RETRY_BACKOFF_SEC = 60    # 60秒 → 120秒 → (打ち止め) の指数バックオフ
+
+
+def send_alert(msg: str) -> None:
+    """screener 失敗時に Discord アラート送信.
+
+    DISCORD_WEBHOOK_ALERT が未設定なら何もしない。
+    送信自体の失敗はログに残すのみで screener の処理は継続。
+    """
+    webhook = settings.DISCORD_WEBHOOK_ALERT
+    if not webhook:
+        logger.warning("[Screener] DISCORD_WEBHOOK_ALERT 未設定、 通知スキップ")
+        return
+    payload = {
+        "embeds": [{
+            "title": "⚠️ Screener 失敗",
+            "description": msg,
+            "color": 0xE74C3C,  # 赤
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "footer": {"text": "moomoo-trader screener"},
+        }],
+    }
+    try:
+        r = requests.post(webhook, json=payload, timeout=10)
+        if r.status_code in (200, 204):
+            logger.info("[Screener] Discord アラート送信成功")
+        else:
+            logger.error(
+                "[Screener] Discord アラート送信失敗: status=%d body=%s",
+                r.status_code, r.text[:200],
+            )
+    except Exception:
+        logger.exception("[Screener] Discord アラート送信例外 (screener は継続)")
+
+
+def fetch_with_retry(n: int) -> tuple[list[str], str | None]:
+    """Finviz 取得をリトライ付きで実行.
+
+    Returns:
+        (候補リスト, 最終エラーメッセージ or None)
+        成功時: (候補リスト, None)
+        全失敗時: ([], エラーメッセージ)
+    """
+    last_error: str | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            candidates = fetch_finviz_candidates(n=n)
+            if candidates:
+                if attempt > 1:
+                    logger.info("[Screener] リトライ %d/%d で成功", attempt, MAX_RETRIES)
+                return candidates, None
+            last_error = "Finviz が空リストを返した (dedup 後 0 銘柄)"
+            logger.warning(
+                "[Screener] 試行 %d/%d: 空リスト — リトライ",
+                attempt, MAX_RETRIES,
+            )
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "[Screener] 試行 %d/%d 失敗: %s — リトライ",
+                attempt, MAX_RETRIES, last_error,
+            )
+
+        if attempt < MAX_RETRIES:
+            backoff = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
+            logger.info("[Screener] %d 秒待って再試行 (attempt %d/%d)",
+                        backoff, attempt + 1, MAX_RETRIES)
+            time.sleep(backoff)
+
+    return [], last_error
+
+
 def main() -> None:
     """メイン処理."""
     logger.info("=" * 50)
@@ -253,11 +360,30 @@ def main() -> None:
 
     max_symbols = settings.SCREENER_MAX_SYMBOLS
 
-    # 1) Finviz で候補取得
-    candidates = fetch_finviz_candidates(n=settings.SCREENER_CANDIDATES)
+    # 1) Finviz で候補取得 (最大 MAX_RETRIES 回リトライ)
+    candidates, err = fetch_with_retry(n=settings.SCREENER_CANDIDATES)
     if not candidates:
-        logger.warning("[Screener] Finviz 取得失敗 — 空の結果を保存")
-        save_results([])
+        # 全リトライ失敗: 既存 watchlist_dynamic.json を保持 (空で上書きしない)
+        logger.error("[Screener] 全 %d 回リトライ失敗、 既存 watchlist_dynamic.json を保持", MAX_RETRIES)
+        existing_info = "(既存 file なし)"
+        if OUTPUT_PATH.exists():
+            try:
+                existing = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
+                existing_n = len(existing.get("symbols", []))
+                existing_gen = existing.get("generated_at", "?")
+                existing_info = f"{existing_n} 銘柄 (generated_at={existing_gen})"
+                logger.info("[Screener] 既存 watchlist_dynamic.json: %s", existing_info)
+            except Exception:
+                logger.exception("[Screener] 既存 file 読取エラー")
+                existing_info = "(既存 file 読取エラー)"
+        # Discord アラート送信
+        alert_msg = (
+            f"**Screener 全 {MAX_RETRIES} 回リトライ失敗**\n"
+            f"最終エラー: `{err or 'unknown'}`\n"
+            f"既存 watchlist_dynamic.json: {existing_info}\n"
+            f"→ 次回 bot 起動時は上記の既存 (or 空) WATCHLIST で稼働"
+        )
+        send_alert(alert_msg)
         return
 
     # 2) moomoo でスコアリング
