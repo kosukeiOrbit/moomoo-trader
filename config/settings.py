@@ -196,6 +196,9 @@ GICS_SECTOR_ETF: dict[str, str] = {
     "ADI": "XLK",   # Analog Devices, 半導体
     "CDW": "XLK",   # CDW Corp, Tech distribution
     "AKAM": "XLK",  # Akamai, CDN/Security
+    # 8/28 追加 (新スクリーナー動的 WL の未マップ分)
+    "HPQ": "XLK",   # HP Inc, Tech Hardware
+    "CTSH": "XLK",  # Cognizant Tech Solutions, IT Services
     # Communication Services (XLC)
     "META": "XLC", "GOOG": "XLC", "GOOGL": "XLC", "NFLX": "XLC", "DIS": "XLC",
     "CMCSA": "XLC", "TMUS": "XLC", "WBD": "XLC", "CHTR": "XLC", "TTD": "XLC",
@@ -212,6 +215,7 @@ GICS_SECTOR_ETF: dict[str, str] = {
     # Health Care (XLV)
     "UNH": "XLV", "BMY": "XLV", "BAX": "XLV", "MRK": "XLV", "GILD": "XLV",
     "CVS": "XLV", "ABT": "XLV", "BSX": "XLV",
+    "PFE": "XLV",  # 8/28 追加: Pfizer, 医薬品
     # Energy (XLE)
     "XOM": "XLE",
     # Industrials (XLI)

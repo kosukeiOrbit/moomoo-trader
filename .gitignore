@@ -65,6 +65,12 @@ data/filter_d_log.jsonl
 data/in_position_signal.jsonl
 data/scan_price_log.jsonl
 data/a1a3_block_log.jsonl
+data/long_sentiment_shadow_dryrun.jsonl
+data/long_autodaytrade_shadow.jsonl
+data/dynamic_sector_map.json
+data/*_intraday.jsonl
+data/_backup_*/
+data/watchlist_dynamic copy.json
 
 # Old log archives
 logs/old/

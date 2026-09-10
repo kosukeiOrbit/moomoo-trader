@@ -50,6 +50,26 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(_project_root) / "data"
 OUTPUT_PATH = DATA_DIR / "watchlist_dynamic.json"
 CANDIDATES_PATH = DATA_DIR / "momentum_candidates.json"
+# 8/28 追加: Finviz スクリーニング時に銘柄→GICS セクター ETF の動的マップを生成
+# main.py が起動時に読み込んで静的 GICS_SECTOR_ETF (settings.py) にマージ、
+# 未マップ銘柄をゼロにする恒久対策
+SECTOR_MAP_PATH = DATA_DIR / "dynamic_sector_map.json"
+
+# Finviz sector フィルタキー → SPDR セクター ETF のマッピング
+# スクリーナーが銘柄取得時に自動でセクターを判定するために使用
+FINVIZ_SECTOR_TO_ETF: dict[str, str] = {
+    "sec_technology": "XLK",
+    "sec_communicationservices": "XLC",
+    "sec_healthcare": "XLV",
+    "sec_financial": "XLF",
+    "sec_consumercyclical": "XLY",       # Consumer Discretionary
+    "sec_consumerdefensive": "XLP",      # Consumer Staples (現状 TARGET_SECTORS に無し、 将来用)
+    "sec_industrials": "XLI",
+    "sec_energy": "XLE",
+    "sec_basicmaterials": "XLB",
+    "sec_realestate": "XLRE",
+    "sec_utilities": "XLU",
+}
 
 # 除外リスト（低ボラ・AI無関係・投機的銘柄）
 EXCLUDE_SYMBOLS = {
@@ -82,6 +102,30 @@ TARGET_SECTORS = [
     "sec_financial",               # 8/19 再追加 (shadow 用、 XLF カバー)
     "sec_consumercyclical",        # 8/19 新規 (shadow 用、 XLY = Consumer Discretionary カバー)
 ]
+
+# 8/28 追加: スクリーニング中に蓄積する銘柄→ETF マップ (fetch_finviz_candidates が書き込み)
+_sector_map: dict[str, str] = {}
+
+
+def save_sector_map() -> None:
+    """スクリーニング中に蓄積した銘柄→ETF マップを保存.
+
+    main.py が起動時に読み込んで静的 GICS_SECTOR_ETF (settings.py) にマージする。
+    これにより Finviz が新規銘柄を選ぶたびに発生していた「未マップ」 問題を恒久解消。
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "sector_map": _sector_map,
+        }
+        SECTOR_MAP_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info(
+            "[Screener] 動的 sector map 保存: %s (%d 銘柄)",
+            SECTOR_MAP_PATH, len(_sector_map),
+        )
+    except Exception:
+        logger.exception("[Screener] sector map 保存失敗")
 
 
 def get_previous_trading_day() -> date:
@@ -116,6 +160,10 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
 
     テクノロジー・通信・ヘルスケア・金融の4セクターを個別にフェッチし、
     出来高順で統合して上位N件を返す。
+
+    副作用: 銘柄→GICS セクター ETF の動的マップを `_sector_map` に蓄積し、
+    save_results 呼び出し時に data/dynamic_sector_map.json に保存する
+    (8/28 追加、 未マップ銘柄ゼロの恒久対策)。
     """
     try:
         from finviz.screener import Screener
@@ -130,6 +178,13 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
 
         all_tickers: list[str] = []
         for sector in TARGET_SECTORS:
+            # 8/28 追加: このセクターの ETF を判定 (未定義なら None)
+            etf = FINVIZ_SECTOR_TO_ETF.get(sector)
+            if not etf:
+                logger.warning(
+                    "[Screener] Finviz sector %s に ETF マッピングなし、 dynamic_sector_map から除外",
+                    sector,
+                )
             try:
                 stocks = Screener(
                     filters=base_filters + [sector],
@@ -150,7 +205,11 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
                     if t in EXCLUDE_SYMBOLS:
                         continue
                     tickers.append(t)
-                logger.info("[Screener] Finviz %s: %d銘柄", sector, len(tickers))
+                    # 8/28 追加: 動的 sector map に登録 (Finviz 由来の権威データ)
+                    if etf:
+                        _sector_map[t] = etf
+                logger.info("[Screener] Finviz %s (%s): %d銘柄",
+                            sector, etf or "no-etf", len(tickers))
                 all_tickers.extend(tickers)
             except Exception:
                 logger.warning("[Screener] Finviz %s 取得失敗", sector)
@@ -165,7 +224,10 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
                 candidates.append(t)
 
         candidates = candidates[:n]
-        logger.info("[Screener] Finviz 合計: %d銘柄 (4セクター)", len(candidates))
+        logger.info(
+            "[Screener] Finviz 合計: %d銘柄 (%d セクター、 sector_map %d 銘柄)",
+            len(candidates), len(TARGET_SECTORS), len(_sector_map),
+        )
         return candidates
 
     except ImportError:
@@ -400,6 +462,8 @@ def main() -> None:
 
     # 3) 保存
     save_results(top_symbols)
+    # 8/28 追加: 動的 sector map を保存 (未マップ問題の恒久対策)
+    save_sector_map()
 
     # 候補銘柄リスト (絞り込み前の全件) をモメンタム検知用に保存
     candidates_output = {

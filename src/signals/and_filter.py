@@ -25,6 +25,11 @@ class EntryDecision:
     sentiment_score: float = 0.0
     flow_strength: float = 0.0
     reason: str = ""
+    # 8/28 追加: Phase 2 Sentiment Bypass Final 案経由フラグ
+    # True の場合、 SPY_BLOCK / QQQ_BLOCK 判定を bypass する (Final 案の shadow n=6 で
+    # QQQ<-0.5% 対象日でも WR 83% avg +$66 の勝ちパターン発見のため、 地合いガードを外す)。
+    # 現行 AND filter 経由の signal は False のまま (現行の実売分析 n=30 3/3 全敗 evidence 尊重)。
+    is_final_bypass: bool = False
 
 
 class AndFilter:

@@ -775,6 +775,24 @@ _LONG_AUTODAYTRADE_SHADOW_PATH = Path(_project_root) / "data" / "long_autodaytra
 # {etf_symbol: {"day_chg_pct": float, "fetched_at": datetime, "open_price": float}}
 _sector_etf_context: dict[str, dict] = {}
 
+# 8/28 追加: 動的 sector map (screener.py がスクリーニング時に自動生成)
+# main.py 起動時に load、 _get_sector_etf_day_chg が静的 GICS_SECTOR_ETF (settings.py) の
+# フォールバック参照先として使う → 未マップ銘柄問題の恒久解消。
+_dynamic_sector_map: dict[str, str] = {}
+_DYNAMIC_SECTOR_MAP_PATH = Path(_project_root) / "data" / "dynamic_sector_map.json"
+
+
+def _load_dynamic_sector_map() -> dict[str, str]:
+    """screener.py が生成した動的 sector map を読み込む."""
+    try:
+        if not _DYNAMIC_SECTOR_MAP_PATH.exists():
+            return {}
+        payload = _json.loads(_DYNAMIC_SECTOR_MAP_PATH.read_text(encoding="utf-8"))
+        return payload.get("sector_map", {}) or {}
+    except Exception:
+        logger.warning("[AUTODAY] 動的 sector map 読込失敗", exc_info=True)
+        return {}
+
 # 押し目待ちキュー: vwap_dev > PULLBACK_VWAP_ENTRY_PCT で発火した銘柄を保持
 # {symbol: {fired_at, decision, sentiment, vwap_price, kline, texts_count,
 #           entry_price_at_signal, min_vwap_dev}}
@@ -1085,6 +1103,20 @@ async def _long_dryrun_record(
 
         # 方向情報 (6/17 Idea B: _price_history deque から計算)
         _d5_long, _d15_long, _vel_long = _calc_direction_from_history(symbol)
+
+        # 前営業日騰落率 (8/28 追加、 shadow n=80 事後分析で発見した勝ちパターン軸)
+        # kline (K_DAY) の直近 2 本から計算 = (前日 close - 前々日 close) / 前々日 close × 100
+        prev_day_change_pct = None
+        if kline is not None:
+            try:
+                if len(kline) >= 2:
+                    _pd_close = float(kline["close"].iloc[-1])
+                    _pd_prev = float(kline["close"].iloc[-2])
+                    if _pd_prev > 0:
+                        prev_day_change_pct = (_pd_close - _pd_prev) / _pd_prev * 100
+            except Exception:
+                pass
+
         recorded_dict[symbol] = today
         record = {
             "date": today,
@@ -1120,6 +1152,12 @@ async def _long_dryrun_record(
             "price_position_in_range": round(snap.price_position_in_range, 3) if snap.price_position_in_range is not None else None,
             "amplitude": round(snap.amplitude, 3) if snap.amplitude > 0 else None,
             "pre_change_rate": round(snap.pre_change_rate, 3),
+            # 8/28 追加: アフターマーケット変化率 (前日 close → 前日アフター終値)
+            # snapshot に既存フィールド、 前日夜間の材料反応を捕捉
+            "after_change_rate": round(snap.after_change_rate, 3),
+            # 8/28 追加: 前営業日騰落率 (kline から計算、 事後分析で発見した勝ちパターン軸)
+            # shadow n=80 分析: Final 案通過分では前日 +1〜+3% で WR 80%、 +5%+ は罠
+            "prev_day_change_pct": round(prev_day_change_pct, 3) if prev_day_change_pct is not None else None,
             "volume_ratio": round(snap.volume_ratio, 3) if snap.volume_ratio > 0 else None,
             # tight filter 評価結果 (IF分析用)
             "tight_filter_pass": tight_pass,
@@ -1321,8 +1359,15 @@ def _update_sector_etf_context(client) -> None:
 
 
 def _get_sector_etf_day_chg(symbol: str) -> tuple[str | None, float | None]:
-    """銘柄 → (対応セクター ETF、 当日変動%)"""
+    """銘柄 → (対応セクター ETF、 当日変動%).
+
+    8/28 追加: 静的 GICS_SECTOR_ETF (settings.py) → 動的 sector map
+    (screener.py が生成) の順で参照。 未マップ銘柄をゼロにする恒久対策。
+    """
     etf = settings.GICS_SECTOR_ETF.get(symbol)
+    if not etf:
+        # フォールバック: screener 由来の動的 map
+        etf = _dynamic_sector_map.get(symbol)
     if not etf:
         return (None, None)
     ctx = _sector_etf_context.get(etf)
@@ -1398,6 +1443,19 @@ async def _long_autodaytrade_shadow_record(
                 pass
         prev_close = snap.prev_close if snap.prev_close > 0 else None
 
+        # 前営業日騰落率 (8/28 追加、 shadow n=80 事後分析で発見した勝ちパターン軸)
+        # kline (K_DAY) の直近 2 本から (前日 close - 前々日 close) / 前々日 close
+        prev_day_change_pct = None
+        if kline is not None:
+            try:
+                if len(kline) >= 2:
+                    _pd_close = float(kline["close"].iloc[-1])
+                    _pd_prev = float(kline["close"].iloc[-2])
+                    if _pd_prev > 0:
+                        prev_day_change_pct = (_pd_close - _pd_prev) / _pd_prev * 100
+            except Exception:
+                pass
+
         # direction 情報 (Idea B: _price_history deque から)
         _d5, _d15, _vel = _calc_direction_from_history(symbol)
 
@@ -1430,6 +1488,10 @@ async def _long_autodaytrade_shadow_record(
             "amplitude": round(snap.amplitude, 3) if snap.amplitude > 0 else None,
             "change_from_open_pct": round(cfo, 3) if cfo is not None else None,
             "pre_change_rate": round(snap.pre_change_rate, 3),
+            # 8/28 追加: アフターマーケット変化率 (前日 close → 前日アフター終値)
+            "after_change_rate": round(snap.after_change_rate, 3),
+            # 8/28 追加: 前営業日騰落率 (kline から計算、 shadow n=80 事後分析で発見)
+            "prev_day_change_pct": round(prev_day_change_pct, 3) if prev_day_change_pct is not None else None,
             "price_position_in_range": round(snap.price_position_in_range, 3) if snap.price_position_in_range is not None else None,
             "atr_pct": round(atr_pct, 4) if atr_pct is not None else None,
             "is_dynamic": symbol not in settings.WATCHLIST,
@@ -1624,6 +1686,24 @@ async def main_loop() -> None:
                 "WATCHLIST: %d symbols (fixed=%d + dynamic=%d)",
                 len(watchlist), len(settings.WATCHLIST), len(new_symbols),
             )
+            # 8/28 追加: 動的 sector map をロード (未マップ問題の恒久対策)
+            global _dynamic_sector_map
+            _dynamic_sector_map = _load_dynamic_sector_map()
+            # 未マップ検知: 動的 WL 銘柄で静的 GICS_SECTOR_ETF にも動的 map にも無い銘柄を警告
+            _unmapped = [
+                s for s in watchlist
+                if s not in settings.GICS_SECTOR_ETF and s not in _dynamic_sector_map
+            ]
+            if _unmapped:
+                logger.warning(
+                    "[AUTODAY] 未マップ銘柄 %d 件: %s (shadow 判定対象外)",
+                    len(_unmapped), _unmapped,
+                )
+            else:
+                logger.info(
+                    "[AUTODAY] セクター マッピング完備: %d 銘柄 (静的 %d + 動的 %d)",
+                    len(watchlist), len(settings.GICS_SECTOR_ETF), len(_dynamic_sector_map),
+                )
         except Exception:
             logger.exception("[Screener] Failed — using fixed WATCHLIST only")
 
@@ -1887,7 +1967,10 @@ async def main_loop() -> None:
                 )
             elif scan_skip_for_full:
                 skip_reason = f"LONG_MAX_POSITIONS({settings.LONG_MAX_POSITIONS}) reached"
-            elif buying_power < settings.MIN_BUYING_POWER:
+            elif buying_power < settings.MIN_BUYING_POWER and not (slots_full and settings.LONG_FULL_DRY_RUN):
+                # 9/1 修正: 満杯 + LONG_FULL_DRY_RUN=true 時は scan 継続 (機会損失を shadow 記録)
+                # 満杯 → 買付余力は使い切っている状態が多いが、 分析データ蓄積のため scan は動かす
+                # 実発注は slots_full チェック (`if decision.go:` 内) で必ずブロックされるので安全
                 skip_reason = f"Insufficient buying power (${buying_power:.0f} < ${settings.MIN_BUYING_POWER})"
 
             if skip_reason:
@@ -2483,6 +2566,8 @@ async def main_loop() -> None:
                             decision.go = True
                             decision.direction = "LONG"
                             decision.reason = _final_reason
+                            # 8/28 追加: SPY/QQQ BLOCK バイパスフラグ (shadow n=6 で QQQ<-0.5% でも WR 83%)
+                            decision.is_final_bypass = True
                             logger.info("[%s] 🔀 %s", symbol, _final_reason)
 
                     # ------------------------------------------------------------
@@ -2693,8 +2778,10 @@ async def main_loop() -> None:
                         # SPY <-0.5% で SL ヒット率 80%+ (n=62 分析) のため、 暴落中は LONG 控える。
                         # blocked シグナルは rejected dryrun に記録し、 「もし入っていたら」 の
                         # 仮想 pnl を後から評価可能にする (リバウンド取りこぼしの IF 分析)。
+                        # 8/28: Final 案 (Phase 2) 経由の signal は bypass (shadow n=6 で QQQ<-0.5% でも WR 83%)
                         if (
                             decision.direction == "LONG"
+                            and not decision.is_final_bypass
                             and settings.SPY_LONG_BLOCK_THRESHOLD < 0
                             and _spy_change is not None
                             and _spy_change < settings.SPY_LONG_BLOCK_THRESHOLD
@@ -2733,8 +2820,10 @@ async def main_loop() -> None:
                         # QQQ 地合いフィルタ: テック弱の日 (QQQ<-0.5%) の LONG エントリーをブロック
                         # n=30 実売分析 (6/12-7/6): QQQ<-0.5% で 3/3 全敗 net -$94、 うち TSM 7/2 SL -$66.55。
                         # SPY -0.18% (SPY_BLOCK 通過) だが QQQ -1.39% の局面で LONG 大負けを防ぐ。
+                        # 8/28: Final 案 (Phase 2) 経由の signal は bypass (shadow n=6 で QQQ<-0.5% でも WR 83%)
                         if (
                             decision.direction == "LONG"
+                            and not decision.is_final_bypass
                             and settings.QQQ_LONG_BLOCK_THRESHOLD < 0
                             and _qqq_change is not None
                             and _qqq_change < settings.QQQ_LONG_BLOCK_THRESHOLD
