@@ -2411,6 +2411,11 @@ async def main_loop() -> None:
                         continue
 
                     # 1) フロー先行取得（API不要・低コスト）
+                    # get_capital_flow はリクエスト頻度に上限があり、詰めて呼ぶと ret=-1 で
+                    # 落ちて flow=NEUTRAL になり、その銘柄が丸ごとスキップされる。
+                    # await で譲るので monitor_positions() の SL/TP 監視は止まらない。
+                    if settings.FLOW_FETCH_INTERVAL_SEC > 0:
+                        await asyncio.sleep(settings.FLOW_FETCH_INTERVAL_SEC)
                     flow = flow_detector.get_flow_signal(symbol)
 
                     # 2) flow=NEUTRAL ならスキップ（BUY/SELL のみ処理）
