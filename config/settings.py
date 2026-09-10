@@ -329,6 +329,17 @@ SCREENER_MAX_SYMBOLS: int = int(os.getenv("SCREENER_MAX_SYMBOLS", "10"))
 SCREENER_CANDIDATES: int = int(os.getenv("SCREENER_CANDIDATES", "100"))  # モメンタム検知用候補プールも兼ねるので拡大
 SCREENER_MAX_DROP_PCT: float = float(os.getenv("SCREENER_MAX_DROP_PCT", "-5.0"))  # これ以下の騰落率は除外
 
+# 9/10 追加: 選抜スコアに ATR% を加味する (in_flow 単独ではボラティリティを見ていなかった)
+# 従来は in_flow (前日大口資金流入) 順のみで上位 N を選抜していたが、エントリー条件は
+# amp>=5% & atr>=3% の高ボラ前提なので基準がミスマッチだった。実測で NOW(条件B 7回) /
+# SMCI(5回) / CRWD(4回) が候補プールにいながら in_flow 順で漏れていた。
+# score = in_flow * (atr_pct / SCREENER_ATR_BASE) にすることで、資金が入っていて
+# かつボラのある銘柄を優先する。SCREENER_ATR_WEIGHT_ENABLED=false で従来動作に戻る。
+SCREENER_ATR_WEIGHT_ENABLED: bool = os.getenv("SCREENER_ATR_WEIGHT_ENABLED", "true").lower() == "true"
+SCREENER_ATR_BASE: float = float(os.getenv("SCREENER_ATR_BASE", "0.03"))  # 倍率1.0となる基準 ATR% (Filter G の閾値と揃える)
+SCREENER_ATR_WEIGHT_CAP: float = float(os.getenv("SCREENER_ATR_WEIGHT_CAP", "3.0"))  # 倍率上限 (極端なボラ銘柄が独占するのを防ぐ)
+SCREENER_ATR_PERIOD: int = int(os.getenv("SCREENER_ATR_PERIOD", "14"))  # ATR 計算期間 (日足)
+
 # --- 寄り付きスキップ ---
 # 押し目待ちが VWAP 付近のみエントリーするため、寄り付き直後のノイズは自然弾き
 # される。15分に短縮 (旧30分)。

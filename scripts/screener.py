@@ -238,8 +238,47 @@ def fetch_finviz_candidates(n: int = 50) -> list[str]:
         return []
 
 
+def _calc_atr_pct(kline, period: int) -> float | None:
+    """日足 kline から ATR% (ATR / 直近終値) を計算する.
+
+    True Range = max(high-low, |high-prev_close|, |low-prev_close|) の period 平均。
+    データ不足・異常値の場合は None を返し、呼び出し側で倍率 1.0 にフォールバックする。
+    """
+    try:
+        n = len(kline)
+        if n < 2:
+            return None
+        highs = [float(x) for x in kline["high"]]
+        lows = [float(x) for x in kline["low"]]
+        closes = [float(x) for x in kline["close"]]
+        trs = []
+        for i in range(1, n):
+            prev_close = closes[i - 1]
+            trs.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - prev_close),
+                abs(lows[i] - prev_close),
+            ))
+        if not trs:
+            return None
+        window = trs[-period:] if len(trs) > period else trs
+        atr = sum(window) / len(window)
+        last_close = closes[-1]
+        if last_close <= 0:
+            return None
+        return atr / last_close
+    except Exception:
+        return None
+
+
 def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
-    """moomoo の前日大口フローでスコアリングする."""
+    """moomoo の前日大口フロー × ATR% でスコアリングする.
+
+    9/10 変更: 従来は in_flow 単独だったが、エントリー条件 (amp>=5% & atr>=3%) が
+    高ボラ前提なのに選抜がボラを見ておらずミスマッチだった。
+    score = in_flow * clamp(atr_pct / SCREENER_ATR_BASE, 上限 SCREENER_ATR_WEIGHT_CAP)。
+    SCREENER_ATR_WEIGHT_ENABLED=false で従来の in_flow 単独に戻る。
+    """
     import socket
 
     # OpenD 接続チェック
@@ -274,8 +313,10 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
             try:
                 code = f"US.{symbol}"
 
-                # 前日騰落率チェック（急落銘柄を除外）
-                ret_kl, kline = ctx.get_cur_kline(code, 2, ktype="K_DAY")
+                # 前日騰落率チェック（急落銘柄を除外）+ ATR% 算出 (同じ kline を再利用)
+                bars = max(settings.SCREENER_ATR_PERIOD + 1, 2)
+                ret_kl, kline = ctx.get_cur_kline(code, bars, ktype="K_DAY")
+                atr_pct: float | None = None
                 if ret_kl == RET_OK and len(kline) >= 2:
                     prev_close = float(kline["close"].iloc[-2])
                     last_close = float(kline["close"].iloc[-1])
@@ -287,6 +328,7 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                             )
                             time.sleep(1.0)
                             continue
+                    atr_pct = _calc_atr_pct(kline, settings.SCREENER_ATR_PERIOD)
 
                 # 大口フロー取得
                 ret, data = ctx.get_capital_flow(
@@ -298,8 +340,18 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                 if ret == RET_OK and not data.empty:
                     in_flow = float(data["in_flow"].sum()) if "in_flow" in data.columns else 0.0
                     if in_flow > 0:
-                        scored.append((symbol, in_flow))
-                        logger.debug("[%s] in_flow=%.0f", symbol, in_flow)
+                        weight = 1.0
+                        if settings.SCREENER_ATR_WEIGHT_ENABLED and atr_pct:
+                            weight = min(
+                                atr_pct / settings.SCREENER_ATR_BASE,
+                                settings.SCREENER_ATR_WEIGHT_CAP,
+                            )
+                        scored.append((symbol, in_flow * weight))
+                        logger.debug(
+                            "[%s] in_flow=%.0f atr=%.2f%% weight=%.2f score=%.0f",
+                            symbol, in_flow,
+                            (atr_pct or 0) * 100, weight, in_flow * weight,
+                        )
             except Exception:
                 logger.debug("[Screener] フロー取得失敗: %s", symbol)
 
@@ -313,8 +365,10 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
         ctx.close()
 
         logger.info(
-            "[Screener] フロー確認完了: %d/%d銘柄がプラスフロー",
+            "[Screener] フロー確認完了: %d/%d銘柄がプラスフロー (ATR加重=%s base=%.1f%% cap=%.1f)",
             len(scored), len(candidates),
+            "ON" if settings.SCREENER_ATR_WEIGHT_ENABLED else "OFF",
+            settings.SCREENER_ATR_BASE * 100, settings.SCREENER_ATR_WEIGHT_CAP,
         )
         return scored
 
