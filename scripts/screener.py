@@ -54,6 +54,11 @@ CANDIDATES_PATH = DATA_DIR / "momentum_candidates.json"
 # main.py が起動時に読み込んで静的 GICS_SECTOR_ETF (settings.py) にマージ、
 # 未マップ銘柄をゼロにする恒久対策
 SECTOR_MAP_PATH = DATA_DIR / "dynamic_sector_map.json"
+# 9/10 追加: 選抜の判断材料を全件記録する分析用ログ (1 行 = 1 銘柄 x 1 日)。
+# 従来 in_flow は logger.debug でしか出しておらず値が残らなかったため、
+# 「in_flow の大小と実際のエントリー結果」を後から突き合わせられなかった。
+# 採用/不採用に関わらず候補全件を残すので、足切り基準の妥当性を検証できる。
+SCORE_LOG_PATH = DATA_DIR / "screener_scores.jsonl"
 
 # Finviz sector フィルタキー → SPDR セクター ETF のマッピング
 # スクリーナーが銘柄取得時に自動でセクターを判定するために使用
@@ -271,7 +276,65 @@ def _calc_atr_pct(kline, period: int) -> float | None:
         return None
 
 
-def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
+def _daily_bar_metrics(kline) -> dict:
+    """日足 kline から分析用の指標を抜き出す (記録専用、選抜には影響しない).
+
+    直近バーの amplitude / 出来高比 / 終値位置などを残しておくと、
+    「どんな値動きの銘柄が翌日勝ったか」を screener 側の記録だけで追える。
+    """
+    out: dict = {}
+    try:
+        n = len(kline)
+        if n < 2:
+            return out
+        h = float(kline["high"].iloc[-1])
+        low = float(kline["low"].iloc[-1])
+        c = float(kline["close"].iloc[-1])
+        o = float(kline["open"].iloc[-1])
+        out["prev_close_price"] = round(c, 4)
+        if low > 0:
+            out["prev_amplitude"] = round((h - low) / low * 100, 3)
+        if o > 0:
+            out["prev_change_from_open_pct"] = round((c - o) / o * 100, 3)
+        if h > low:
+            out["prev_close_position"] = round((c - low) / (h - low), 3)
+        if "volume" in kline.columns and n >= 6:
+            vols = [float(x) for x in kline["volume"]]
+            base = vols[-min(20, n - 1) - 1:-1]
+            avg = sum(base) / len(base) if base else 0
+            if avg > 0:
+                out["prev_volume_ratio"] = round(vols[-1] / avg, 3)
+    except Exception:
+        pass
+    return out
+
+
+def save_score_log(records: list[dict], selected: list[str]) -> None:
+    """選抜の判断材料を JSONL に追記する (分析専用、失敗しても screener は継続).
+
+    採用/不採用に関わらず候補全件を残す。後から
+    「in_flow がいくつの銘柄を採用し、その日どうだったか」を突き合わせられる。
+    """
+    if not records:
+        return
+    try:
+        sel = set(selected)
+        rank = {s: i + 1 for i, s in enumerate(selected)}
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with SCORE_LOG_PATH.open("a", encoding="utf-8") as f:
+            for r in records:
+                r["selected"] = r["symbol"] in sel
+                r["rank_final"] = rank.get(r["symbol"])
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info(
+            "[Screener] スコアログ記録: %s (%d 件、うち採用 %d)",
+            SCORE_LOG_PATH, len(records), sum(1 for r in records if r["selected"]),
+        )
+    except Exception:
+        logger.exception("[Screener] スコアログ記録に失敗 (処理は継続)")
+
+
+def score_by_moomoo_flow(candidates: list[str]) -> tuple[list[tuple[str, float]], list[dict]]:
     """moomoo の前日大口フロー × ATR% でスコアリングする.
 
     9/10 変更: 従来は in_flow 単独だったが、エントリー条件 (amp>=5% & atr>=3%) が
@@ -288,7 +351,7 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
         result = sock.connect_ex((settings.MOOMOO_HOST, settings.MOOMOO_PORT))
         if result != 0:
             logger.warning("[Screener] OpenD 未起動 — Finviz 出来高順で代替")
-            return []
+            return [], []
     finally:
         sock.close()
 
@@ -331,8 +394,15 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
 
         scored: list[tuple[str, float]] = []
         kline_ok = 0
+        score_records: list[dict] = []
 
         for i, symbol in enumerate(candidates):
+            rec: dict = {
+                "date": date.today().isoformat(),
+                "flow_date": yesterday_str,
+                "symbol": symbol,
+                "rank_finviz": i + 1,   # Finviz 出来高順の元順位
+            }
             try:
                 code = f"US.{symbol}"
 
@@ -344,15 +414,21 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                     kline_ok += 1
                     prev_close = float(kline["close"].iloc[-2])
                     last_close = float(kline["close"].iloc[-1])
+                    rec.update(_daily_bar_metrics(kline))
                     if prev_close > 0:
                         change_pct = (last_close - prev_close) / prev_close * 100
+                        rec["prev_day_change_pct"] = round(change_pct, 3)
                         if change_pct < settings.SCREENER_MAX_DROP_PCT:
                             logger.info(
                                 "[Screener] %s 急落除外: %.1f%%", symbol, change_pct,
                             )
+                            rec["excluded_reason"] = "drop"
+                            rec["selected"] = False
+                            score_records.append(rec)
                             time.sleep(1.0)
                             continue
                     atr_pct = _calc_atr_pct(kline, settings.SCREENER_ATR_PERIOD)
+                    rec["atr_pct"] = round(atr_pct, 5) if atr_pct else None
 
                 # 大口フロー取得
                 ret, data = ctx.get_capital_flow(
@@ -362,6 +438,16 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                     end=yesterday_str,
                 )
                 if ret == RET_OK and not data.empty:
+                    # in_flow は総額。super/big/mid/sml/main の内訳も残す
+                    # (総額プラスでも超大口が流出しているケースがあり、
+                    #  どの規模の資金が予測力を持つか後から検証するため)
+                    for col in ("in_flow", "super_in_flow", "big_in_flow",
+                                "mid_in_flow", "sml_in_flow", "main_in_flow"):
+                        if col in data.columns:
+                            try:
+                                rec[col] = round(float(data[col].sum()), 1)
+                            except Exception:
+                                rec[col] = None
                     in_flow = float(data["in_flow"].sum()) if "in_flow" in data.columns else 0.0
                     if in_flow > 0:
                         weight = 1.0
@@ -371,13 +457,21 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                                 settings.SCREENER_ATR_WEIGHT_CAP,
                             )
                         scored.append((symbol, in_flow * weight))
+                        rec["atr_weight"] = round(weight, 3)
+                        rec["score"] = round(in_flow * weight, 1)
                         logger.debug(
                             "[%s] in_flow=%.0f atr=%.2f%% weight=%.2f score=%.0f",
                             symbol, in_flow,
                             (atr_pct or 0) * 100, weight, in_flow * weight,
                         )
+                    else:
+                        rec["excluded_reason"] = "in_flow<=0"
+                else:
+                    rec["excluded_reason"] = "no_flow_data"
             except Exception:
                 logger.debug("[Screener] フロー取得失敗: %s", symbol)
+                rec["excluded_reason"] = "exception"
+            score_records.append(rec)
 
             # レート制限対策: 1秒スリープ
             time.sleep(1.0)
@@ -393,14 +487,14 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
             "ON" if settings.SCREENER_ATR_WEIGHT_ENABLED else "OFF",
             settings.SCREENER_ATR_BASE * 100, settings.SCREENER_ATR_WEIGHT_CAP,
         )
-        return scored
+        return scored, score_records
 
     except ImportError:
         logger.error("[Screener] futu パッケージ未インストール")
-        return []
+        return [], []
     except Exception:
         logger.exception("[Screener] moomoo フロー取得エラー")
-        return []
+        return [], []
     finally:
         if ctx is not None:
             if subscribed_codes:
@@ -536,7 +630,7 @@ def main() -> None:
         return
 
     # 2) moomoo でスコアリング
-    scored = score_by_moomoo_flow(candidates)
+    scored, score_records = score_by_moomoo_flow(candidates)
 
     if scored:
         # フロースコア上位
@@ -551,6 +645,8 @@ def main() -> None:
     save_results(top_symbols)
     # 8/28 追加: 動的 sector map を保存 (未マップ問題の恒久対策)
     save_sector_map()
+    # 9/10 追加: 選抜の判断材料を全件記録 (足切り基準の事後検証用)
+    save_score_log(score_records, top_symbols)
 
     # 候補銘柄リスト (絞り込み前の全件) をモメンタム検知用に保存
     candidates_output = {

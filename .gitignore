@@ -68,6 +68,7 @@ data/a1a3_block_log.jsonl
 data/long_sentiment_shadow_dryrun.jsonl
 data/long_autodaytrade_shadow.jsonl
 data/dynamic_sector_map.json
+data/screener_scores.jsonl
 data/*_intraday.jsonl
 data/_backup_*/
 data/watchlist_dynamic copy.json
