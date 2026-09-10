@@ -292,8 +292,10 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
     finally:
         sock.close()
 
+    subscribed_codes: list[str] = []
+    ctx = None
     try:
-        from futu import OpenQuoteContext, RET_OK, PeriodType
+        from futu import OpenQuoteContext, RET_OK, PeriodType, SubType
 
         ctx = OpenQuoteContext(
             host=settings.MOOMOO_HOST,
@@ -307,7 +309,28 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
             len(candidates), yesterday_str, len(candidates),
         )
 
+        # 9/10 修正: get_cur_kline は事前購読が必須 (未購読だと
+        # "please subscribe to the KL_Day data first" で毎回失敗していた)。
+        # これにより急落除外チェックが長期間 no-op になっていたため、日足を一括購読する。
+        # 購読枠は 300 なので候補 100 銘柄なら収まる。失敗しても致命ではない
+        # (kline が取れないだけで in_flow スコアリングは従来通り動く)。
+        all_codes = [f"US.{sym}" for sym in candidates]
+        try:
+            ret_sub, sub_msg = ctx.subscribe(all_codes, [SubType.K_DAY])
+            if ret_sub == RET_OK:
+                subscribed_codes = all_codes
+                time.sleep(1.0)  # 初回データ配信を待つ
+                logger.info("[Screener] 日足 一括購読: %d銘柄", len(all_codes))
+            else:
+                logger.warning(
+                    "[Screener] 日足購読失敗 (%s) — 急落除外と ATR 加重はスキップされます",
+                    sub_msg,
+                )
+        except Exception:
+            logger.exception("[Screener] 日足購読で例外 — kline 系はスキップして継続")
+
         scored: list[tuple[str, float]] = []
+        kline_ok = 0
 
         for i, symbol in enumerate(candidates):
             try:
@@ -318,6 +341,7 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
                 ret_kl, kline = ctx.get_cur_kline(code, bars, ktype="K_DAY")
                 atr_pct: float | None = None
                 if ret_kl == RET_OK and len(kline) >= 2:
+                    kline_ok += 1
                     prev_close = float(kline["close"].iloc[-2])
                     last_close = float(kline["close"].iloc[-1])
                     if prev_close > 0:
@@ -362,11 +386,10 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
             if (i + 1) % 10 == 0:
                 logger.info("[Screener] 進捗: %d/%d", i + 1, len(candidates))
 
-        ctx.close()
-
         logger.info(
-            "[Screener] フロー確認完了: %d/%d銘柄がプラスフロー (ATR加重=%s base=%.1f%% cap=%.1f)",
-            len(scored), len(candidates),
+            "[Screener] フロー確認完了: %d/%d銘柄がプラスフロー "
+            "(kline取得 %d/%d、 ATR加重=%s base=%.1f%% cap=%.1f)",
+            len(scored), len(candidates), kline_ok, len(candidates),
             "ON" if settings.SCREENER_ATR_WEIGHT_ENABLED else "OFF",
             settings.SCREENER_ATR_BASE * 100, settings.SCREENER_ATR_WEIGHT_CAP,
         )
@@ -378,6 +401,16 @@ def score_by_moomoo_flow(candidates: list[str]) -> list[tuple[str, float]]:
     except Exception:
         logger.exception("[Screener] moomoo フロー取得エラー")
         return []
+    finally:
+        if ctx is not None:
+            if subscribed_codes:
+                try:
+                    from futu import SubType as _SubType
+                    ctx.unsubscribe(subscribed_codes, [_SubType.K_DAY])
+                    logger.info("[Screener] 日足購読解除: %d銘柄", len(subscribed_codes))
+                except Exception:
+                    logger.warning("[Screener] 購読解除に失敗 (OpenD 側で自然解放されます)")
+            ctx.close()
 
 
 def save_results(symbols: list[str]) -> None:
