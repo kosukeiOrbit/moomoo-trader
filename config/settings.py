@@ -351,13 +351,18 @@ LONG_FULL_DRY_RUN: bool = os.getenv("LONG_FULL_DRY_RUN", "true").lower() == "tru
 LOOP_INTERVAL_SECONDS: int = 30
 
 # 9/10 追加: scan ループでのフロー取得ペーシング。
-# moomoo の get_capital_flow はリクエスト頻度に上限があり、超えると ret=-1 を返す。
-# 実測 (2026-09-10, 監視47銘柄): 1秒あたり 1-4 件なら失敗率 0-3% だが、
-# 6-7 件で 22-26%、8 件以上で 50-100% に跳ね上がる。
-# 監視 35→47 銘柄への拡大でフロー失敗率が 14% → 34% に悪化し、
-# watchlist 後半の 14 銘柄が毎回 SKIP(API skipped) されてエントリー対象外になっていた。
-# 銘柄ごとに待ってから取得することで 3 件/秒前後に抑える。0 で無効化 (従来動作)。
-FLOW_FETCH_INTERVAL_SEC: float = float(os.getenv("FLOW_FETCH_INTERVAL_SEC", "0.3"))
+# moomoo の get_capital_flow には「30 秒間に 30 回」の上限があり、超えると ret=-1 を返す。
+# 実測 (2026-09-10): 間隔を空けずに連続リクエストすると 31 回目から失敗し、
+# 30 秒待つと回復した。つまり瞬間のリクエスト密度ではなく一定時間内の累積回数の制限。
+# フロー取得が失敗すると flow=NEUTRAL 扱いになり、その銘柄は SKIP(API skipped) で
+# 丸ごとエントリー対象から外れる (sentiment すら呼ばれない) ため実害が大きい。
+#
+# 監視 47 銘柄では 1 周に最低 47 秒必要になる (1 秒あたり 1 回が上限のため)。
+# 0.3 秒では 1 周 39 秒 = 30 秒窓に約 36 回入って失敗率 13.9% だったので 0.6 秒に引き上げ。
+# 0.6 秒なら 1 銘柄あたり約 1.13 秒 = 30 秒窓で約 26 回に収まる (1 周 約53 秒)。
+# 監視銘柄を減らしても 30 秒窓の回数は変わらないので、この間隔調整が唯一の対処になる。
+# 0 で無効化 (従来動作)。
+FLOW_FETCH_INTERVAL_SEC: float = float(os.getenv("FLOW_FETCH_INTERVAL_SEC", "0.6"))
 
 # --- Discord Webhook 通知 ---
 DISCORD_WEBHOOK_SIGNAL: str = os.getenv("DISCORD_WEBHOOK_SIGNAL", "")   # mt-signal チャンネル
