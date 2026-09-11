@@ -358,11 +358,13 @@ LOOP_INTERVAL_SECONDS: int = 30
 # 丸ごとエントリー対象から外れる (sentiment すら呼ばれない) ため実害が大きい。
 #
 # 監視 47 銘柄では 1 周に最低 47 秒必要になる (1 秒あたり 1 回が上限のため)。
-# 0.3 秒では 1 周 39 秒 = 30 秒窓に約 36 回入って失敗率 13.9% だったので 0.6 秒に引き上げ。
-# 0.6 秒なら 1 銘柄あたり約 1.13 秒 = 30 秒窓で約 26 回に収まる (1 周 約53 秒)。
+# 実測の推移: 0.3 秒 → 1周39秒・失敗率13.9% / 0.6 秒 → 1周48秒・失敗率5.75%。
+# 0.6 秒でも失敗は処理順 30-34 番目 (TKO/SWKS/MSI/PAYX/ROP) に集中し、
+# 公式の「30 回」境界と一致していたため 0.75 秒に引き上げ。
+# 0.75 秒なら 1 銘柄あたり約 1.2 秒 = 30 秒窓で約 25 回に収まる (1 周 約55 秒)。
 # 監視銘柄を減らしても 30 秒窓の回数は変わらないので、この間隔調整が唯一の対処になる。
 # 0 で無効化 (従来動作)。
-FLOW_FETCH_INTERVAL_SEC: float = float(os.getenv("FLOW_FETCH_INTERVAL_SEC", "0.6"))
+FLOW_FETCH_INTERVAL_SEC: float = float(os.getenv("FLOW_FETCH_INTERVAL_SEC", "0.75"))
 
 # --- Discord Webhook 通知 ---
 DISCORD_WEBHOOK_SIGNAL: str = os.getenv("DISCORD_WEBHOOK_SIGNAL", "")   # mt-signal チャンネル
