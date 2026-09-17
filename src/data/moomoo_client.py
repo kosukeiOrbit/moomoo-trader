@@ -11,6 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from futu import (
     AuType,
@@ -33,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_MAX_RETRIES = 3
 RECONNECT_DELAY = 2.0  # 秒
+
+# 分足の time_key は ET 表記。日付の決定も ET 基準で行う必要がある
+_ET_TZ = ZoneInfo("America/New_York")
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +325,9 @@ class MoomooClient:
         code = f"US.{symbol}"
         ret, data = self._quote_ctx.get_market_snapshot([code])
         if ret != RET_OK or data.empty:
-            logger.debug("Snapshot unavailable: %s (ret=%s)", symbol, ret)
+            # warning に上げている: snapshot は 60 回/30 秒が上限で、超えると ret=-1 を返す。
+            # debug のままだと引け処理の一括失敗が完全に不可視になる (2026-09-17 修正)
+            logger.warning("Snapshot unavailable: %s (ret=%s)", symbol, ret)
             return QuoteSnapshot(symbol=symbol, last_price=0.0, volume=0.0, turnover=0.0)
 
         row = data.iloc[0]
@@ -461,6 +467,7 @@ class MoomooClient:
         symbol: str,
         ktype: str = "K_1M",
         days: int = 1,
+        target_date: str | None = None,
     ) -> "pd.DataFrame | None":
         """当日 (or 直近N日) の分足 K 線データを取得する.
 
@@ -476,12 +483,20 @@ class MoomooClient:
             time_key (str), open, high, low, close, volume 列を含む DataFrame
             取得失敗時は None
         """
-        from datetime import date as _date, timedelta as _td
+        from datetime import datetime as _dt, timedelta as _td
         assert self._quote_ctx is not None
         code = f"US.{symbol}"
-        end_date = _date.today().strftime("%Y-%m-%d")
-        # days=1 なら当日のみ、 days=2 以上なら遡る
-        start_date = (_date.today() - _td(days=max(days - 1, 0))).strftime("%Y-%m-%d")
+        # 日付は ET (市場時間) 基準で決める。
+        # JST の date.today() を使うと ET 15:50 の引け処理 (= JST 翌日 04:50) で
+        # 翌日を要求してしまい、1 分足が常に 0 本になる (2026-09-17 修正)。
+        # target_date (YYYY-MM-DD, ET) 指定時はその 1 日だけを取得する (過去分の埋め直し用)。
+        if target_date:
+            start_date = end_date = target_date
+        else:
+            _today_et = _dt.now(_ET_TZ).date()
+            end_date = _today_et.strftime("%Y-%m-%d")
+            # days=1 なら当日のみ、 days=2 以上なら遡る
+            start_date = (_today_et - _td(days=max(days - 1, 0))).strftime("%Y-%m-%d")
         # ktype マッピング
         kt_map = {
             "K_1M": KLType.K_1M,

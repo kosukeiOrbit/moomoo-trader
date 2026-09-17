@@ -544,12 +544,40 @@ async def _short_dryrun(
         logger.warning("[DRY-RUN SHORT] %s エラー（無視）", symbol, exc_info=True)
 
 
+def _batch_snapshot_prices(client, symbols: list) -> dict[str, float]:
+    """未クローズ分の現在値を一括取得する.
+
+    snapshot は 60 回/30 秒が上限で、1 銘柄ずつ呼ぶと引け処理 (未クローズ 80 件超) で
+    上限を超え、超過分が silent fail していた。1 リクエストで最大 400 銘柄取れるため
+    一括で引く (2026-09-17 修正)。
+    """
+    uniq = sorted({s for s in symbols if s})
+    if not uniq:
+        return {}
+    out: dict[str, float] = {}
+    try:
+        for i in range(0, len(uniq), 200):
+            chunk = uniq[i:i + 200]
+            snaps = client.get_snapshots([f"US.{s}" for s in chunk])
+            for sym, snap in (snaps or {}).items():
+                if snap is not None and snap.last_price > 0:
+                    out[sym] = float(snap.last_price)
+        missing = [s for s in uniq if s not in out]
+        if missing:
+            logger.warning("[DRY-RUN CLOSE] 一括 snapshot 取得できず %d 件: %s",
+                           len(missing), ", ".join(missing[:10]))
+    except Exception:
+        logger.warning("[DRY-RUN CLOSE] 一括 snapshot 失敗", exc_info=True)
+    return out
+
+
 def _close_dryrun_record_via_intraday(
     rec: dict,
     direction: str,
     client,
     entry_price_key: str = "entry_price",
     entry_time_key: str = "entry_time",
+    snapshot_price: float | None = None,
 ) -> bool:
     """1 分足ベースで dryrun レコードを仮想クローズする (LONG/SHORT 共通).
 
@@ -577,17 +605,27 @@ def _close_dryrun_record_via_intraday(
         if not entry_time_str or not date_str:
             return False
         try:
-            entry_dt = datetime.fromisoformat(f"{date_str}T{entry_time_str}")
+            # 記録側の date / entry_time は JST。1 分足の time_key は ET 表記なので、
+            # 変換してから比較しないとバー抽出が常に 0 本になる (2026-09-17 修正)
+            entry_dt_jst = datetime.fromisoformat(f"{date_str}T{entry_time_str}").replace(tzinfo=JST)
+            entry_dt = entry_dt_jst.astimezone(ET).replace(tzinfo=None)
         except Exception:
             return False
 
-        kline_1m = client.get_intraday_kline(symbol, ktype="K_1M", days=1)
+        # 1 分足も ET のセッション日で取得する
+        kline_1m = client.get_intraday_kline(
+            symbol, ktype="K_1M", days=1,
+            target_date=entry_dt.strftime("%Y-%m-%d"),
+        )
         # フォールバック: 1 分足取得失敗時は snapshot ベースの旧ロジック
         if kline_1m is None or kline_1m.empty:
-            snap = client.get_snapshot(symbol)
-            if snap is None or snap.last_price <= 0:
-                return False
-            close_price = float(snap.last_price)
+            if snapshot_price is not None and snapshot_price > 0:
+                close_price = float(snapshot_price)
+            else:
+                snap = client.get_snapshot(symbol)
+                if snap is None or snap.last_price <= 0:
+                    return False
+                close_price = float(snap.last_price)
             if direction == "SHORT":
                 if close_price >= sl_price:
                     exit_reason, pnl = "SL", entry_price - sl_price
@@ -716,11 +754,18 @@ async def _short_dryrun_close(client) -> None:
                     records.append(_json.loads(line))
 
         updated = False
+        # 未クローズ分の現在値を一括取得 (snapshot 60回/30秒の上限対策)
+        _snap_map = _batch_snapshot_prices(
+            client, [r.get("symbol") for r in records if r.get("close_price") is None],
+        )
         for rec in records:
             # 未決済レコードを全て処理（日付に関係なく）
             if rec.get("close_price") is not None:
                 continue
-            if _close_dryrun_record_via_intraday(rec, "SHORT", client):
+            if _close_dryrun_record_via_intraday(
+                rec, "SHORT", client,
+                snapshot_price=_snap_map.get(rec.get("symbol")),
+            ):
                 updated = True
                 logger.info(
                     "[DRY-RUN SHORT CLOSE] %s entry=%.2f close=%.2f "
@@ -1229,6 +1274,10 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
         updated = False
         intraday_ok = 0
         intraday_fail = 0
+        # 未クローズ分の現在値を一括取得 (snapshot 60回/30秒の上限対策)
+        _snap_map = _batch_snapshot_prices(
+            client, [r.get("symbol") for r in records if r.get("close_price") is None],
+        )
         for rec in records:
             if rec.get("close_price") is not None:
                 continue  # 処理済み
@@ -1238,6 +1287,7 @@ async def _long_dryrun_close(client, pnl_tracker, dryrun_type: str = "skip") -> 
                 rec, "LONG", client,
                 entry_price_key="first_signal_price",
                 entry_time_key="first_signal_time",
+                snapshot_price=_snap_map.get(rec.get("symbol")),
             ):
                 updated = True
                 if rec.get("price_source") == "kline_1m":
