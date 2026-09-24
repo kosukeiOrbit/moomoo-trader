@@ -342,6 +342,19 @@ SCREENER_ATR_BASE: float = float(os.getenv("SCREENER_ATR_BASE", "0.03"))  # 倍�
 SCREENER_ATR_WEIGHT_CAP: float = float(os.getenv("SCREENER_ATR_WEIGHT_CAP", "3.0"))  # 倍率上限 (極端なボラ銘柄が独占するのを防ぐ)
 SCREENER_ATR_PERIOD: int = int(os.getenv("SCREENER_ATR_PERIOD", "14"))  # ATR 計算期間 (日足)
 
+# 9/25 追加: 選抜枠を現行ルールと新ルールで分割する (対照実験)
+# 実測で現行ルール (in_flow>0 & in_flow×ATR加重) の選定は候補プール平均より悪かった:
+#   amp>=5% 到達率 採用12.0% vs 不採用15.8% / 寄→引 採用-0.310% vs 不採用-0.145%
+# 原因は主軸の in_flow に予測力がないこと (翌日 amplitude との相関 -0.012) で、
+# それでいて候補の 57% を in_flow<=0 で足切りし、枠が平均 9.6 個余っていた。
+# 一方シグナル化を決めるのは ATR ではなくテキスト取得率 (ENTRY生成率との相関 +0.553)。
+# 新ルール = prev_amplitude × テキスト取得率 (in_flow 足切りなし / 急落除外は維持)。
+# 全面置換ではなく枠を分けるのは、同じ日・同じ相場で両者を並走させて対照比較するため。
+SCREENER_HYBRID_ENABLED: bool = os.getenv("SCREENER_HYBRID_ENABLED", "true").lower() == "true"
+SCREENER_CURRENT_RULE_SLOTS: int = int(os.getenv("SCREENER_CURRENT_RULE_SLOTS", "25"))  # 現行ルールに残す枠数 (残りが新ルール)
+SCREENER_TEXT_RATE_DAYS: int = int(os.getenv("SCREENER_TEXT_RATE_DAYS", "30"))  # テキスト取得率の集計対象 (直近 N 日分のログ)
+SCREENER_TEXT_RATE_MIN_OBS: int = int(os.getenv("SCREENER_TEXT_RATE_MIN_OBS", "50"))  # 観測数がこれ未満の銘柄は率を信用しない
+
 # --- 寄り付きスキップ ---
 # 押し目待ちが VWAP 付近のみエントリーするため、寄り付き直後のノイズは自然弾き
 # される。15分に短縮 (旧30分)。

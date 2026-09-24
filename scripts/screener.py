@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -309,22 +310,31 @@ def _daily_bar_metrics(kline) -> dict:
     return out
 
 
-def save_score_log(records: list[dict], selected: list[str]) -> None:
+def save_score_log(
+    records: list[dict],
+    selected: list[str],
+    rules: dict[str, str] | None = None,
+) -> None:
     """選抜の判断材料を JSONL に追記する (分析専用、失敗しても screener は継続).
 
     採用/不採用に関わらず候補全件を残す。後から
     「in_flow がいくつの銘柄を採用し、その日どうだったか」を突き合わせられる。
+
+    9/25 追加: rule ("current"/"new") を記録する。枠を分割して両ルールを並走させる
+    ため、どちらの枠から実際のエントリーと損益が出たかを後から集計できる。
     """
     if not records:
         return
     try:
         sel = set(selected)
         rank = {s: i + 1 for i, s in enumerate(selected)}
+        rules = rules or {}
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with SCORE_LOG_PATH.open("a", encoding="utf-8") as f:
             for r in records:
                 r["selected"] = r["symbol"] in sel
                 r["rank_final"] = rank.get(r["symbol"])
+                r["rule"] = rules.get(r["symbol"])
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         logger.info(
             "[Screener] スコアログ記録: %s (%d 件、うち採用 %d)",
@@ -332,6 +342,147 @@ def save_score_log(records: list[dict], selected: list[str]) -> None:
         )
     except Exception:
         logger.exception("[Screener] スコアログ記録に失敗 (処理は継続)")
+
+
+# 9/25 追加: テキスト取得率の集計
+# AND フィルタはテキスト (ニュース/掲示板) が 1 件以上ないとセンチメント分析に進まない。
+# 実測でスキャン観測 446,027 回のうち texts>=1 は 20.5% しかなく、ENTRY 生成率との
+# 相関は ATR (+0.105) よりテキスト取得率 (+0.553) の方が圧倒的に高い。
+# 取得率は銘柄固有で安定している (前後半に分けた相関 +0.849) ため順位付けに使える。
+_TEXTS_LOG_PATTERN = re.compile(r"\[([A-Z]{1,6})\] (?:flow=\w+\([\d.]+\) )?texts=(\d+)")
+
+
+def load_symbol_text_rates(
+    days: int | None = None,
+    min_obs: int | None = None,
+) -> dict[str, float]:
+    """直近の bot ログから銘柄別のテキスト取得率 (%) を集計する.
+
+    失敗しても例外を投げない (空 dict を返し、呼び出し側が現行ルール単独に退避する)。
+    """
+    days = days if days is not None else settings.SCREENER_TEXT_RATE_DAYS
+    min_obs = min_obs if min_obs is not None else settings.SCREENER_TEXT_RATE_MIN_OBS
+    obs: dict[str, int] = {}
+    hit: dict[str, int] = {}
+    try:
+        files = sorted(log_dir.glob("bot_*.log"))[-days:]
+        if not files:
+            logger.warning("[Screener] bot ログが見つからず テキスト取得率を集計できません")
+            return {}
+        for fp in files:
+            try:
+                with fp.open(encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m = _TEXTS_LOG_PATTERN.search(line)
+                        if not m:
+                            continue
+                        sym = m.group(1)
+                        obs[sym] = obs.get(sym, 0) + 1
+                        if int(m.group(2)) >= 1:
+                            hit[sym] = hit.get(sym, 0) + 1
+            except Exception:
+                logger.warning("[Screener] ログ読取失敗 (スキップ): %s", fp.name)
+        rates = {
+            s: hit.get(s, 0) / n * 100.0
+            for s, n in obs.items()
+            if n >= min_obs
+        }
+        logger.info(
+            "[Screener] テキスト取得率: %d 銘柄 (ログ %d 日分、観測 %d 回、中央値 %.1f%%)",
+            len(rates), len(files), sum(obs.values()),
+            sorted(rates.values())[len(rates) // 2] if rates else 0.0,
+        )
+        return rates
+    except Exception:
+        logger.exception("[Screener] テキスト取得率の集計に失敗 (現行ルール単独に退避)")
+        return {}
+
+
+def select_hybrid(
+    scored: list[tuple[str, float]],
+    score_records: list[dict],
+    max_symbols: int,
+    text_rates: dict[str, float],
+) -> tuple[list[str], dict[str, str]]:
+    """枠を現行ルールと新ルールで分割して選抜する.
+
+    現行ルール: in_flow × ATR 加重の上位 (従来どおり)
+    新ルール  : prev_amplitude × テキスト取得率 (in_flow 足切りなし / 急落除外は維持)
+
+    Returns:
+        (採用銘柄リスト, {銘柄: "current"|"new"})
+    """
+    cur_slots = max(0, min(settings.SCREENER_CURRENT_RULE_SLOTS, max_symbols))
+    current = [sym for sym, _ in scored[:cur_slots]]
+    rules = {s: "current" for s in current}
+    picked = set(current)
+
+    by_symbol = {r["symbol"]: r for r in score_records if r.get("symbol")}
+    cands: list[tuple[str, float]] = []
+    no_atr = 0
+    for sym, rec in by_symbol.items():
+        if sym in picked:
+            continue
+        # 急落除外は維持する (落ちるナイフを掴まないための既存ルール)
+        if rec.get("excluded_reason") == "drop":
+            continue
+        # Filter G (atr>=TIGHT_ATR_PCT_MIN) を満たせない銘柄は、監視しても構造上
+        # 実エントリーに到達できないので除外する。データへの当てはめではなく
+        # エントリー条件との整合性による足切り。
+        if settings.TIGHT_ATR_PCT_MIN > 0:
+            atr_pct = rec.get("atr_pct")
+            if atr_pct is None:
+                no_atr += 1
+                continue
+            if atr_pct < settings.TIGHT_ATR_PCT_MIN:
+                continue
+        prev_amp = rec.get("prev_amplitude")
+        if prev_amp is None:
+            continue
+        rate = text_rates.get(sym)
+        if rate is None:
+            continue
+        cands.append((sym, float(prev_amp) * rate))
+    cands.sort(key=lambda x: x[1], reverse=True)
+    if no_atr:
+        # 日足購読が失敗すると全件 atr_pct=None になり新ルール枠が消える。
+        # その場合は現行ルールで埋まる (安全側) が、気付けるようログに残す。
+        logger.warning(
+            "[Screener] 新ルール候補のうち %d 件は atr_pct 欠損のため除外", no_atr,
+        )
+
+    for sym, _ in cands:
+        if len(current) + sum(1 for v in rules.values() if v == "new") >= max_symbols:
+            break
+        rules[sym] = "new"
+        picked.add(sym)
+
+    new_syms = [s for s, v in rules.items() if v == "new"]
+    result = current + new_syms
+
+    # 新ルール側の候補が足りなければ現行ルールの続きで埋める (枠を減らさない)
+    if len(result) < max_symbols:
+        for sym, _ in scored:
+            if len(result) >= max_symbols:
+                break
+            if sym in picked:
+                continue
+            result.append(sym)
+            rules[sym] = "current"
+            picked.add(sym)
+
+    logger.info(
+        "[Screener] 枠分割: 現行 %d 銘柄 / 新ルール %d 銘柄 (合計 %d / 上限 %d)",
+        sum(1 for v in rules.values() if v == "current"),
+        sum(1 for v in rules.values() if v == "new"),
+        len(result), max_symbols,
+    )
+    if new_syms:
+        logger.info(
+            "[Screener] 新ルール枠: %s",
+            " ".join(f"{s}({text_rates.get(s, 0):.0f}%)" for s in new_syms),
+        )
+    return result, rules
 
 
 def score_by_moomoo_flow(candidates: list[str]) -> tuple[list[tuple[str, float]], list[dict]]:
@@ -632,21 +783,49 @@ def main() -> None:
     # 2) moomoo でスコアリング
     scored, score_records = score_by_moomoo_flow(candidates)
 
+    rules: dict[str, str] = {}
     if scored:
         # フロースコア上位
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [sym for sym, _ in scored[:max_symbols]]
+        # 9/25 追加: 枠を現行ルールと新ルールで分割 (対照実験)。
+        # テキスト取得率が取れない場合は従来どおり現行ルール単独で動く。
+        text_rates = (
+            load_symbol_text_rates() if settings.SCREENER_HYBRID_ENABLED else {}
+        )
+        top_symbols = []
+        if settings.SCREENER_HYBRID_ENABLED and text_rates:
+            # 無人実行なので、想定外の例外でも watchlist 更新を止めない。
+            # 失敗時は現行ルール単独にフォールバックする。
+            try:
+                top_symbols, rules = select_hybrid(
+                    scored, score_records, max_symbols, text_rates,
+                )
+            except Exception:
+                logger.exception(
+                    "[Screener] 枠分割に失敗 — 現行ルール単独にフォールバック",
+                )
+                top_symbols = []
+        if not top_symbols:
+            if settings.SCREENER_HYBRID_ENABLED and text_rates:
+                pass  # 例外時は上で記録済み
+            elif settings.SCREENER_HYBRID_ENABLED:
+                logger.warning(
+                    "[Screener] テキスト取得率が空 — 現行ルール単独で選抜します",
+                )
+            top_symbols = [sym for sym, _ in scored[:max_symbols]]
+            rules = {s: "current" for s in top_symbols}
     else:
         # moomoo 接続失敗時は Finviz 出来高順
         logger.info("[Screener] moomoo フローなし — Finviz 出来高順を使用")
         top_symbols = candidates[:max_symbols]
+        rules = {s: "fallback" for s in top_symbols}
 
     # 3) 保存
     save_results(top_symbols)
     # 8/28 追加: 動的 sector map を保存 (未マップ問題の恒久対策)
     save_sector_map()
     # 9/10 追加: 選抜の判断材料を全件記録 (足切り基準の事後検証用)
-    save_score_log(score_records, top_symbols)
+    save_score_log(score_records, top_symbols, rules)
 
     # 候補銘柄リスト (絞り込み前の全件) をモメンタム検知用に保存
     candidates_output = {
