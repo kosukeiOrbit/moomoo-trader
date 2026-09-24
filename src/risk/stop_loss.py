@@ -44,8 +44,18 @@ class StopLossManager:
     ) -> Levels:
         """ATRに基づきSL/TP/トレーリングストップを計算する.
 
-        LONG: SL = entry - ATR×1.5,  TP = entry + ATR×2.5
-        SHORT: SL = entry + ATR×1.5, TP = entry - ATR×2.5
+        乗数は settings で調整するため、ここでは式のみ記す
+        (現行値は LONG: SL 0.7 / TP 1.0、 SHORT: SL 0.7 / TP 0.7)。
+
+        LONG : SL = entry - ATR×ATR_SL_MULTIPLIER
+               TP = entry + ATR×ATR_TP_MULTIPLIER
+        SHORT: SL = entry + ATR×ATR_SL_MULTIPLIER_SHORT
+               TP = entry - ATR×ATR_TP_MULTIPLIER_SHORT
+
+        トレーリングストップは LONG/SHORT とも SL 幅の 0.8 倍。
+        ATR が計算できない場合は entry_price × 2% で代用する
+        (この既定値は tight_filter の Filter G 閾値 3% を下回るため、
+         ATR 取得に失敗した銘柄は実エントリーに進まない)。
 
         Args:
             symbol: 銘柄シンボル
