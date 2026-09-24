@@ -2122,6 +2122,26 @@ async def main_loop() -> None:
                         else settings.PULLBACK_VWAP_ENTRY_PCT
                     )
 
+                    # 毎スキャンの判定材料を記録 (9/24 追加)
+                    # 閾値の事後検証で vwap_dev の時系列が残っておらず、
+                    # entry_price/vwap_dev から VWAP を逆算する近似に頼らざるを
+                    # 得なかった (再現率 69% が限界)。判定に使う値をそのまま残す。
+                    # min_vwap_dev は更新前の値なので、反転確認ロジックを
+                    # 後から厳密に再現できる。
+                    if settings.PULLBACK_SCAN_LOG_ENABLED:
+                        _log_pullback_event({
+                            "event": "scan",
+                            "symbol": _pb_symbol,
+                            "scanned_at": datetime.now().strftime("%H:%M:%S"),
+                            "elapsed_min": round(_elapsed_min, 2),
+                            "price": round(_pb_snap.last_price, 4),
+                            "vwap": round(_pb_vwap, 4) if _pb_vwap else None,
+                            "vwap_dev": round(_pb_vwap_dev, 4),
+                            "min_vwap_dev": round(_pb["min_vwap_dev"], 4),
+                            "entry_threshold": _pb_entry_threshold,
+                            "is_momentum": _pb_is_momentum_q,
+                        })
+
                     # 反転確認ロジック: vwap_dev の最小値を追跡
                     # 同値 (横ばい) も「まだ下げ or 横ばい」扱いとして最小値更新・継続
                     if _pb_vwap_dev <= _pb['min_vwap_dev']:

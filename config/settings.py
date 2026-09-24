@@ -244,6 +244,8 @@ ENTRY_PRICE_HISTORY_DEPTH: int = int(os.getenv("ENTRY_PRICE_HISTORY_DEPTH", "6")
 SCAN_PRICE_LOG_ENABLED: bool = os.getenv("SCAN_PRICE_LOG_ENABLED", "true").lower() == "true"
 # A1/A3 ブロックイベントを JSONL に記録 (クールダウン案の事後検証用、 1日数KB)
 A1A3_BLOCK_LOG_ENABLED: bool = os.getenv("A1A3_BLOCK_LOG_ENABLED", "true").lower() == "true"
+# 押し目待ちキュー中の毎スキャン状態を記録 (閾値の事後検証用)
+PULLBACK_SCAN_LOG_ENABLED: bool = os.getenv("PULLBACK_SCAN_LOG_ENABLED", "true").lower() == "true"
 
 # --- モメンタム検知 (寄付き直前の急騰銘柄を当日WATCHLISTに追加) ---
 # 6/10 分析 (n=153): is_momentum=True cohort は n=25 / WR 60% / sum -$103 で損失源。
