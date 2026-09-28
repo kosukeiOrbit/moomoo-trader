@@ -29,7 +29,7 @@ from config import settings
 from src.data.moomoo_client import MoomooClient
 from src.data.board_scraper import BoardScraper
 from src.data.news_feed import NewsFeed
-from src.signals.sentiment_analyzer import SentimentAnalyzer
+from src.signals.sentiment_analyzer import SentimentAnalyzer, SentimentResult
 from src.signals.flow_detector import FlowDetector
 from src.signals.and_filter import AndFilter
 from src.risk.position_sizer import PositionSizer, TradeResult
@@ -241,20 +241,25 @@ async def _short_dryrun(
         # まだ実エントリーされていない銘柄 → 案C 再評価のため処理続行 (dryrun jsonl 重複は後段で抑制)
 
         # テキスト収集（条件A/B 共通で使用）
-        posts = await board_scraper.fetch_posts(symbol)
-        news_articles = await news_feed.get_latest(symbol)
-        texts = [p.text for p in posts] + [
-            f"{a.title} {a.body}" for a in news_articles
-        ]
-
-        # sentiment 取得（テキストがあれば）
+        # SENTIMENT_ENABLED=false のときは取得も API 呼び出しもしない。
+        # score/confidence は 0.0 のままなので条件A (個別悪材料) は発動せず、
+        # 条件B (マクロ連動) のみで判定される。
+        texts: list[str] = []
         score = 0.0
         confidence = 0.0
-        filtered_count = len([t for t in texts if t.strip()])
-        if filtered_count >= settings.MIN_TEXTS_FOR_ANALYSIS:
-            sentiment = sentiment_analyzer.analyze(texts, symbol)
-            score = sentiment.score
-            confidence = sentiment.confidence
+        if settings.SENTIMENT_ENABLED:
+            posts = await board_scraper.fetch_posts(symbol)
+            news_articles = await news_feed.get_latest(symbol)
+            texts = [p.text for p in posts] + [
+                f"{a.title} {a.body}" for a in news_articles
+            ]
+
+            # sentiment 取得（テキストがあれば）
+            filtered_count = len([t for t in texts if t.strip()])
+            if filtered_count >= settings.MIN_TEXTS_FOR_ANALYSIS:
+                sentiment = sentiment_analyzer.analyze(texts, symbol)
+                score = sentiment.score
+                confidence = sentiment.confidence
 
         # 条件A: 個別悪材料ショート
         individual_short = (
@@ -2569,25 +2574,34 @@ async def main_loop() -> None:
                     # 注: amplitude チェックは tight_filter_long の Filter F に統合
                     # (Claude API 後だが、 dryrun 記録に tight_filter_reason として残るため)
 
-                    # 3) テキスト収集
-                    posts = await board_scraper.fetch_posts(symbol)
-                    news_articles = await news_feed.get_latest(symbol)
-                    texts = [p.text for p in posts] + [
-                        f"{a.title} {a.body}" for a in news_articles
-                    ]
+                    # 3) テキスト収集 + センチメント分析
+                    # SENTIMENT_ENABLED=false のときは Reddit/News 取得も Claude API も
+                    # 丸ごとスキップし、 flow のみで判定する (9/28 実験、 settings.py 参照)。
+                    if settings.SENTIMENT_ENABLED:
+                        posts = await board_scraper.fetch_posts(symbol)
+                        news_articles = await news_feed.get_latest(symbol)
+                        texts = [p.text for p in posts] + [
+                            f"{a.title} {a.body}" for a in news_articles
+                        ]
 
-                    # 4) テキスト不足ならClaude APIをスキップ
-                    filtered_count = len([t for t in texts if t.strip()])
-                    if filtered_count < settings.MIN_TEXTS_FOR_ANALYSIS:
-                        logger.info(
-                            "[%s] flow=%s(%.2f) texts=%d -> SKIP(texts < %d, API skipped)",
-                            symbol, flow.direction, flow.strength,
-                            filtered_count, settings.MIN_TEXTS_FOR_ANALYSIS,
+                        # 4) テキスト不足ならClaude APIをスキップ
+                        filtered_count = len([t for t in texts if t.strip()])
+                        if filtered_count < settings.MIN_TEXTS_FOR_ANALYSIS:
+                            logger.info(
+                                "[%s] flow=%s(%.2f) texts=%d -> SKIP(texts < %d, API skipped)",
+                                symbol, flow.direction, flow.strength,
+                                filtered_count, settings.MIN_TEXTS_FOR_ANALYSIS,
+                            )
+                            continue
+
+                        # 5) Claude APIでセンチメント分析（flow=BUY + texts十分の場合のみ）
+                        sentiment = sentiment_analyzer.analyze(texts, symbol)
+                    else:
+                        texts = []
+                        sentiment = SentimentResult(
+                            score=0.0, confidence=0.0, reasoning="sentiment_disabled",
                         )
-                        continue
 
-                    # 5) Claude APIでセンチメント分析（flow=BUY + texts十分の場合のみ）
-                    sentiment = sentiment_analyzer.analyze(texts, symbol)
                     decision = and_filter.should_enter(sentiment, flow)
 
                     # VWAP は snapshot の avg_price を優先 (フォールバックで turnover/volume)
@@ -2597,10 +2611,13 @@ async def main_loop() -> None:
                     if vwap_approx:
                         vwap_str = f"{vwap_approx:.2f}({'上' if vwap_above else '下'})"
 
+                    _sent_str = (
+                        f"sentiment={sentiment.score:.2f} conf={sentiment.confidence:.2f}"
+                        if settings.SENTIMENT_ENABLED else "sentiment=OFF"
+                    )
                     logger.info(
-                        "[%s] texts=%d sentiment=%.2f conf=%.2f flow=%s(%.2f) "
-                        "vwap=%s -> %s",
-                        symbol, len(texts), sentiment.score, sentiment.confidence,
+                        "[%s] texts=%d %s flow=%s(%.2f) vwap=%s -> %s",
+                        symbol, len(texts), _sent_str,
                         flow.direction, flow.strength,
                         vwap_str,
                         "ENTRY" if decision.go else f"SKIP({decision.reason[:50]})",

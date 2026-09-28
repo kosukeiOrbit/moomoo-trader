@@ -262,6 +262,17 @@ MOMENTUM_MAX_SYMBOLS: int = int(os.getenv("MOMENTUM_MAX_SYMBOLS", "5"))         
 MOMENTUM_VWAP_ENTRY_PCT: float = float(os.getenv("MOMENTUM_VWAP_ENTRY_PCT", "1.0"))  # モメンタム銘柄の即エントリー閾値 (通常 PULLBACK_VWAP_ENTRY_PCT=0.5%)
 MOMENTUM_ONLY_MODE: bool = os.getenv("MOMENTUM_ONLY_MODE", "false").lower() == "true"   # True=モメンタム検知銘柄のみエントリー (False=通常モード)
 
+# --- 9/28 実験: Claude API (センチメント判定) の撤去 ---
+# false にすると Reddit/News のテキスト取得と Claude API 呼び出しを丸ごとスキップし、
+# LONG 判定を flow のみ (direction=="BUY" かつ strength>FLOW_BUY_THRESHOLD) で行う。
+# tight_filter (F/G/I/H/A2) / SPY・QQQ ブロック / 急落除外 / 押し目待ちは従来どおり適用される。
+# SHORT 側はセンチメント条件を残すため、 撤去時は条件A (個別悪材料) が発動しなくなる
+# (SHORT は実弾・shadow ともに期待値負で恒久的に閉じているため実害なし)。
+# 根拠: 9/25 の BUY flow スキャン 4,813 件のうち 3,572 件 (74.2%) が texts=0 で SKIP されており、
+#       score と実損益の相関も -0.033 と予測力がない。
+# revert: SENTIMENT_ENABLED=true (default) で即座に元に戻る。
+SENTIMENT_ENABLED: bool = os.getenv("SENTIMENT_ENABLED", "true").lower() == "true"
+
 SENTIMENT_THRESHOLD: float = 0.6      # LONGセンチメントスコアの最低閾値
 SHORT_SENTIMENT_THRESHOLD: float = -0.3  # SHORTセンチメントスコアの閾値（これ以下で弱気）
 CONFIDENCE_MIN: float = 0.7           # LLMの確信度最低値

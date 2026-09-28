@@ -41,6 +41,10 @@ class AndFilter:
       3. sentiment.confidence > CONFIDENCE_MIN        (0.6)
       4. flow.strength        > FLOW_BUY_THRESHOLD   (0.65)
 
+    9/28 追加: `SENTIMENT_ENABLED=false` のとき LONG は 1 と 3 を外し、
+    flow のみ (2 と 4) で判定する。SHORT 側は変更しない (score=0.0 固定になるため
+    条件が成立せず、 実質的に閉じたままになる)。
+
     SHORT 条件 (4つ全て + ENABLE_SHORT):
       1. sentiment.score      < SHORT_SENTIMENT_THRESHOLD (-0.3)
       2. flow.direction      == "SELL"
@@ -78,17 +82,27 @@ class AndFilter:
 
     def _check_long(self, sentiment: SentimentResult, flow: FlowSignal) -> EntryDecision:
         """LONG エントリー判定."""
-        if (
+        # SENTIMENT_ENABLED=false のときは score/confidence の 2 条件を外す。
+        # tight_filter / SPY・QQQ ブロック / 押し目待ちは呼び出し側でそのまま適用される。
+        sentiment_ok = not settings.SENTIMENT_ENABLED or (
             sentiment.score > settings.SENTIMENT_THRESHOLD
-            and flow.direction == "BUY"
             and sentiment.confidence > settings.CONFIDENCE_MIN
+        )
+        if (
+            sentiment_ok
+            and flow.direction == "BUY"
             and flow.strength > settings.FLOW_BUY_THRESHOLD
         ):
-            reason = (
-                f"Bullishセンチメント(score={sentiment.score:.2f}) "
-                f"+ 高確信度(confidence={sentiment.confidence:.2f}) "
-                f"+ 大口買い超過(strength={flow.strength:.2f})"
-            )
+            if settings.SENTIMENT_ENABLED:
+                reason = (
+                    f"Bullishセンチメント(score={sentiment.score:.2f}) "
+                    f"+ 高確信度(confidence={sentiment.confidence:.2f}) "
+                    f"+ 大口買い超過(strength={flow.strength:.2f})"
+                )
+            else:
+                reason = (
+                    f"[sentiment OFF] 大口買い超過(strength={flow.strength:.2f})"
+                )
             if flow.short_squeeze:
                 reason += " + ショートスクイーズ候補"
             logger.info("LONG エントリーシグナル: %s", reason)
@@ -253,9 +267,9 @@ class AndFilter:
         failures: list[str] = []
 
         if flow.direction == "BUY":
-            if sentiment.score <= settings.SENTIMENT_THRESHOLD:
+            if settings.SENTIMENT_ENABLED and sentiment.score <= settings.SENTIMENT_THRESHOLD:
                 failures.append(f"センチメント不足(score={sentiment.score:.2f} <= {settings.SENTIMENT_THRESHOLD})")
-            if sentiment.confidence <= settings.CONFIDENCE_MIN:
+            if settings.SENTIMENT_ENABLED and sentiment.confidence <= settings.CONFIDENCE_MIN:
                 failures.append(f"確信度不足(confidence={sentiment.confidence:.2f} <= {settings.CONFIDENCE_MIN})")
             if flow.strength <= settings.FLOW_BUY_THRESHOLD:
                 failures.append(f"フロー強度不足(strength={flow.strength:.2f} <= {settings.FLOW_BUY_THRESHOLD})")
