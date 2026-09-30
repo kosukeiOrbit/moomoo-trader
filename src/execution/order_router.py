@@ -46,6 +46,8 @@ class Position:
     # 直近観測価格 (monitor_positions で更新)。強制決済時に snapshot が
     # 一時的に 0 を返した場合のフォールバック値として使う。
     last_known_price: float = 0.0
+    # 9/30 追加: entry_price 異常を 1 回だけ警告するためのフラグ (ログ洪水防止)
+    entry_price_warned: bool = False
 
 
 @dataclass
@@ -110,7 +112,13 @@ class OrderRouter:
             order_id = f"POS-{pos_id}" if pos_id else f"RECOVERED-{symbol}"
             if order_id in self._positions:
                 continue
-            cost_price = info["cost_price"]
+            cost_price = float(info.get("cost_price") or 0.0)
+            if cost_price <= 0:
+                # levels=None なので SL/TP 監視対象外だが、 MFE/MAE と損益表示が壊れる
+                logger.warning(
+                    "[%s] 復元時の cost_price=%r が不正 (entry_price=0 で登録される)",
+                    symbol, info.get("cost_price"),
+                )
             # get_positions() が direction ("LONG"/"SHORT") を返す。 SHORT 建玉も復元する
             direction = info.get("direction", "LONG")
             self._positions[order_id] = Position(
@@ -339,7 +347,24 @@ class OrderRouter:
             self._client.cancel_order(result.order_id)
             return OrderResult(order_id=result.order_id, status="CANCELLED")
 
-        fill_price = filled.get("cost_price", price)
+        # 9/30 修正: moomoo の position_list は約定直後に qty だけ反映され
+        # cost_price=0 の中間状態を返すことがある (9/29 LITE で実際に発生し、
+        # entry_price=0 で登録されて monitor_positions が全ループ例外 → SL/TP 未評価)。
+        # dict.get(key, default) はキーが存在して値が 0 だと default が効かないため、
+        # 0/None を明示的に弾いて発注時価格にフォールバックする。
+        _cost_raw = filled.get("cost_price")
+        try:
+            _cost = float(_cost_raw) if _cost_raw is not None else 0.0
+        except (TypeError, ValueError):
+            _cost = 0.0
+        if _cost > 0:
+            fill_price = _cost
+        else:
+            fill_price = price
+            logger.warning(
+                "[%s] 約定確認: cost_price=%r が不正 → 発注時価格 $%.2f を entry_price に使用",
+                symbol, _cost_raw, price,
+            )
         fill_qty = int(filled.get("qty", size))
         logger.info("[%s] 約定確認OK: qty=%d/%d cost_price=$%.2f", symbol, fill_qty, size, fill_price)
 
@@ -712,11 +737,25 @@ class OrderRouter:
                     # 直近観測価格を更新 (強制決済時のフォールバック用)
                     pos.last_known_price = price
 
+                    # 9/30 修正: entry_price が異常 (0 等) でも SL/TP 判定を止めない。
+                    # 9/29 に LITE が entry_price=0 で登録され、 ここの除算で
+                    # ZeroDivisionError が 3,856 回発生して SL/TP/トレーリングが
+                    # 全セッション未評価になった (実弾ポジションが 5.7 時間無監視)。
+                    # 割合表示と MFE/MAE は暫定値でよいので、 判定の継続を優先する。
+                    entry_ref = pos.entry_price if pos.entry_price > 0 else price
+                    if pos.entry_price <= 0 and not pos.entry_price_warned:
+                        pos.entry_price_warned = True
+                        logger.warning(
+                            "[%s] entry_price=%.2f が不正 — %%表示と MFE/MAE は暫定値 "
+                            "(現値 $%.2f で代用)。 SL/TP 判定は継続する",
+                            pos.symbol, pos.entry_price, price,
+                        )
+
                     # MFE/MAE 更新
                     if pos.direction == "LONG":
-                        unrealized = (price - pos.entry_price) * pos.size
+                        unrealized = (price - entry_ref) * pos.size
                     else:
-                        unrealized = (pos.entry_price - price) * pos.size
+                        unrealized = (entry_ref - price) * pos.size
                     if unrealized > 0:
                         pos.mfe = max(pos.mfe, unrealized)
                     else:
@@ -724,11 +763,11 @@ class OrderRouter:
 
                     # SL/TP の距離計算（LONG: SL<price<TP, SHORT: TP<price<SL）
                     if pos.direction == "SHORT":
-                        sl_dist = (pos.levels.stop_loss - price) / pos.entry_price * 100
-                        tp_dist = (price - pos.levels.take_profit) / pos.entry_price * 100
+                        sl_dist = (pos.levels.stop_loss - price) / entry_ref * 100
+                        tp_dist = (price - pos.levels.take_profit) / entry_ref * 100
                     else:
-                        sl_dist = (price - pos.levels.stop_loss) / pos.entry_price * 100
-                        tp_dist = (pos.levels.take_profit - price) / pos.entry_price * 100
+                        sl_dist = (price - pos.levels.stop_loss) / entry_ref * 100
+                        tp_dist = (pos.levels.take_profit - price) / entry_ref * 100
 
                     if loop_count % 100 == 1 or sl_dist < 0.5 or tp_dist < 0.5:
                         logger.info(
