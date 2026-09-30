@@ -41,6 +41,7 @@ class StopLossManager:
         entry_price: float,
         price_history: pd.DataFrame | None = None,
         direction: str = "LONG",
+        fallback_atr_pct: float | None = None,
     ) -> Levels:
         """ATRに基づきSL/TP/トレーリングストップを計算する.
 
@@ -53,25 +54,41 @@ class StopLossManager:
                TP = entry - ATR×ATR_TP_MULTIPLIER_SHORT
 
         トレーリングストップは LONG/SHORT とも SL 幅の 0.8 倍。
-        ATR が計算できない場合は entry_price × 2% で代用する
-        (この既定値は tight_filter の Filter G 閾値 3% を下回るため、
-         ATR 取得に失敗した銘柄は実エントリーに進まない)。
+
+        price_history から ATR を計算できない場合:
+          - fallback_atr_pct があれば entry_price × その値を使う
+            (9/30 追加。 履歴K線の枠切れ時に screener 記録の atr_pct を渡す)
+          - なければ従来どおり entry_price × 2%
+
+        注 (9/30): 2% 既定値は Filter G 閾値 3% を下回るため、 従来は
+        「ATR 取得に失敗した銘柄は実エントリーに進まない」 という前提があった。
+        main.py が Filter G 判定に screener の atr_pct をフォールバック使用する
+        ようになったため**この前提はもう成り立たない**。 実弾経路では必ず
+        fallback_atr_pct を渡すこと (渡さないと狭すぎる SL で建ててしまう)。
 
         Args:
             symbol: 銘柄シンボル
             entry_price: エントリー価格
             price_history: 価格履歴DataFrame（high, low, close 列が必要）
             direction: "LONG" or "SHORT"
+            fallback_atr_pct: ATR 計算不可時に使う ATR% (0.06 = 6%)
 
         Returns:
             損切り・利確水準
         """
         atr_value = self._calculate_atr(price_history)
         if atr_value is None or atr_value == 0:
-            atr_value = entry_price * 0.02
-            logger.warning(
-                "ATR計算不可: %s デフォルト値を使用 (%.4f)", symbol, atr_value,
-            )
+            if fallback_atr_pct and fallback_atr_pct > 0:
+                atr_value = entry_price * fallback_atr_pct
+                logger.warning(
+                    "ATR計算不可: %s → フォールバック ATR%%=%.2f%% を使用 (%.4f)",
+                    symbol, fallback_atr_pct * 100, atr_value,
+                )
+            else:
+                atr_value = entry_price * 0.02
+                logger.warning(
+                    "ATR計算不可: %s デフォルト値を使用 (%.4f)", symbol, atr_value,
+                )
 
         if direction == "SHORT":
             # SHORT 専用 ATR 乗数 (LONG とは非対称、 backlog FINAL-7 推奨)

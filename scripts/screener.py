@@ -402,12 +402,15 @@ def select_hybrid(
     scored: list[tuple[str, float]],
     score_records: list[dict],
     max_symbols: int,
-    text_rates: dict[str, float],
 ) -> tuple[list[str], dict[str, str]]:
     """枠を現行ルールと新ルールで分割して選抜する.
 
     現行ルール: in_flow × ATR 加重の上位 (従来どおり)
-    新ルール  : prev_amplitude × テキスト取得率 (in_flow 足切りなし / 急落除外は維持)
+    新ルール  : prev_amplitude × atr_pct (in_flow 足切りなし / 急落除外は維持)
+
+    9/30 変更: 新ルールのスコア項を「テキスト取得率」から atr_pct に変更した。
+    センチメント撤去 (SENTIMENT_ENABLED=false) でテキストが一切取得されなくなり、
+    取得率が全銘柄ゼロに収束して順位が壊れるため。
 
     Returns:
         (採用銘柄リスト, {銘柄: "current"|"new"})
@@ -429,20 +432,17 @@ def select_hybrid(
         # Filter G (atr>=TIGHT_ATR_PCT_MIN) を満たせない銘柄は、監視しても構造上
         # 実エントリーに到達できないので除外する。データへの当てはめではなく
         # エントリー条件との整合性による足切り。
-        if settings.TIGHT_ATR_PCT_MIN > 0:
-            atr_pct = rec.get("atr_pct")
-            if atr_pct is None:
-                no_atr += 1
-                continue
-            if atr_pct < settings.TIGHT_ATR_PCT_MIN:
-                continue
+        # atr_pct は新ルールのスコア項でもあるので、閾値設定に関わらず必ず読む。
+        atr_pct = rec.get("atr_pct")
+        if atr_pct is None:
+            no_atr += 1
+            continue
+        if settings.TIGHT_ATR_PCT_MIN > 0 and atr_pct < settings.TIGHT_ATR_PCT_MIN:
+            continue
         prev_amp = rec.get("prev_amplitude")
         if prev_amp is None:
             continue
-        rate = text_rates.get(sym)
-        if rate is None:
-            continue
-        cands.append((sym, float(prev_amp) * rate))
+        cands.append((sym, float(prev_amp) * float(atr_pct)))
     cands.sort(key=lambda x: x[1], reverse=True)
     if no_atr:
         # 日足購読が失敗すると全件 atr_pct=None になり新ルール枠が消える。
@@ -480,7 +480,11 @@ def select_hybrid(
     if new_syms:
         logger.info(
             "[Screener] 新ルール枠: %s",
-            " ".join(f"{s}({text_rates.get(s, 0):.0f}%)" for s in new_syms),
+            " ".join(
+                f"{s}(amp{by_symbol[s].get('prev_amplitude') or 0:.1f}"
+                f"/atr{(by_symbol[s].get('atr_pct') or 0) * 100:.1f}%)"
+                for s in new_syms
+            ),
         )
     return result, rules
 
@@ -788,17 +792,18 @@ def main() -> None:
         # フロースコア上位
         scored.sort(key=lambda x: x[1], reverse=True)
         # 9/25 追加: 枠を現行ルールと新ルールで分割 (対照実験)。
-        # テキスト取得率が取れない場合は従来どおり現行ルール単独で動く。
-        text_rates = (
-            load_symbol_text_rates() if settings.SCREENER_HYBRID_ENABLED else {}
-        )
+        # 9/30 変更: 新ルールのスコアを prev_amplitude × atr_pct に変更。
+        # 検証 (14遷移 / 1,379銘柄日): 翌セッションで amp>=5% に到達した割合は
+        # 無選別 15.8% / 現行ルール 19.4% に対し prev_amp×atr_pct は 37.7%。
+        # 日別勝敗 14戦14勝 (符号検定 p=0.0001)、期間2分割・1日除外ジャックナイフとも安定。
+        # 現行枠 25 はそのまま残し、同じ相場での対照比較を継続する。
         top_symbols = []
-        if settings.SCREENER_HYBRID_ENABLED and text_rates:
+        if settings.SCREENER_HYBRID_ENABLED:
             # 無人実行なので、想定外の例外でも watchlist 更新を止めない。
             # 失敗時は現行ルール単独にフォールバックする。
             try:
                 top_symbols, rules = select_hybrid(
-                    scored, score_records, max_symbols, text_rates,
+                    scored, score_records, max_symbols,
                 )
             except Exception:
                 logger.exception(
@@ -806,12 +811,6 @@ def main() -> None:
                 )
                 top_symbols = []
         if not top_symbols:
-            if settings.SCREENER_HYBRID_ENABLED and text_rates:
-                pass  # 例外時は上で記録済み
-            elif settings.SCREENER_HYBRID_ENABLED:
-                logger.warning(
-                    "[Screener] テキスト取得率が空 — 現行ルール単独で選抜します",
-                )
             top_symbols = [sym for sym, _ in scored[:max_symbols]]
             rules = {s: "current" for s in top_symbols}
     else:

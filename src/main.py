@@ -1013,6 +1013,70 @@ _momentum_scan_done: bool = False
 _momentum_added_symbols: set[str] = set()
 _MOMENTUM_CANDIDATES_PATH = Path(_project_root) / "data" / "momentum_candidates.json"
 
+# 9/30 追加: 履歴K線の枠切れ対策。
+# client.get_kline() は request_history_kline を使うため「銘柄単位300 / 30日ローリング」の
+# 枠を消費する。枠切れの銘柄では calc_atr_pct() が 0.02 を返し、Filter G (>=0.03) が
+# 必ず棄却するため、新規ローテーション銘柄が通常の Filter G 拒否に偽装されて全滅する。
+# screener は枠を消費しない get_cur_kline で atr_pct を算出し、候補100%分を
+# screener_scores.jsonl に記録しているので、それをフォールバックに使う。
+_SCREENER_SCORES_PATH = Path(_project_root) / "data" / "screener_scores.jsonl"
+_screener_atr_cache: dict[str, float] = {}
+_screener_atr_loaded_for: str = ""
+_ATR_MIN_BARS = 14  # StopLossManager._calculate_atr の length と揃える
+
+
+def _screener_atr_pct(symbol: str) -> float | None:
+    """screener が記録した atr_pct を返す (K線枠を消費しない). 無ければ None."""
+    global _screener_atr_cache, _screener_atr_loaded_for
+    today = date.today().isoformat()
+    if _screener_atr_loaded_for != today:
+        _screener_atr_loaded_for = today
+        latest: dict[str, dict[str, float]] = {}
+        try:
+            with open(_SCREENER_SCORES_PATH, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
+                        continue
+                    d, sym, atr = rec.get("date"), rec.get("symbol"), rec.get("atr_pct")
+                    if not d or not sym or atr is None:
+                        continue
+                    latest.setdefault(d, {})[sym] = float(atr)
+            _screener_atr_cache = latest[max(latest)] if latest else {}
+            logger.info(
+                "[ATR fallback] screener の atr_pct を読み込み: %d 銘柄 (%s)",
+                len(_screener_atr_cache), max(latest) if latest else "なし",
+            )
+        except FileNotFoundError:
+            _screener_atr_cache = {}
+        except Exception:
+            _screener_atr_cache = {}
+            logger.warning("[ATR fallback] 読み込み失敗（無視）", exc_info=True)
+    v = _screener_atr_cache.get(symbol)
+    return v if v and v > 0 else None
+
+
+def _resolve_atr_pct(sl_manager, kline, price: float, symbol: str) -> float:
+    """ATR% を返す。K線が不足する場合のみ screener 記録値にフォールバックする.
+
+    sl_manager を引数で受けるのは、呼び出し側の stop_loss_manager が
+    ローカル変数のためモジュールスコープから参照できないため。
+    """
+    if kline is not None and len(kline) >= _ATR_MIN_BARS and price > 0:
+        return sl_manager.calc_atr_pct(kline, price)
+    fb = _screener_atr_pct(symbol)
+    if fb is not None:
+        logger.info(
+            "[%s] ATR: K線不足 (枠切れの可能性) → screener 値 %.2f%% を使用",
+            symbol, fb * 100,
+        )
+        return fb
+    return sl_manager.calc_atr_pct(kline, price)
+
 
 def _log_filter_d_event(event: dict) -> None:
     """Filter D 候補をJSONLに記録. エラーは握りつぶす."""
@@ -1803,6 +1867,7 @@ async def main_loop() -> None:
                     levels = stop_loss_manager.calculate_levels(
                         pos.symbol, pos.entry_price,
                         price_history=kline, direction=pos.direction,
+                        fallback_atr_pct=_screener_atr_pct(pos.symbol),
                     )
                     pos.levels = levels
                     logger.info(
@@ -2243,6 +2308,7 @@ async def main_loop() -> None:
                             _pb_symbol, _pb_snap.last_price,
                             price_history=_pb['kline'],
                             direction="LONG",
+                            fallback_atr_pct=_screener_atr_pct(_pb_symbol),
                         )
                         _pb_size = position_sizer.calculate(
                             _pb_symbol, _pb_snap.last_price, buying_power,
@@ -2688,8 +2754,11 @@ async def main_loop() -> None:
                                 _shadow_levels = stop_loss_manager.calculate_levels(
                                     symbol, _shadow_cp,
                                     price_history=_shadow_kline, direction="LONG",
+                                    fallback_atr_pct=_screener_atr_pct(symbol),
                                 )
-                                _shadow_atr_pct = stop_loss_manager.calc_atr_pct(_shadow_kline, _shadow_cp)
+                                _shadow_atr_pct = _resolve_atr_pct(
+                                    stop_loss_manager, _shadow_kline, _shadow_cp, symbol,
+                                )
                                 _shadow_is_dyn = symbol not in settings.WATCHLIST
                                 _shadow_is_mom = symbol in _momentum_added_symbols
                                 _shadow_tight_pass, _shadow_tight_reason = and_filter.tight_filter_long(
@@ -2738,13 +2807,16 @@ async def main_loop() -> None:
                         levels = stop_loss_manager.calculate_levels(
                             symbol, current_price,
                             price_history=kline, direction=decision.direction,
+                            fallback_atr_pct=_screener_atr_pct(symbol),
                         )
 
                         # tight filter 評価 (LONG のみ。実エントリーをゲート、dryrun は記録継続)
                         tight_pass = True
                         tight_reason = "n/a"
                         if decision.direction == "LONG":
-                            _atr_pct_for_filter = stop_loss_manager.calc_atr_pct(kline, current_price)
+                            _atr_pct_for_filter = _resolve_atr_pct(
+                                stop_loss_manager, kline, current_price, symbol,
+                            )
                             _is_dynamic_for_filter = symbol not in settings.WATCHLIST
                             _is_momentum_for_filter = symbol in _momentum_added_symbols
                             tight_pass, tight_reason = and_filter.tight_filter_long(
