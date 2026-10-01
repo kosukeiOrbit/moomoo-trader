@@ -20,6 +20,9 @@ class Levels:
 
     stop_loss: float
     take_profit: float
+    # 計算されるが 2026-10-01 時点でどこからも参照されていない (order_router は
+    # stop_loss / take_profit のみ参照)。有効化するなら monitor_positions に
+    # 追従ロジックを実装する必要がある。現状「設定されているのに効かない」状態。
     trailing_stop: float
 
 
@@ -53,7 +56,13 @@ class StopLossManager:
         SHORT: SL = entry + ATR×ATR_SL_MULTIPLIER_SHORT
                TP = entry - ATR×ATR_TP_MULTIPLIER_SHORT
 
-        トレーリングストップは LONG/SHORT とも SL 幅の 0.8 倍。
+        トレーリングストップ (SL 幅の 0.8 倍) も返すが、**この値はどこからも
+        参照されていない** (2026-10-01 にリポジトリ全体を確認)。
+        `order_router.monitor_positions` は `stop_loss` と `take_profit` だけを見ており、
+        `Levels.trailing_stop` の読み出し箇所は存在しない (計算・ログ出力・テストのみ)。
+        実際に機能している決済は **SL / TP / 引け FORCE_CLOSE の 3 つ**。
+        なお決済最適化 (TP 縮小・トレーリング・時間決済) は過去に実測で全パターン
+        棄却済みなので、 トレーリングが無効であること自体は現状の検証結果と整合する。
 
         price_history から ATR を計算できない場合:
           - fallback_atr_pct があれば entry_price × その値を使う
