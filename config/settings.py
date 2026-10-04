@@ -70,6 +70,13 @@ WATCHLIST = [
 # --- シグナル閾値 ---
 # --- Tight Filter (高値掴み・動的小型中ボラ・低値幅除外) ---
 TIGHT_FILTER_ENABLED: bool = os.getenv("TIGHT_FILTER_ENABLED", "true").lower() == "true"
+# Filter P (10/04 追加): 株価の下限。これ未満はエントリーしない。0 で無効。
+# 低位株は手数料ドラッグが急増する (建玉$3,570 の往復手数料率: $10→0.338% /
+# $15→0.225% / $20→0.182% / $100→0.134% / $960→0.123%)。
+# 建玉を小さくしても手数料・株数とも株価に反比例するため比率は改善せず、スキップ以外に
+# 対処法が無い。閾値$20 の根拠は手数料の算術のみで、「低位株は値動きの質も悪い」という
+# 仮説は dryrun n=1,452 の順列検定で棄却済み ($100閾値で p=0.0560、CIはゼロをまたぐ)。
+MIN_ENTRY_PRICE: float = float(os.getenv("MIN_ENTRY_PRICE", "0"))
 TIGHT_VWAP_DEV_PCT: float = float(os.getenv("TIGHT_VWAP_DEV_PCT", "1.0"))    # VWAPからの乖離率 (%) これ超えで除外 (R2: 強トレンド例外なし)
 # Filter D (R1): dynamic 銘柄かつ atr_pct がこの範囲内なら除外（中ボラ罠）
 # n=10 で統計不十分のためログのみ・通過に格下げ (データ蓄積中)。設定は維持。
