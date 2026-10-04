@@ -30,6 +30,12 @@ def _flow(direction: str = "BUY", strength: float = 0.8, short_squeeze: bool = F
 # LONG テスト
 # ---------------------------------------------------------------------------
 
+# 10/04: 運用の .env に依存しないよう設定値を固定する。
+# .env が FLOW_BUY_THRESHOLD=0.8 を設定しており、 _flow() の既定 strength=0.8 と
+# 判定の厳密な不等号 (strength > threshold) が衝突して 7 件が落ちていた。
+# SENTIMENT_ENABLED=false も score/confidence をバイパスするため固定する。
+@patch("config.settings.SENTIMENT_ENABLED", True)
+@patch("config.settings.FLOW_BUY_THRESHOLD", 0.65)
 class TestLong:
 
     @pytest.fixture()
@@ -82,6 +88,8 @@ class TestLong:
 # ---------------------------------------------------------------------------
 
 @patch("config.settings.ENABLE_SHORT", True)
+@patch("config.settings.SENTIMENT_ENABLED", True)
+@patch("config.settings.FLOW_BUY_THRESHOLD", 0.65)
 class TestShort:
 
     @pytest.fixture()
@@ -131,6 +139,8 @@ class TestShort:
 # SHORT 無効テスト（クラス外）
 # ---------------------------------------------------------------------------
 
+@patch("config.settings.SENTIMENT_ENABLED", True)
+@patch("config.settings.FLOW_BUY_THRESHOLD", 0.65)
 @patch("config.settings.ENABLE_SHORT", False)
 def test_short_disabled() -> None:
     """ENABLE_SHORT=False なら SHORT は発動しない."""
@@ -144,6 +154,8 @@ def test_short_disabled() -> None:
 # LONG + SHORT 混在テスト
 # ---------------------------------------------------------------------------
 
+@patch("config.settings.SENTIMENT_ENABLED", True)
+@patch("config.settings.FLOW_BUY_THRESHOLD", 0.65)
 @patch("config.settings.ENABLE_SHORT", True)
 class TestMixed:
 
