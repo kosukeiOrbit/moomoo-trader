@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from unittest.mock import patch
+
 from config import settings
 from src.risk.position_sizer import PositionSizer, TradeResult
 from src.risk.stop_loss import StopLossManager, Levels
@@ -38,8 +40,11 @@ class TestPositionSizerDefaults:
         assert sizer.consecutive_losses == 0
 
 
+# 10/04: 余力等分モード (POSITION_SIZE_BP_SPLIT_ENABLED) を .env で有効化したため、
+# 固定額モードを前提にするこのクラスは明示的に無効化して固定する。
+@patch("config.settings.POSITION_SIZE_BP_SPLIT_ENABLED", False)
 class TestPositionSizerCalculate:
-    """calculate() のテスト."""
+    """calculate() のテスト (固定額モード)."""
 
     def test_fixed_usd_calculation(self) -> None:
         """POSITION_SIZE_USD の固定額で株数が計算される."""

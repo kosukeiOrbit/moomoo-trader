@@ -1008,6 +1008,34 @@ def _log_in_position_signal(event: dict) -> None:
     except Exception:
         logger.warning("[in_position_log] 記録エラー（無視）", exc_info=True)
 
+# 10/04 追加: LONG の同一セッション内 再エントリー禁止。
+# 実弾で同一セッション・同一銘柄への2回目以降のエントリーは 7 件すべて負け
+# (合計 -$302.19、 うち手数料だけで $48.43)。 有益だった事例はゼロ。
+# 例: ET 10/01 PSKY は 01:03 に SL → 27 秒後に再シグナル → 01:07 再エントリー →
+#     引けでまた損切り (-$176.21 と -$121.75 で計 -$297.96)。
+# SHORT 側には既に _short_entered_real で 1 日 1 回制限があり、 LONG だけ無かった。
+# キーは ET セッション日付を使う。 date.today() (JST) だと JST 深夜 0 時で切り替わり
+# セッション途中で制限が解除される (long_full_dryrun で同一銘柄の二重記録を観測済み)。
+_long_entered_real: dict[str, str] = {}
+
+
+def _et_session_key() -> str:
+    """ET の暦日を返す。 1 セッションは ET 同一日に収まるのでセッション識別子になる."""
+    return datetime.now(ET).date().isoformat()
+
+
+def _long_reentry_blocked(symbol: str) -> bool:
+    """同一セッションで既に LONG 実エントリー済みなら True."""
+    if not settings.LONG_REENTRY_BLOCK_ENABLED:
+        return False
+    return _long_entered_real.get(symbol) == _et_session_key()
+
+
+def _mark_long_entered(symbol: str) -> None:
+    """LONG 実エントリー成功を記録する (再エントリー禁止の判定用)."""
+    _long_entered_real[symbol] = _et_session_key()
+
+
 # モメンタム検知 (1セッション1回 / Bot再起動でリセット)
 _momentum_scan_done: bool = False
 _momentum_added_symbols: set[str] = set()
@@ -2310,6 +2338,13 @@ async def main_loop() -> None:
                             direction="LONG",
                             fallback_atr_pct=_screener_atr_pct(_pb_symbol),
                         )
+                        if _long_reentry_blocked(_pb_symbol):
+                            logger.info(
+                                "[%s] 再エントリー禁止: このセッションで既に実エントリー済み → キャンセル",
+                                _pb_symbol,
+                            )
+                            continue
+
                         _pb_size = position_sizer.calculate(
                             _pb_symbol, _pb_snap.last_price, buying_power,
                         )
@@ -2318,6 +2353,7 @@ async def main_loop() -> None:
                             _pb_snap.last_price, _pb_levels,
                         )
                         if _pb_result and _pb_result.status not in ("FAILED", "CANCELLED"):
+                            _mark_long_entered(_pb_symbol)
                             # エントリー実行ログ
                             _e_signal_price = _pb.get('entry_price_at_signal', 0) or 0
                             _e_chg_pct = None
@@ -3103,6 +3139,13 @@ async def main_loop() -> None:
                             )
                             continue
 
+                        if _long_reentry_blocked(symbol):
+                            logger.info(
+                                "[%s] 再エントリー禁止: このセッションで既に実エントリー済み → スキップ",
+                                symbol,
+                            )
+                            continue
+
                         size = position_sizer.calculate(
                             symbol, current_price, buying_power,
                         )
@@ -3110,6 +3153,7 @@ async def main_loop() -> None:
                             decision, symbol, size, current_price, levels,
                         )
                         if result and result.status not in ("FAILED", "CANCELLED"):
+                            _mark_long_entered(symbol)
                             logger.info(
                                 "[%s] ENTRY %s %d shares @ $%.2f (order=%s)",
                                 symbol, decision.direction, size, current_price, result.order_id,

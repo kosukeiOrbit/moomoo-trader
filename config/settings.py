@@ -317,6 +317,23 @@ ENABLE_REAL_TRADING: bool = os.getenv("ENABLE_REAL_TRADING", "true").lower() == 
 MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
 POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "1500"))  # 1ポジションあたりの固定額（ドル）
+
+# --- 10/04 追加: 買付余力を枠数で等分するサイズ決定 ---
+# 固定額 POSITION_SIZE_USD × LONG_MAX_POSITIONS が買付余力を超えると、最後の枠だけ
+# 極端に小さくなる (ET 10/01: $4,992 + $4,869 + $1,903)。ET 9/30 には MRNA の発注が
+# Insufficient buying power で失敗もしている。
+# 余力は自己資本の約1.85倍で連動し固定ではない (ET 10/01 $11,846 → 10/02 $11,275 で
+# -$305 のセッション後に $571 減少)。固定額を再設定しても自己資本が減れば再発するため、
+# 割合で持つ。true で有効 (default false = 従来の固定額)。
+POSITION_SIZE_BP_SPLIT_ENABLED: bool = os.getenv("POSITION_SIZE_BP_SPLIT_ENABLED", "false").lower() == "true"
+POSITION_SIZE_BP_SAFETY: float = float(os.getenv("POSITION_SIZE_BP_SAFETY", "0.95"))  # 余力に対する安全係数
+
+# --- 10/04 追加: LONG の同一セッション内 再エントリー禁止 ---
+# 実弾で同一セッション・同一銘柄への2回目以降のエントリーは 7 件すべて負け
+# (合計 -$302.19、うち手数料だけで $48.43)。有益だった事例はゼロ。
+# SHORT 側には既に _short_entered_real で1日1回制限があり、LONG だけ無かった。
+# true で有効 (default false = 従来どおり再エントリー可)。
+LONG_REENTRY_BLOCK_ENABLED: bool = os.getenv("LONG_REENTRY_BLOCK_ENABLED", "false").lower() == "true"
 MIN_POSITION_SHARES: int = 1          # 最低保証株数（Kelly=0でもデータ蓄積用に発注）
 # MAX_POSITIONS: int = 10             # (旧) 合計上限 → LONG/SHORT独立管理に変更
 LONG_MAX_POSITIONS: int = int(os.getenv("LONG_MAX_POSITIONS", "5"))
