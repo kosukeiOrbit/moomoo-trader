@@ -183,6 +183,26 @@ class AndFilter:
                 f"Filter P: price=${snap.last_price:.2f} < ${settings.MIN_ENTRY_PRICE:.2f}"
             )
 
+        # Filter T (10/05 追加): 強制決済が近すぎる時刻の新規エントリーを止める。
+        # 手数料は保有時間に関係なく約 $4.6 の固定費なので、 残り時間が短い建玉は
+        # 「同じコストで機会だけ小さい」 状態になる (残り60分なら通常の約1/6)。
+        # 根拠は算術のみ。 時刻別の損益は多重検定で棄却済み (補正後 p=0.2481) のため、
+        # 成績が最良に見える線 (ET 12:50) ではなく経済的に成立しない裾だけを落とす。
+        # 注: 15:50 は main.FORCE_EXIT_ET と同値。 変更時は両方合わせること
+        # (Filter H が 9:30 をハードコードしているのと同じ扱い)。
+        if settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE > 0:
+            try:
+                now_et = datetime.now(_ET)
+                force_exit = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
+                mins_left = (force_exit - now_et).total_seconds() / 60
+                if mins_left < settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE:
+                    return False, (
+                        f"Filter T: 強制決済まで {mins_left:.0f}分 < "
+                        f"{settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE}分"
+                    )
+            except Exception:
+                logger.debug("Filter T 時刻判定で例外 (ガードしない)", exc_info=True)
+
         # Filter D (R1): dynamic + 中ボラ罠 (SNDK, MU, NOW, TER, WDC 等)
         # n=10 で統計的に不十分なため log のみで通過 (データ蓄積中)。
         # 後で n>=30 等の十分なサンプルで再評価する。
