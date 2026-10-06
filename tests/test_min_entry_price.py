@@ -29,9 +29,14 @@ def _snap(price: float) -> SimpleNamespace:
     )
 
 
-# 他フィルタを無効化して Filter P だけを見る
+# 他フィルタを無効化して Filter P だけを見る。
+# ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE を 0 に固定するのは必須:
+# Filter T は**実時刻**を見るため、固定しないと ET 14:50 以降に実行したときだけ
+# Filter T が棄却してこのファイルのテストが落ちる (実行時刻依存の不安定テストになる)。
+# 2026-10-06 に実際に発生した (ET 10:4x では通り、ET 20:0x では4件失敗)。
 _OTHERS = [
     patch("config.settings.TIGHT_FILTER_ENABLED", True),
+    patch("config.settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", 0),
     patch("config.settings.TIGHT_AMPLITUDE_MIN", 0.0),
     patch("config.settings.TIGHT_ATR_PCT_MIN", 0.0),
     patch("config.settings.TIGHT_VOL_RATIO_MIN", 0.0),

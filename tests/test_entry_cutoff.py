@@ -100,3 +100,58 @@ class TestFilterT:
             passed, reason = AndFilter().tight_filter_long(_snap(), None)
         assert passed is True
         assert reason == "tight_filter_disabled"
+
+
+class TestFilterOrder:
+    """Filter T は F/G/I の後に評価される (10/06 に移動)。
+
+    F より先だと ET 14:50 以降のスキャンが全て "Filter T" で返り、
+    その時間帯の amplitude が記録されなくなる (ET 10/05 で 884 件)。
+    すると「カットオフで条件を満たすシグナルを失ったか」を後から測れない。
+    """
+
+    def _late(self, amplitude: float, vol: float):
+        fake_dt = MagicMock()
+        fake_dt.now.return_value = _dt(2026, 10, 6, 15, 39, 0, tzinfo=_ET)
+        snap = SimpleNamespace(
+            symbol="TEST", last_price=300.0, amplitude=amplitude,
+            volume_ratio=vol, gap_pct=0.0, pre_change_rate=0.0,
+        )
+        stack = [
+            patch("config.settings.TIGHT_FILTER_ENABLED", True),
+            patch("config.settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", 60),
+            patch("config.settings.MIN_ENTRY_PRICE", 0.0),
+            patch("config.settings.TIGHT_AMPLITUDE_MIN", 5.0),
+            patch("config.settings.TIGHT_ATR_PCT_MIN", 0.0),
+            patch("config.settings.TIGHT_VOL_RATIO_MIN", 2.0),
+            patch("config.settings.TIGHT_OVERHEAT_GUARD_MINUTES", 0),
+            patch("config.settings.TIGHT_VWAP_DEV_PCT", 100.0),
+            patch("src.signals.and_filter.datetime", fake_dt),
+        ]
+        for p in stack:
+            p.start()
+        try:
+            return AndFilter().tight_filter_long(snap, None)
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_low_amplitude_reports_filter_f_not_t(self) -> None:
+        """遅い時刻でも低振幅なら Filter F が理由になる (amplitude が記録される)."""
+        passed, reason = self._late(amplitude=2.0, vol=3.0)
+        assert passed is False
+        assert "Filter F" in reason
+        assert "Filter T" not in reason
+
+    def test_low_volume_reports_filter_i_not_t(self) -> None:
+        """遅い時刻でも vol 不足なら Filter I が理由になる."""
+        passed, reason = self._late(amplitude=10.0, vol=1.0)
+        assert passed is False
+        assert "Filter I" in reason
+        assert "Filter T" not in reason
+
+    def test_qualifying_signal_reports_filter_t(self) -> None:
+        """全条件を満たしたシグナルだけが Filter T として記録される = 機会損失が測れる."""
+        passed, reason = self._late(amplitude=10.0, vol=3.0)
+        assert passed is False
+        assert "Filter T" in reason

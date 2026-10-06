@@ -183,26 +183,6 @@ class AndFilter:
                 f"Filter P: price=${snap.last_price:.2f} < ${settings.MIN_ENTRY_PRICE:.2f}"
             )
 
-        # Filter T (10/05 追加): 強制決済が近すぎる時刻の新規エントリーを止める。
-        # 手数料は保有時間に関係なく約 $4.6 の固定費なので、 残り時間が短い建玉は
-        # 「同じコストで機会だけ小さい」 状態になる (残り60分なら通常の約1/6)。
-        # 根拠は算術のみ。 時刻別の損益は多重検定で棄却済み (補正後 p=0.2481) のため、
-        # 成績が最良に見える線 (ET 12:50) ではなく経済的に成立しない裾だけを落とす。
-        # 注: 15:50 は main.FORCE_EXIT_ET と同値。 変更時は両方合わせること
-        # (Filter H が 9:30 をハードコードしているのと同じ扱い)。
-        if settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE > 0:
-            try:
-                now_et = datetime.now(_ET)
-                force_exit = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
-                mins_left = (force_exit - now_et).total_seconds() / 60
-                if mins_left < settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE:
-                    return False, (
-                        f"Filter T: 強制決済まで {mins_left:.0f}分 < "
-                        f"{settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE}分"
-                    )
-            except Exception:
-                logger.debug("Filter T 時刻判定で例外 (ガードしない)", exc_info=True)
-
         # Filter D (R1): dynamic + 中ボラ罠 (SNDK, MU, NOW, TER, WDC 等)
         # n=10 で統計的に不十分なため log のみで通過 (データ蓄積中)。
         # 後で n>=30 等の十分なサンプルで再評価する。
@@ -258,6 +238,33 @@ class AndFilter:
             return False, (
                 f"Filter I: volume_ratio={snap.volume_ratio:.2f} < {settings.TIGHT_VOL_RATIO_MIN}"
             )
+
+        # Filter T (10/05 追加): 強制決済が近すぎる時刻の新規エントリーを止める。
+        # 手数料は保有時間に関係なく約 $4.6 の固定費なので、 残り時間が短い建玉は
+        # 「同じコストで機会だけ小さい」 状態になる (残り60分なら通常の約1/6)。
+        # 根拠は算術のみ。 時刻別の損益は多重検定で棄却済み (補正後 p=0.2481) のため、
+        # 成績が最良に見える線 (ET 12:50) ではなく経済的に成立しない裾だけを落とす。
+        #
+        # 配置の理由 (10/06 に F の前から I の後へ移動): F より先に置くと ET 14:50 以降の
+        # スキャンが全て "Filter T" で返り、**その時間帯の amplitude が記録されない**。
+        # ET 10/05 では 884 件がこれに該当した。 すると「14:50 以降に amp>=5% へ達した
+        # 銘柄があったか」= カットオフの機会損失を後から測れなくなる (自己盲検化)。
+        # F/G/I の後に置けば、低振幅は F で棄却されて amplitude が残り、 条件を満たした
+        # シグナルだけが "Filter T" として記録される。 エントリーの可否は変わらない。
+        # 注: 15:50 は main.FORCE_EXIT_ET と同値。 変更時は両方合わせること
+        # (Filter H が 9:30 をハードコードしているのと同じ扱い)。
+        if settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE > 0:
+            try:
+                now_et = datetime.now(_ET)
+                force_exit = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
+                mins_left = (force_exit - now_et).total_seconds() / 60
+                if mins_left < settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE:
+                    return False, (
+                        f"Filter T: 強制決済まで {mins_left:.0f}分 < "
+                        f"{settings.ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE}分"
+                    )
+            except Exception:
+                logger.debug("Filter T 時刻判定で例外 (ガードしない)", exc_info=True)
 
         # Filter H: 過熱ガード (午前序盤の gap/pre 過熱銘柄をブロック)
         # n=72 分析: gap/pre >= +5% かつ ET 9:30-10:30 = n=13 WR 46% net -$199
